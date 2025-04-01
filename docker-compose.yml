@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  ado-exporter:
+    build: .
+    environment:
+      - ADO_ORGANIZATION=${ADO_ORGANIZATION}
+      - ADO_PROJECT=${ADO_PROJECT}
+      - ADO_PERSONAL_ACCESS_TOKEN=${ADO_PERSONAL_ACCESS_TOKEN}
+      - DB_TYPE=${DB_TYPE}
+      # SQL Server settings
+      - SQL_DRIVER=${SQL_DRIVER}
+      - SQL_SERVER=${SQL_SERVER}
+      - SQL_DATABASE=${SQL_DATABASE}
+      - SQL_USERNAME=${SQL_USERNAME}
+      - SQL_PASSWORD=${SQL_PASSWORD}
+      # PostgreSQL settings
+      - PG_HOST=${PG_HOST}
+      - PG_PORT=${PG_PORT}
+      - PG_DATABASE=${PG_DATABASE}
+      - PG_USERNAME=${PG_USERNAME}
+      - PG_PASSWORD=${PG_PASSWORD}
+    volumes:
+      - ./.env:/app/.env
+    restart: unless-stopped 
