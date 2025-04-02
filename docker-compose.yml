@@ -1,6 +1,45 @@
 version: '3.8'
 
 services:
+  postgres:
+    image: postgres:17.4
+    environment:
+      - POSTGRES_DB=${PG_DATABASE}
+      - POSTGRES_USER=${PG_USERNAME}
+      - POSTGRES_PASSWORD=${PG_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USERNAME} -d ${PG_DATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  metabase:
+    image: metabase/metabase:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - MB_DB_TYPE=postgres
+      - MB_DB_DBNAME=${PG_METABASE_DATABASE}
+      - MB_DB_PORT=5432
+      - MB_DB_USER=${PG_USERNAME}
+      - MB_DB_PASS=${PG_PASSWORD}
+      - MB_DB_HOST=postgres
+      - JAVA_TIMEZONE=UTC
+    volumes:
+      - metabase_data:/metabase-data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   ado-exporter:
     build: .
     environment:
@@ -15,11 +54,18 @@ services:
       - SQL_USERNAME=${SQL_USERNAME}
       - SQL_PASSWORD=${SQL_PASSWORD}
       # PostgreSQL settings
-      - PG_HOST=${PG_HOST}
-      - PG_PORT=${PG_PORT}
+      - PG_HOST=postgres
+      - PG_PORT=5432
       - PG_DATABASE=${PG_DATABASE}
       - PG_USERNAME=${PG_USERNAME}
       - PG_PASSWORD=${PG_PASSWORD}
     volumes:
       - ./.env:/app/.env
-    restart: unless-stopped 
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  metabase_data:
