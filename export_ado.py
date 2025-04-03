@@ -7,7 +7,6 @@ import os
 from dotenv import load_dotenv
 from pathlib import Path
 from sqlalchemy import create_engine, text, Table, Column, Integer, String, DateTime, MetaData, ForeignKey, inspect
-from sqlalchemy.dialects.mssql import NVARCHAR, TEXT as MSSQL_TEXT
 from sqlalchemy.dialects.postgresql import TEXT as PG_TEXT
 from sqlalchemy.exc import SQLAlchemyError
 import json
@@ -17,56 +16,139 @@ from abc import ABC, abstractmethod
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-class DatabaseConnection(ABC):
+class DatabaseConnection:
     def __init__(self):
+        self.connection_string = (
+            f"postgresql://{os.getenv('PG_USERNAME')}:{os.getenv('PG_PASSWORD')}@"
+            f"{os.getenv('PG_HOST')}:{os.getenv('PG_PORT', '5432')}/"
+            f"{os.getenv('PG_DATABASE')}"
+        )
         self.engine = self._create_engine()
         self.metadata = MetaData()
         self.setup_tables()
 
-    @abstractmethod
     def _create_engine(self):
-        """Create and return a SQLAlchemy engine"""
-        pass
+        return create_engine(self.connection_string)
 
-    @abstractmethod
     def _get_text_type(self):
-        """Return the appropriate TEXT type for the database"""
-        pass
+        return PG_TEXT
 
-    @abstractmethod
-    def _get_merge_query(self, snapshot_date, metrics):
-        """Return the appropriate MERGE/UPSERT query for history snapshots"""
-        pass
-
-    @abstractmethod
-    def _handle_identity_insert(self, connection, table_name, enable=True):
-        """Handle identity insert for the specific database"""
-        pass
-
-    @abstractmethod
     def _create_index(self, connection, index_name, table_name, columns):
-        """Create an index with database-specific syntax"""
-        pass
+        connection.execute(text(f"""
+            CREATE INDEX IF NOT EXISTS {index_name} ON {table_name}({columns})
+        """))
 
-    @abstractmethod
     def _drop_index(self, connection, index_name, table_name):
-        """Drop an index with database-specific syntax"""
+        connection.execute(text(f"""
+            DROP INDEX IF EXISTS {index_name}
+        """))
+
+    def _get_merge_query(self, snapshot_date, metrics):
+        # Build the source CTE for all metrics
+        source_queries = []
+        for name, query in metrics:
+            source_queries.append(f"SELECT CURRENT_DATE AS snapshot_date, '{name}' AS name, ({query}) AS number")
+        
+        source_cte = " UNION ALL ".join(source_queries)
+        
+        # Build the upsert query using ON CONFLICT
+        merge_query = f"""
+        WITH source_data AS ({source_cte})
+        INSERT INTO history_snapshots (snapshot_date, name, number)
+        SELECT snapshot_date, name, number FROM source_data
+        ON CONFLICT (snapshot_date, name) 
+        DO UPDATE SET number = EXCLUDED.number;
+        """
+        
+        return merge_query
+
+    def _handle_identity_insert(self, connection, table_name, enable=True):
+        # PostgreSQL doesn't need identity insert handling
         pass
 
-    @abstractmethod
     def _get_last_sync_query(self):
-        """Return database-specific query for getting last sync time"""
-        pass
+        return """
+            SELECT last_sync_time 
+            FROM sync_status 
+            WHERE entity_type = :entity_type 
+            ORDER BY last_sync_time DESC
+            LIMIT 1
+        """
 
-    @abstractmethod
     def update_parent_issue(self):
-        """Update parent_issue references in bugs table with database-specific syntax"""
-        pass
+        """Update parent_issue references in bugs table"""
+        try:
+            with self.engine.connect() as connection:
+                update_query = text("""
+                    WITH ValidParents AS (
+                        SELECT 
+                            b.id as bug_id,
+                            COALESCE(
+                                CASE WHEN i.id IS NOT NULL THEN b.parent_issue END,
+                                (
+                                    SELECT issue_id
+                                    FROM bugs_relations br
+                                    JOIN issues i2 ON br.issue_id = i2.id
+                                    WHERE br.bug_id = b.id 
+                                    LIMIT 1
+                                )
+                            ) as new_parent_issue
+                        FROM bugs b
+                        LEFT JOIN issues i ON b.parent_issue = i.id
+                    )
+                    UPDATE bugs
+                    SET parent_issue = vp.new_parent_issue
+                    FROM ValidParents vp
+                    WHERE bugs.id = vp.bug_id
+                    AND COALESCE(bugs.parent_issue, -1) != COALESCE(vp.new_parent_issue, -1)
+                """)
+                
+                result = connection.execute(update_query)
+                connection.commit()
+                
+                rows_affected = result.rowcount
+                print(f"Updated {rows_affected} bugs with new parent issue references")
+                
+        except SQLAlchemyError as e:
+            print(f"Error updating parent issues: {str(e)}")
+            connection.rollback()
+            raise
 
-    @abstractmethod
     def _add_new_columns(self, connection, table_name):
-        """Add new columns to existing tables if they don't exist with database-specific syntax"""
-        pass
+        """Add new columns to existing tables if they don't exist"""
+        inspector = inspect(self.engine)
+        existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
+        
+        new_columns = {
+            'iteration_path': 'VARCHAR(500)',
+            'hotfix_delivered_version': 'VARCHAR(200)'
+        }
+        
+        # Add work_item_type column for work_items table if it doesn't exist
+        if table_name == 'work_items' and 'work_item_type' not in existing_columns:
+            new_columns['work_item_type'] = 'VARCHAR(50)'
+        
+        for col_name, col_type in new_columns.items():
+            if col_name not in existing_columns:
+                connection.execute(text(f"""
+                    DO $$ 
+                    BEGIN 
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name = '{table_name}' 
+                            AND column_name = '{col_name}'
+                        ) THEN
+                            ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type};
+                        END IF;
+                    END $$;
+                """))
+
+        # Drop and recreate indexes for work_items if needed
+        if table_name == 'work_items':
+            self._drop_index(connection, "idx_work_items_changed_date", "work_items")
+            self._drop_index(connection, "idx_work_items_type", "work_items")
+            self._create_index(connection, "idx_work_items_changed_date", "work_items", "changed_date")
+            self._create_index(connection, "idx_work_items_type", "work_items", "work_item_type")
 
     def setup_tables(self):
         """Create tables if they don't exist and add new columns if needed"""
@@ -151,6 +233,24 @@ class DatabaseConnection(ABC):
                 Column('records_processed', Integer, nullable=False, default=0)
             )
 
+            # Work items table
+            self.work_items = Table(
+                'work_items', self.metadata,
+                Column('id', Integer, primary_key=True),
+                Column('title', String(500), nullable=False),
+                Column('description', text_type, nullable=True),
+                Column('assigned_to', String(200), nullable=True),
+                Column('severity', String(50), nullable=True),
+                Column('state', String(50), nullable=False),
+                Column('customer_name', String(200), nullable=True),
+                Column('area_path', String(500), nullable=True),
+                Column('created_date', DateTime, nullable=False),
+                Column('changed_date', DateTime, nullable=False),
+                Column('iteration_path', String(500), nullable=True),
+                Column('hotfix_delivered_version', String(200), nullable=True),
+                Column('work_item_type', String(50), nullable=False)
+            )
+
             # History snapshots table
             self.history_snapshots = Table(
                 'history_snapshots', self.metadata,
@@ -187,6 +287,10 @@ class DatabaseConnection(ABC):
                     self._create_index(connection, "idx_sync_status_entity_type", "sync_status", "entity_type, last_sync_time DESC")
                     
                     self._create_index(connection, "idx_bugs_relations_bug_id", "bugs_relations", "bug_id")
+                    
+                    # Add indexes for work_items table
+                    self._create_index(connection, "idx_work_items_changed_date", "work_items", "changed_date")
+                    self._create_index(connection, "idx_work_items_type", "work_items", "work_item_type")
                     
                     connection.commit()
                 except SQLAlchemyError as e:
@@ -351,6 +455,8 @@ class DatabaseConnection(ABC):
                         
                         if item_type == 'bug':
                             update_stmt += ", parent_issue = :parent_issue"
+                        elif item_type == 'work_item':
+                            update_stmt += ", work_item_type = :work_item_type"
                         
                         update_stmt += " WHERE id = :id"
 
@@ -371,6 +477,8 @@ class DatabaseConnection(ABC):
                         
                         if item_type == 'bug':
                             params["parent_issue"] = item.get('ParentID')
+                        elif item_type == 'work_item':
+                            params["work_item_type"] = item.get('WorkItemType', '')
 
                         connection.execute(text(update_stmt), params)
                     else:
@@ -387,6 +495,8 @@ class DatabaseConnection(ABC):
                         
                         if item_type == 'bug':
                             insert_stmt += ", parent_issue"
+                        elif item_type == 'work_item':
+                            insert_stmt += ", work_item_type"
                         
                         insert_stmt += """)
                         VALUES (
@@ -397,6 +507,8 @@ class DatabaseConnection(ABC):
                         
                         if item_type == 'bug':
                             insert_stmt += ", :parent_issue"
+                        elif item_type == 'work_item':
+                            insert_stmt += ", :work_item_type"
                         
                         insert_stmt += ")"
 
@@ -417,6 +529,8 @@ class DatabaseConnection(ABC):
                         
                         if item_type == 'bug':
                             params["parent_issue"] = item.get('ParentID')
+                        elif item_type == 'work_item':
+                            params["work_item_type"] = item.get('WorkItemType', '')
 
                         connection.execute(text(insert_stmt), params)
                         
@@ -436,284 +550,17 @@ class DatabaseConnection(ABC):
 
         return processed_count
 
-class SQLServerConnection(DatabaseConnection):
-    def __init__(self):
-        self.connection_string = (
-            f"DRIVER={{{os.getenv('SQL_DRIVER')}}};"
-            f"SERVER={os.getenv('SQL_SERVER')};"
-            f"DATABASE={os.getenv('SQL_DATABASE')};"
-            f"UID={os.getenv('SQL_USERNAME')};"
-            f"PWD={os.getenv('SQL_PASSWORD')};"
-            "TrustServerCertificate=yes;"
-        )
-        super().__init__()
-
-    def _create_engine(self):
-        return create_engine(f"mssql+pyodbc:///?odbc_connect={requests.utils.quote(self.connection_string)}")
-
-    def _get_text_type(self):
-        return MSSQL_TEXT
-
-    def _create_index(self, connection, index_name, table_name, columns):
-        connection.execute(text(f"""
-            IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = '{index_name}' AND object_id = OBJECT_ID('{table_name}'))
-            CREATE INDEX {index_name} ON {table_name}({columns})
-        """))
-
-    def _drop_index(self, connection, index_name, table_name):
-        connection.execute(text(f"""
-            IF EXISTS (SELECT * FROM sys.indexes WHERE name = '{index_name}' AND object_id = OBJECT_ID('{table_name}'))
-            DROP INDEX {index_name} ON {table_name}
-        """))
-
-    def _get_merge_query(self, snapshot_date, metrics):
-        # Build the source CTE for all metrics
-        source_queries = []
-        for name, query in metrics:
-            # Replace PostgreSQL date syntax with SQL Server syntax
-            if 'CURRENT_DATE - INTERVAL' in query:
-                query = query.replace("CURRENT_DATE - INTERVAL '1 day'", "DATEADD(day, -1, CAST(GETUTCDATE() AS DATE))")
-            source_queries.append(f"SELECT CAST(GETUTCDATE() AS DATE) AS snapshot_date, '{name}' AS name, ({query}) AS number")
-        
-        source_cte = " UNION ALL ".join(source_queries)
-        
-        # Build the MERGE statement
-        merge_query = f"""
-        MERGE INTO history_snapshots AS target
-        USING ({source_cte}) AS source
-        ON target.snapshot_date = source.snapshot_date 
-        AND target.name = source.name
-        WHEN MATCHED THEN 
-            UPDATE SET number = source.number
-        WHEN NOT MATCHED THEN 
-            INSERT (snapshot_date, name, number) 
-            VALUES (source.snapshot_date, source.name, source.number);
-        """
-        
-        return merge_query
-
-    def _handle_identity_insert(self, connection, table_name, enable=True):
-        connection.execute(text(f"SET IDENTITY_INSERT {table_name} {'ON' if enable else 'OFF'}"))
-
-    def _get_last_sync_query(self):
-        return """
-            SELECT TOP 1 last_sync_time 
-            FROM sync_status 
-            WHERE entity_type = :entity_type 
-            ORDER BY last_sync_time DESC
-        """
-
-    def update_parent_issue(self):
-        """Update parent_issue references in bugs table with SQL Server syntax"""
-        try:
-            with self.engine.connect() as connection:
-                update_query = text("""
-                    WITH ValidParents AS (
-                        SELECT 
-                            b.id as bug_id,
-                            COALESCE(
-                                CASE WHEN i.id IS NOT NULL THEN b.parent_issue END,
-                                (
-                                    SELECT TOP 1 issue_id
-                                    FROM bugs_relations br
-                                    JOIN issues i2 ON br.issue_id = i2.id
-                                    WHERE br.bug_id = b.id 
-                                )
-                            ) as new_parent_issue
-                        FROM bugs b
-                        LEFT JOIN issues i ON b.parent_issue = i.id
-                    )
-                    UPDATE bugs
-                    SET parent_issue = vp.new_parent_issue
-                    FROM ValidParents vp
-                    WHERE bugs.id = vp.bug_id
-                    AND COALESCE(bugs.parent_issue, -1) != COALESCE(vp.new_parent_issue, -1)
-                """)
-                
-                result = connection.execute(update_query)
-                connection.commit()
-                
-                rows_affected = result.rowcount
-                print(f"Updated {rows_affected} bugs with new parent issue references")
-                
-        except SQLAlchemyError as e:
-            print(f"Error updating parent issues: {str(e)}")
-            connection.rollback()
-            raise
-
-    def _add_new_columns(self, connection, table_name):
-        """Add new columns to existing tables if they don't exist using SQL Server syntax"""
-        inspector = inspect(self.engine)
-        existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
-        
-        new_columns = {
-            'iteration_path': 'VARCHAR(500)',
-            'hotfix_delivered_version': 'VARCHAR(200)'
-        }
-        
-        for col_name, col_type in new_columns.items():
-            if col_name not in existing_columns:
-                connection.execute(text(f"""
-                    IF NOT EXISTS (
-                        SELECT * FROM sys.columns 
-                        WHERE object_id = OBJECT_ID('{table_name}')
-                        AND name = '{col_name}'
-                    )
-                    BEGIN
-                        ALTER TABLE {table_name} ADD {col_name} {col_type}
-                    END
-                """))
-
-class PostgreSQLConnection(DatabaseConnection):
-    def __init__(self):
-        self.connection_string = (
-            f"postgresql://{os.getenv('PG_USERNAME')}:{os.getenv('PG_PASSWORD')}@"
-            f"{os.getenv('PG_HOST')}:{os.getenv('PG_PORT', '5432')}/"
-            f"{os.getenv('PG_DATABASE')}"
-        )
-        super().__init__()
-
-    def _create_engine(self):
-        return create_engine(self.connection_string)
-
-    def _get_text_type(self):
-        return PG_TEXT
-
-    def _create_index(self, connection, index_name, table_name, columns):
-        connection.execute(text(f"""
-            CREATE INDEX IF NOT EXISTS {index_name} ON {table_name}({columns})
-        """))
-
-    def _drop_index(self, connection, index_name, table_name):
-        connection.execute(text(f"""
-            DROP INDEX IF EXISTS {index_name}
-        """))
-
-    def _get_merge_query(self, snapshot_date, metrics):
-        # Build the source CTE for all metrics
-        source_queries = []
-        for name, query in metrics:
-            # Replace SQL Server date syntax with PostgreSQL syntax if needed
-            if 'DATEADD' in query:
-                query = query.replace("DATEADD(day, -1, CAST(GETUTCDATE() AS DATE))", "CURRENT_DATE - INTERVAL '1 day'")
-            source_queries.append(f"SELECT CURRENT_DATE AS snapshot_date, '{name}' AS name, ({query}) AS number")
-        
-        source_cte = " UNION ALL ".join(source_queries)
-        
-        # Build the upsert query using ON CONFLICT
-        merge_query = f"""
-        WITH source_data AS ({source_cte})
-        INSERT INTO history_snapshots (snapshot_date, name, number)
-        SELECT snapshot_date, name, number FROM source_data
-        ON CONFLICT (snapshot_date, name) 
-        DO UPDATE SET number = EXCLUDED.number;
-        """
-        
-        return merge_query
-
-    def _handle_identity_insert(self, connection, table_name, enable=True):
-        # PostgreSQL doesn't need identity insert handling as it uses OVERRIDING SYSTEM VALUE
-        # when inserting explicit values into identity columns
-        pass
-
-    def _get_last_sync_query(self):
-        return """
-            SELECT last_sync_time 
-            FROM sync_status 
-            WHERE entity_type = :entity_type 
-            ORDER BY last_sync_time DESC
-            LIMIT 1
-        """
-
-    def update_parent_issue(self):
-        """Update parent_issue references in bugs table with PostgreSQL syntax"""
-        try:
-            with self.engine.connect() as connection:
-                update_query = text("""
-                    WITH ValidParents AS (
-                        SELECT 
-                            b.id as bug_id,
-                            COALESCE(
-                                CASE WHEN i.id IS NOT NULL THEN b.parent_issue END,
-                                (
-                                    SELECT issue_id
-                                    FROM bugs_relations br
-                                    JOIN issues i2 ON br.issue_id = i2.id
-                                    WHERE br.bug_id = b.id 
-                                    LIMIT 1
-                                )
-                            ) as new_parent_issue
-                        FROM bugs b
-                        LEFT JOIN issues i ON b.parent_issue = i.id
-                    )
-                    UPDATE bugs
-                    SET parent_issue = vp.new_parent_issue
-                    FROM ValidParents vp
-                    WHERE bugs.id = vp.bug_id
-                    AND COALESCE(bugs.parent_issue, -1) != COALESCE(vp.new_parent_issue, -1)
-                """)
-                
-                result = connection.execute(update_query)
-                connection.commit()
-                
-                rows_affected = result.rowcount
-                print(f"Updated {rows_affected} bugs with new parent issue references")
-                
-        except SQLAlchemyError as e:
-            print(f"Error updating parent issues: {str(e)}")
-            connection.rollback()
-            raise
-
-    def _add_new_columns(self, connection, table_name):
-        """Add new columns to existing tables if they don't exist using PostgreSQL syntax"""
-        inspector = inspect(self.engine)
-        existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
-        
-        new_columns = {
-            'iteration_path': 'VARCHAR(500)',
-            'hotfix_delivered_version': 'VARCHAR(200)'
-        }
-        
-        for col_name, col_type in new_columns.items():
-            if col_name not in existing_columns:
-                connection.execute(text(f"""
-                    DO $$ 
-                    BEGIN 
-                        IF NOT EXISTS (
-                            SELECT 1 FROM information_schema.columns 
-                            WHERE table_name = '{table_name}' 
-                            AND column_name = '{col_name}'
-                        ) THEN
-                            ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type};
-                        END IF;
-                    END $$;
-                """))
-
 def get_database_connection():
-    """Factory function to create the appropriate database connection based on environment variables"""
-    db_type = os.getenv('DB_TYPE', 'sqlserver').lower()
-    if db_type == 'postgresql':
-        try:
-            return PostgreSQLConnection()
-        except ModuleNotFoundError as e:
-            if "psycopg2" in str(e):
-                raise ModuleNotFoundError(
-                    "PostgreSQL driver (psycopg2) is not installed. "
-                    "Please install it using: pip install psycopg2-binary"
-                ) from e
-            raise
-    elif db_type == 'sqlserver':
-        try:
-            return SQLServerConnection()
-        except ModuleNotFoundError as e:
-            if "pyodbc" in str(e):
-                raise ModuleNotFoundError(
-                    "SQL Server driver (pyodbc) is not installed. "
-                    "Please install it using: pip install pyodbc"
-                ) from e
-            raise
-    else:
-        raise ValueError(f"Unsupported database type: {db_type}")
+    """Factory function to create the appropriate database connection"""
+    try:
+        return DatabaseConnection()
+    except ModuleNotFoundError as e:
+        if "psycopg2" in str(e):
+            raise ModuleNotFoundError(
+                "PostgreSQL driver (psycopg2) is not installed. "
+                "Please install it using: pip install psycopg2-binary"
+            ) from e
+        raise
 
 class ADOExtractor:
     def __init__(self, organization, project, personal_access_token):
@@ -783,15 +630,6 @@ class ADOExtractor:
                 print(f"Error fetching work item details: {details_response.status_code}")
                 print(f"Response text: {details_response.text}")
                 continue  # Skip this batch but continue with others
-            
-            # Print raw response data for debugging
-            # print("\nRaw API Response for Work Items:")
-            # print("--------------------------------")
-            # for item in details_response.json()["value"]:
-            #     print(f"\nWork Item {item['id']}:")
-            #     print("Fields:")
-            #     print(json.dumps(item["fields"], indent=2))
-            #     print("--------------------------------")
             
             batch_data = []
             for item in details_response.json()["value"]:
@@ -1240,6 +1078,208 @@ class ADOExtractor:
         except Exception as e:
             print(f"Error processing CSV file: {str(e)}")
 
+    def get_all_work_items(self, last_update):
+        """Query all work items regardless of type that were changed since last update"""
+        query_url = f"https://dev.azure.com/{self.organization}/{self.project}/_apis/wit/wiql?api-version=7.1-preview.2"
+        
+        # Handle last_update whether it's a string or datetime
+        last_update_str = last_update if isinstance(last_update, str) else last_update.strftime('%Y-%m-%d')
+        
+        # Modified WIQL query to include all required fields without type filter
+        query_payload = {
+            "query": f"""
+                SELECT [System.Id],
+                       [System.Title],
+                       [System.State],
+                       [System.CreatedDate],
+                       [System.ChangedDate],
+                       [System.AssignedTo],
+                       [System.Description],
+                       [Microsoft.VSTS.Common.Priority],
+                       [Custom.CustomernameGRC],
+                       [System.AreaPath],
+                       [System.Parent],
+                       [System.IterationPath],
+                       [Custom.HotfixDeliveredVersions],
+                       [System.WorkItemType]
+                FROM WorkItems
+                WHERE [System.ChangedDate] > @Today - 1
+                ORDER BY [System.ChangedDate] DESC
+            """
+        }
+
+        # Get work item IDs
+        response = requests.post(query_url, json=query_payload, headers=self.headers)
+        if response.status_code != 200:
+            print(f"Error fetching WIQL query: {response.status_code} - {response.text}")
+            return []
+
+        work_items = response.json().get("workItems", [])
+        if not work_items:
+            return []
+
+        # Get work item details in batches
+        items_data = []
+        batch_size = 200  # Azure DevOps recommended batch size
+        
+        for i in range(0, len(work_items), batch_size):
+            batch = work_items[i:i + batch_size]
+            item_ids = ",".join(str(item["id"]) for item in batch)
+            details_url = f"https://dev.azure.com/{self.organization}/_apis/wit/workitems?ids={item_ids}&$expand=relations&api-version=7.0"
+            
+            details_response = requests.get(details_url, headers=self.headers)
+            
+            if details_response.status_code != 200:
+                print(f"Error fetching work item details: {details_response.status_code}")
+                print(f"Response text: {details_response.text}")
+                continue
+            
+            batch_data = []
+            for item in details_response.json()["value"]:
+                fields = item["fields"]
+                
+                # Handle AssignedTo field properly
+                assigned_to = fields.get('System.AssignedTo')
+                if isinstance(assigned_to, dict):
+                    assigned_to = assigned_to.get('displayName', '')
+                else:
+                    assigned_to = str(assigned_to) if assigned_to is not None else ''
+                
+                item_data = {
+                    'ID': item["id"],
+                    'Title': fields.get('System.Title', ''),
+                    'Description': fields.get('System.Description', ''),
+                    'AssignedTo': assigned_to,
+                    'Severity': fields.get('Microsoft.VSTS.Common.Priority', ''),
+                    'State': fields.get('System.State', ''),
+                    'CustomerName': fields.get('Custom.CustomernameGRC', ''),
+                    'AreaPath': fields.get('System.AreaPath', ''),
+                    'CreatedDate': fields.get('System.CreatedDate', ''),
+                    'ChangedDate': fields.get('System.ChangedDate', ''),
+                    'IterationPath': fields.get('System.IterationPath', ''),
+                    'HotfixDeliveredVersion': fields.get('Custom.HotfixDeliveredVersions', ''),
+                    'WorkItemType': fields.get('System.WorkItemType', '')
+                }
+
+                batch_data.append(item_data)
+            
+            items_data.extend(batch_data)
+            if len(batch) == batch_size:
+                time.sleep(1)  # Rate limiting between large batches
+            
+        return items_data
+
+    def handle_work_item_changes(self, work_items, db_connection=None):
+        """
+        Get and store the state change history for a list of work items
+        Args:
+            work_items: List of work item dictionaries or work item IDs
+            db_connection: Optional database connection for storing changes
+        Returns:
+            Dictionary mapping work item IDs to their state changes: {work_item_id: [[date, old_value, new_value], ...]}
+        """
+        if not work_items:
+            return {}
+
+        # Convert list of work item dictionaries to list of work item IDs if necessary
+        work_item_ids = [item['ID'] if isinstance(item, dict) else item for item in work_items]
+        all_state_changes = {}
+
+        for work_item_id in work_item_ids:
+            updates_url = f"https://dev.azure.com/{self.organization}/{self.project}/_apis/wit/workitems/{work_item_id}/updates?api-version=7.0"
+            response = requests.get(updates_url, headers=self.headers)
+            
+            if response.status_code != 200:
+                print(f"Error fetching state changes for work item {work_item_id}: {response.status_code}")
+                continue
+                
+            updates = response.json().get("value", [])
+            state_changes = []
+
+            # If we have a database connection, handle the database operations
+            if db_connection:
+                with db_connection.engine.connect() as connection:
+                    try:
+                        # First, delete all existing entries for this work item
+                        connection.execute(
+                            text("""
+                                DELETE FROM change_history 
+                                WHERE record_id = :record_id 
+                                AND table_name = 'work_items'
+                                AND field_changed = 'System.State'
+                            """),
+                            {"record_id": work_item_id}
+                        )
+                        
+                        # Now process and insert all state changes
+                        for update in updates:
+                            if "System.State" in update.get("fields", {}):
+                                state_change = update["fields"]["System.State"]
+                                # Get the changed date from the update object
+                                changed_date = update.get("fields", {}).get("System.ChangedDate", {}).get("newValue", "")
+                                changed_by = update.get("revisedBy", {}).get("displayName", "")
+                                old_value = state_change.get("oldValue", "")
+                                new_value = state_change.get("newValue", "")
+
+                                # Convert date string to datetime object
+                                try:
+                                    changed_date_obj = datetime.strptime(changed_date, "%Y-%m-%dT%H:%M:%S.%fZ")
+                                except ValueError:
+                                    try:
+                                        changed_date_obj = datetime.strptime(changed_date, "%Y-%m-%dT%H:%M:%SZ")
+                                    except ValueError:
+                                        changed_date_obj = None
+
+                                if changed_date_obj:  # Only insert if we have a valid date
+                                    # Insert the change record
+                                    connection.execute(
+                                        text("""
+                                            INSERT INTO change_history 
+                                            (record_id, table_name, field_changed, old_value, new_value, changed_by, changed_date)
+                                            VALUES 
+                                            (:record_id, :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
+                                        """),
+                                        {
+                                            "record_id": work_item_id,
+                                            "table_name": "work_items",
+                                            "field_changed": "System.State",
+                                            "old_value": old_value,
+                                            "new_value": new_value,
+                                            "changed_by": changed_by,
+                                            "changed_date": changed_date_obj
+                                        }
+                                    )
+
+                                state_changes.append([
+                                    changed_date,
+                                    old_value,
+                                    new_value
+                                ])
+                        
+                        connection.commit()
+                        
+                    except SQLAlchemyError as e:
+                        print(f"Error processing state changes for work item {work_item_id}: {str(e)}")
+                        connection.rollback()
+            else:
+                # If no database connection, just collect the state changes
+                for update in updates:
+                    if "System.State" in update.get("fields", {}):
+                        state_change = update["fields"]["System.State"]
+                        changed_date = update.get("fields", {}).get("System.ChangedDate", {}).get("newValue", "")
+                        old_value = state_change.get("oldValue", "")
+                        new_value = state_change.get("newValue", "")
+
+                        state_changes.append([
+                            changed_date,
+                            old_value,
+                            new_value
+                        ])
+            
+            all_state_changes[work_item_id] = state_changes
+        
+        return all_state_changes
+
 def main():
     # Load configuration from .env file
     organization = os.getenv('ADO_ORGANIZATION')
@@ -1284,8 +1324,19 @@ def main():
             # Get last sync times from database
             issues_last_sync = db.get_last_sync_time('issue')
             bugs_last_sync = db.get_last_sync_time('bug')
+            work_items_last_sync = db.get_last_sync_time('work_item')
             
-            # Extract and store issues first
+            # Extract and store all work items first
+            work_items = extractor.get_all_work_items(work_items_last_sync.strftime('%Y-%m-%d'))
+            processed_work_items = db.upsert_items(work_items, db.work_items, 'work_item')
+            print(f"------>Processed {processed_work_items} work items")
+
+            # Process state changes for all work items
+            print("------>Processing work item state changes")
+            extractor.handle_work_item_changes(work_items, db)
+            print(f"------>Processed state changes for {len(work_items)} work items")
+            
+            # Extract and store issues
             issues = extractor.get_work_items('Issue Report', issues_last_sync.strftime('%Y-%m-%d'))
             processed_issues = db.upsert_items(issues, db.issues, 'issue')
             print(f"------>Processed {processed_issues} issues")
@@ -1314,6 +1365,9 @@ def main():
             
             if processed_bugs > 0:
                 db.update_sync_status('bug', processed_bugs)
+
+            if processed_work_items > 0:
+                db.update_sync_status('work_item', processed_work_items)
 
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"=== Sync cycle completed at {current_time} ===")
