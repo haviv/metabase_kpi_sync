@@ -1186,6 +1186,19 @@ class ADOExtractor:
         all_state_changes = {}
 
         for work_item_id in work_item_ids:
+            # First get the work item details to ensure we have the type
+            details_url = f"https://dev.azure.com/{self.organization}/_apis/wit/workitems/{work_item_id}?api-version=7.0"
+            details_response = requests.get(details_url, headers=self.headers)
+            
+            if details_response.status_code != 200:
+                print(f"Error fetching work item details for {work_item_id}: {details_response.status_code}")
+                continue
+
+            work_item_type = details_response.json()["fields"].get("System.WorkItemType")
+            if not work_item_type:
+                print(f"Could not determine work item type for {work_item_id}")
+                continue
+
             updates_url = f"https://dev.azure.com/{self.organization}/{self.project}/_apis/wit/workitems/{work_item_id}/updates?api-version=7.0"
             response = requests.get(updates_url, headers=self.headers)
             
@@ -1200,15 +1213,66 @@ class ADOExtractor:
             if db_connection:
                 with db_connection.engine.connect() as connection:
                     try:
-                        # First, delete all existing entries for this work item
+                        # First, check if the work item exists and get its type from the database
+                        result = connection.execute(
+                            text("SELECT work_item_type FROM work_items WHERE id = :id"),
+                            {"id": work_item_id}
+                        ).first()
+                        
+                        if not result:
+                            # Work item not in database, let's insert it
+                            fields = details_response.json()["fields"]
+                            
+                            # Handle AssignedTo field properly
+                            assigned_to = fields.get('System.AssignedTo')
+                            if isinstance(assigned_to, dict):
+                                assigned_to = assigned_to.get('displayName', '')
+                            else:
+                                assigned_to = str(assigned_to) if assigned_to is not None else ''
+
+                            # Insert the work item
+                            connection.execute(
+                                text("""
+                                    INSERT INTO work_items (
+                                        id, title, description, assigned_to, severity,
+                                        state, customer_name, area_path, created_date, changed_date,
+                                        iteration_path, hotfix_delivered_version, work_item_type
+                                    ) VALUES (
+                                        :id, :title, :description, :assigned_to, :severity,
+                                        :state, :customer_name, :area_path, :created_date, :changed_date,
+                                        :iteration_path, :hotfix_delivered_version, :work_item_type
+                                    )
+                                """),
+                                {
+                                    "id": work_item_id,
+                                    "title": fields.get('System.Title', ''),
+                                    "description": fields.get('System.Description', ''),
+                                    "assigned_to": assigned_to,
+                                    "severity": fields.get('Microsoft.VSTS.Common.Priority', ''),
+                                    "state": fields.get('System.State', ''),
+                                    "customer_name": fields.get('Custom.CustomernameGRC', ''),
+                                    "area_path": fields.get('System.AreaPath', ''),
+                                    "created_date": fields.get('System.CreatedDate', ''),
+                                    "changed_date": fields.get('System.ChangedDate', ''),
+                                    "iteration_path": fields.get('System.IterationPath', ''),
+                                    "hotfix_delivered_version": fields.get('Custom.HotfixDeliveredVersions', ''),
+                                    "work_item_type": work_item_type
+                                }
+                            )
+                            print(f"Inserted missing work item {work_item_id} of type {work_item_type}")
+
+                        # Delete all existing entries for this work item
                         connection.execute(
                             text("""
                                 DELETE FROM change_history 
                                 WHERE record_id = :record_id 
-                                AND table_name = 'work_items'
+                                AND table_name = :table_name
                                 AND field_changed = 'System.State'
                             """),
-                            {"record_id": work_item_id}
+                            {
+                                "record_id": work_item_id,
+                                "table_name": work_item_type
+                            }
                         )
                         
                         # Now process and insert all state changes
@@ -1241,7 +1305,7 @@ class ADOExtractor:
                                         """),
                                         {
                                             "record_id": work_item_id,
-                                            "table_name": "work_items",
+                                            "table_name": work_item_type,
                                             "field_changed": "System.State",
                                             "old_value": old_value,
                                             "new_value": new_value,
