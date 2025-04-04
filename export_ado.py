@@ -1375,7 +1375,7 @@ def main():
     # extractor.update_issues_customer_names_from_csv(issues_csv_file_path)
     # print("Issues CSV processing completed\n")
 
-    SLEEP_INTERVAL = 30 * 60  # 30 minutes in seconds
+    SLEEP_INTERVAL = 60 * 60  # 1 hour in seconds
     
     print(f"Starting continuous sync with {SLEEP_INTERVAL/60} minute intervals")
     print("Press Ctrl+C to stop the program")
