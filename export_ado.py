@@ -340,17 +340,17 @@ class DatabaseConnection:
         """Update the history snapshots table with current metrics"""
         metrics = [
             ('total_bugs', 'SELECT COUNT(*) FROM bugs'),
-            ('open_bugs', "SELECT COUNT(*) FROM bugs WHERE state NOT IN ('Done', 'Not Reproduced', 'QA Completed', 'Removed')"),
+            ('open_bugs', "SELECT COUNT(*) FROM bugs WHERE state NOT IN ('Done', 'Not reproduced', 'QA Completed', 'Removed')"),
             ('in_qa_bugs', "SELECT COUNT(*) FROM bugs WHERE state = 'In QA'"),
             ('new_bugs', "SELECT COUNT(*) FROM bugs WHERE state IN ('New', 'Approved')"),
-            ('closed_bugs', "SELECT COUNT(*) FROM bugs WHERE state IN ('Done', 'Not Reproduced', 'QA Completed', 'Removed')"),
+            ('closed_bugs', "SELECT COUNT(*) FROM bugs WHERE state IN ('Done', 'Not reproduced', 'QA Completed', 'Removed')"),
             ('reopened_bugs', "SELECT COUNT(*) FROM bugs WHERE state = 'Reopened' AND changed_date >= CURRENT_DATE - INTERVAL '1 day'"),
-            ('p1_bugs', "SELECT COUNT(*) FROM bugs WHERE severity = '1' AND state NOT IN ('Done', 'Not Reproduced', 'QA Completed', 'Removed')"),
-            ('p2_bugs', "SELECT COUNT(*) FROM bugs WHERE severity = '2' AND state NOT IN ('Done', 'Not Reproduced', 'QA Completed', 'Removed')"),
-            ('p1_p2_bugs_with_customer_issues', "SELECT COUNT(*) FROM bugs WHERE state NOT IN ('Done', 'Not Reproduced', 'QA Completed', 'Removed') AND severity IN ('1','2') AND parent_issue IS NOT NULL"),
+            ('p1_bugs', "SELECT COUNT(*) FROM bugs WHERE severity = '1' AND state NOT IN ('Done', 'Not reproduced', 'QA Completed', 'Removed')"),
+            ('p2_bugs', "SELECT COUNT(*) FROM bugs WHERE severity = '2' AND state NOT IN ('Done', 'Not reproduced', 'QA Completed', 'Removed')"),
+            ('p1_p2_bugs_with_customer_issues', "SELECT COUNT(*) FROM bugs WHERE state NOT IN ('Done', 'Not reproduced', 'QA Completed', 'Removed') AND severity IN ('1','2') AND parent_issue IS NOT NULL"),
             ('p1_p2_bugs_in_dev', "SELECT COUNT(*) FROM bugs WHERE state IN ('Approved', 'Issues Found', 'New', 'In Progress', 'Waiting for PR') AND severity IN ('1','2')"),
             ('open_bugs_QA_p1_p2', "SELECT COUNT(*) FROM bugs WHERE state IN ('Ready for QA', 'In QA') AND severity IN ('1','2')"),
-            ('open_p1_bugs_with_customer_issues', "SELECT COUNT(*) FROM bugs WHERE state NOT IN ('Done', 'Not Reproduced', 'QA Completed', 'Removed') AND severity = '1' AND parent_issue IS NOT NULL")
+            ('open_p1_bugs_with_customer_issues', "SELECT COUNT(*) FROM bugs WHERE state NOT IN ('Done', 'Not reproduced', 'QA Completed', 'Removed') AND severity = '1' AND parent_issue IS NOT NULL")
         ]
 
         snapshot_date = datetime.now().date()
