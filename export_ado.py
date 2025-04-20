@@ -593,6 +593,7 @@ class ADOExtractor:
                        [System.AssignedTo],
                        [System.Description],
                        [Microsoft.VSTS.Common.Priority],
+                       [Microsoft.VSTS.Common.Severity],
                        [Custom.CustomernameGRC],
                        [System.AreaPath],
                        [System.Parent],
@@ -642,12 +643,19 @@ class ADOExtractor:
                 else:
                     assigned_to = str(assigned_to) if assigned_to is not None else ''
                 
+                # Modified to extract first character from Severity for Issue Report type
+                severity_value = fields.get('Microsoft.VSTS.Common.Severity', '')
+                if work_item_type == 'Issue Report' and severity_value and len(severity_value) > 0:
+                    severity_value = severity_value[0]  # Extract just the first character (e.g. "1" from "1 Critical...")
+                else:
+                    severity_value = fields.get('Microsoft.VSTS.Common.Priority', '')
+                
                 item_data = {
                     'ID': item["id"],
                     'Title': fields.get('System.Title', ''),
                     'Description': fields.get('System.Description', ''),
                     'AssignedTo': assigned_to,
-                    'Severity': fields.get('Microsoft.VSTS.Common.Priority', ''),
+                    'Severity': severity_value,
                     'State': fields.get('System.State', ''),
                     'CustomerName': fields.get('Custom.CustomernameGRC', ''),
                     'AreaPath': fields.get('System.AreaPath', ''),
@@ -1096,6 +1104,7 @@ class ADOExtractor:
                        [System.AssignedTo],
                        [System.Description],
                        [Microsoft.VSTS.Common.Priority],
+                       [Microsoft.VSTS.Common.Severity],
                        [Custom.CustomernameGRC],
                        [System.AreaPath],
                        [System.Parent],
@@ -1145,12 +1154,20 @@ class ADOExtractor:
                 else:
                     assigned_to = str(assigned_to) if assigned_to is not None else ''
                 
+                # Modified to extract first character from Severity for Issue Report type
+                work_item_type = fields.get('System.WorkItemType', '')
+                severity_value = fields.get('Microsoft.VSTS.Common.Severity', '')
+                if work_item_type == 'Issue Report' and severity_value and len(severity_value) > 0:
+                    severity_value = severity_value[0]  # Extract just the first character (e.g. "1" from "1 Critical...")
+                else:
+                    severity_value = fields.get('Microsoft.VSTS.Common.Priority', '')
+                
                 item_data = {
                     'ID': item["id"],
                     'Title': fields.get('System.Title', ''),
                     'Description': fields.get('System.Description', ''),
                     'AssignedTo': assigned_to,
-                    'Severity': fields.get('Microsoft.VSTS.Common.Priority', ''),
+                    'Severity': severity_value,
                     'State': fields.get('System.State', ''),
                     'CustomerName': fields.get('Custom.CustomernameGRC', ''),
                     'AreaPath': fields.get('System.AreaPath', ''),
@@ -1158,7 +1175,7 @@ class ADOExtractor:
                     'ChangedDate': fields.get('System.ChangedDate', ''),
                     'IterationPath': fields.get('System.IterationPath', ''),
                     'HotfixDeliveredVersion': fields.get('Custom.HotfixDeliveredVersions', ''),
-                    'WorkItemType': fields.get('System.WorkItemType', '')
+                    'WorkItemType': work_item_type
                 }
 
                 batch_data.append(item_data)
@@ -1230,6 +1247,13 @@ class ADOExtractor:
                             else:
                                 assigned_to = str(assigned_to) if assigned_to is not None else ''
 
+                            # Handle the severity field appropriately
+                            severity_value = fields.get('Microsoft.VSTS.Common.Severity', '')
+                            if work_item_type == 'Issue Report' and severity_value and len(severity_value) > 0:
+                                severity_value = severity_value[0]  # Extract just the first character
+                            else:
+                                severity_value = fields.get('Microsoft.VSTS.Common.Priority', '')
+
                             # Insert the work item
                             connection.execute(
                                 text("""
@@ -1248,7 +1272,7 @@ class ADOExtractor:
                                     "title": fields.get('System.Title', ''),
                                     "description": fields.get('System.Description', ''),
                                     "assigned_to": assigned_to,
-                                    "severity": fields.get('Microsoft.VSTS.Common.Priority', ''),
+                                    "severity": severity_value,
                                     "state": fields.get('System.State', ''),
                                     "customer_name": fields.get('Custom.CustomernameGRC', ''),
                                     "area_path": fields.get('System.AreaPath', ''),
