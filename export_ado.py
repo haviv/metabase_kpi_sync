@@ -1291,7 +1291,7 @@ class ADOExtractor:
                                 DELETE FROM change_history 
                                 WHERE record_id = :record_id 
                                 AND table_name = :table_name
-                                AND field_changed = 'System.State'
+                                AND field_changed IN ('System.State', 'System.IterationPath')
                             """),
                             {
                                 "record_id": work_item_id,
@@ -1299,50 +1299,55 @@ class ADOExtractor:
                             }
                         )
                         
-                        # Now process and insert all state changes
+                        # Now process and insert all state and iteration path changes
                         for update in updates:
-                            if "System.State" in update.get("fields", {}):
-                                state_change = update["fields"]["System.State"]
-                                # Get the changed date from the update object
-                                changed_date = update.get("fields", {}).get("System.ChangedDate", {}).get("newValue", "")
-                                changed_by = update.get("revisedBy", {}).get("displayName", "")
-                                old_value = state_change.get("oldValue", "")
-                                new_value = state_change.get("newValue", "")
+                            fields_to_track = {'System.State': 'State', 'System.IterationPath': 'Iteration Path'}
+                            
+                            for field_name, display_name in fields_to_track.items():
+                                if field_name in update.get("fields", {}):
+                                    field_change = update["fields"][field_name]
+                                    # Get the changed date from the update object
+                                    changed_date = update.get("fields", {}).get("System.ChangedDate", {}).get("newValue", "")
+                                    changed_by = update.get("revisedBy", {}).get("displayName", "")
+                                    old_value = field_change.get("oldValue", "")
+                                    new_value = field_change.get("newValue", "")
 
-                                # Convert date string to datetime object
-                                try:
-                                    changed_date_obj = datetime.strptime(changed_date, "%Y-%m-%dT%H:%M:%S.%fZ")
-                                except ValueError:
+                                    # Convert date string to datetime object
                                     try:
-                                        changed_date_obj = datetime.strptime(changed_date, "%Y-%m-%dT%H:%M:%SZ")
+                                        changed_date_obj = datetime.strptime(changed_date, "%Y-%m-%dT%H:%M:%S.%fZ")
                                     except ValueError:
-                                        changed_date_obj = None
+                                        try:
+                                            changed_date_obj = datetime.strptime(changed_date, "%Y-%m-%dT%H:%M:%SZ")
+                                        except ValueError:
+                                            changed_date_obj = None
 
-                                if changed_date_obj:  # Only insert if we have a valid date
-                                    # Insert the change record
-                                    connection.execute(
-                                        text("""
-                                            INSERT INTO change_history 
-                                            (record_id, table_name, field_changed, old_value, new_value, changed_by, changed_date)
-                                            VALUES 
-                                            (:record_id, :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
-                                        """),
-                                        {
-                                            "record_id": work_item_id,
-                                            "table_name": work_item_type,
-                                            "field_changed": "System.State",
-                                            "old_value": old_value,
-                                            "new_value": new_value,
-                                            "changed_by": changed_by,
-                                            "changed_date": changed_date_obj
-                                        }
-                                    )
+                                    if changed_date_obj:  # Only insert if we have a valid date
+                                        # Insert the change record
+                                        connection.execute(
+                                            text("""
+                                                INSERT INTO change_history 
+                                                (record_id, table_name, field_changed, old_value, new_value, changed_by, changed_date)
+                                                VALUES 
+                                                (:record_id, :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
+                                            """),
+                                            {
+                                                "record_id": work_item_id,
+                                                "table_name": work_item_type,
+                                                "field_changed": field_name,
+                                                "old_value": old_value,
+                                                "new_value": new_value,
+                                                "changed_by": changed_by,
+                                                "changed_date": changed_date_obj
+                                            }
+                                        )
 
-                                state_changes.append([
-                                    changed_date,
-                                    old_value,
-                                    new_value
-                                ])
+                                    # For backward compatibility, store state changes in the return value
+                                    if field_name == 'System.State':
+                                        state_changes.append([
+                                            changed_date,
+                                            old_value,
+                                            new_value
+                                        ])
                         
                         connection.commit()
                         
