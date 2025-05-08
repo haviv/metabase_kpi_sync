@@ -351,6 +351,7 @@ class DatabaseConnection:
             ('p1_p2_bugs_in_dev', "SELECT COUNT(*) FROM bugs WHERE state IN ('Approved', 'Issues Found', 'New', 'In Progress', 'Waiting for PR') AND severity IN ('1','2')"),
             ('open_bugs_QA_p1_p2', "SELECT COUNT(*) FROM bugs WHERE state IN ('Ready for QA', 'In QA') AND severity IN ('1','2')"),
             ('total_customers', " SELECT COUNT(DISTINCT i.customer_name) AS total_customers FROM issues i"),
+            ('redline_bugs', "SELECT  COUNT(*) * 1.0 / (SELECT COUNT(DISTINCT customer_name) FROM bugs) AS bugs_with_parent_per_customer FROM bugs WHERE parent_issue IS NOT NULL AND DATE_TRUNC('month', created_date) = DATE_TRUNC('month', CURRENT_DATE)"),
             ('open_p1_bugs_with_customer_issues', "SELECT COUNT(*) FROM bugs WHERE state NOT IN ('Done', 'Not reproduced', 'QA Completed', 'Removed') AND severity = '1' AND parent_issue IS NOT NULL")
         ]
 
