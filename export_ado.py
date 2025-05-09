@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 from pathlib import Path
-from sqlalchemy import create_engine, text, Table, Column, Integer, String, DateTime, MetaData, ForeignKey, inspect
+from sqlalchemy import create_engine, text, Table, Column, Integer, String, DateTime, MetaData, ForeignKey, inspect, Float
 from sqlalchemy.dialects.postgresql import TEXT as PG_TEXT
 from sqlalchemy.exc import SQLAlchemyError
 import json
@@ -176,6 +176,14 @@ class DatabaseConnection:
                 if 'sync_status' in existing_tables:
                     self._drop_index(connection, "idx_sync_status_entity_type", "sync_status")
                 
+                # Alter history_snapshots.number column to FLOAT if the table exists
+                if 'history_snapshots' in existing_tables:
+                    connection.execute(text("""
+                        ALTER TABLE history_snapshots 
+                        ALTER COLUMN number TYPE FLOAT 
+                        USING number::FLOAT
+                    """))
+                
                 connection.commit()
 
             text_type = self._get_text_type()
@@ -256,7 +264,7 @@ class DatabaseConnection:
                 'history_snapshots', self.metadata,
                 Column('snapshot_date', DateTime, primary_key=True),
                 Column('name', String(255), primary_key=True),
-                Column('number', Integer, nullable=False)
+                Column('number', Float, nullable=False)
             )
 
             # Change history table
