@@ -176,6 +176,13 @@ class DatabaseConnection:
                 if 'sync_status' in existing_tables:
                     self._drop_index(connection, "idx_sync_status_entity_type", "sync_status")
                 
+                # Drop existing change_history indexes if table exists (will be recreated with optimizations)
+                if 'change_history' in existing_tables:
+                    self._drop_index(connection, "idx_change_history_query_optimization", "change_history")
+                    self._drop_index(connection, "idx_change_history_changed_date", "change_history")
+                    self._drop_index(connection, "idx_change_history_record_id", "change_history")
+                    self._drop_index(connection, "idx_change_history_field_changed", "change_history")
+                
                 # Alter history_snapshots.number column to FLOAT if the table exists
                 if 'history_snapshots' in existing_tables:
                     connection.execute(text("""
@@ -299,6 +306,12 @@ class DatabaseConnection:
                     # Add indexes for work_items table
                     self._create_index(connection, "idx_work_items_changed_date", "work_items", "changed_date")
                     self._create_index(connection, "idx_work_items_type", "work_items", "work_item_type")
+                    
+                    # Add critical indexes for change_history table to improve Metabase query performance
+                    self._create_index(connection, "idx_change_history_query_optimization", "change_history", "table_name, field_changed, new_value, changed_date")
+                    self._create_index(connection, "idx_change_history_changed_date", "change_history", "changed_date")
+                    self._create_index(connection, "idx_change_history_record_id", "change_history", "record_id, table_name")
+                    self._create_index(connection, "idx_change_history_field_changed", "change_history", "field_changed, table_name")
                     
                     connection.commit()
                 except SQLAlchemyError as e:
