@@ -176,6 +176,11 @@ class DatabaseConnection:
                 if 'sync_status' in existing_tables:
                     self._drop_index(connection, "idx_sync_status_entity_type", "sync_status")
                 
+                if 'sprints' in existing_tables:
+                    self._drop_index(connection, "idx_sprints_name", "sprints")
+                    self._drop_index(connection, "idx_sprints_start_date", "sprints")
+                    self._drop_index(connection, "idx_sprints_finish_date", "sprints")
+                
                 # Alter history_snapshots.number column to FLOAT if the table exists
                 if 'history_snapshots' in existing_tables:
                     connection.execute(text("""
@@ -280,6 +285,19 @@ class DatabaseConnection:
                 Column('changed_date', DateTime, nullable=True, server_default=text('CURRENT_TIMESTAMP')),
             )
 
+            # Sprints table
+            self.sprints = Table(
+                'sprints', self.metadata,
+                Column('id', String(255), primary_key=True),
+                Column('name', String(500), nullable=False),
+                Column('path', String(1000), nullable=True),
+                Column('start_date', DateTime, nullable=True),
+                Column('finish_date', DateTime, nullable=True),
+                Column('state', String(50), nullable=True),
+                Column('created_date', DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP')),
+                Column('updated_date', DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP')),
+            )
+
             # Create tables if they don't exist
             self.metadata.create_all(self.engine, checkfirst=True)
 
@@ -299,6 +317,11 @@ class DatabaseConnection:
                     # Add indexes for work_items table
                     self._create_index(connection, "idx_work_items_changed_date", "work_items", "changed_date")
                     self._create_index(connection, "idx_work_items_type", "work_items", "work_item_type")
+                    
+                    # Add indexes for sprints table
+                    self._create_index(connection, "idx_sprints_name", "sprints", "name")
+                    self._create_index(connection, "idx_sprints_start_date", "sprints", "start_date")
+                    self._create_index(connection, "idx_sprints_finish_date", "sprints", "finish_date")
                     
                     connection.commit()
                 except SQLAlchemyError as e:
@@ -561,6 +584,65 @@ class DatabaseConnection:
 
         return processed_count
 
+    def upsert_sprints(self, sprints):
+        """Upsert sprints into the sprints table"""
+        processed_count = 0
+        with self.engine.connect() as connection:
+            for sprint in sprints:
+                try:
+                    # Check if sprint exists
+                    result = connection.execute(
+                        text("SELECT id FROM sprints WHERE id = :id"),
+                        {"id": sprint['id']}
+                    ).first()
+
+                    if result:
+                        # Update existing sprint
+                        connection.execute(
+                            text("""
+                                UPDATE sprints 
+                                SET name = :name, 
+                                    path = :path,
+                                    start_date = :start_date, 
+                                    finish_date = :finish_date,
+                                    state = :state,
+                                    updated_date = CURRENT_TIMESTAMP
+                                WHERE id = :id
+                            """),
+                            {
+                                "id": sprint['id'],
+                                "name": sprint['name'],
+                                "path": sprint['path'],
+                                "start_date": sprint['start_date'],
+                                "finish_date": sprint['finish_date'],
+                                "state": sprint['state']
+                            }
+                        )
+                    else:
+                        # Insert new sprint
+                        connection.execute(
+                            text("""
+                                INSERT INTO sprints (id, name, path, start_date, finish_date, state)
+                                VALUES (:id, :name, :path, :start_date, :finish_date, :state)
+                            """),
+                            {
+                                "id": sprint['id'],
+                                "name": sprint['name'],
+                                "path": sprint['path'],
+                                "start_date": sprint['start_date'],
+                                "finish_date": sprint['finish_date'],
+                                "state": sprint['state']
+                            }
+                        )
+
+                    connection.commit()
+                    processed_count += 1
+                except SQLAlchemyError as e:
+                    print(f"Error upserting sprint {sprint['id']}: {str(e)}")
+                    connection.rollback()
+
+        return processed_count
+
 def get_database_connection():
     """Factory function to create the appropriate database connection"""
     try:
@@ -574,9 +656,10 @@ def get_database_connection():
         raise
 
 class ADOExtractor:
-    def __init__(self, organization, project, personal_access_token):
+    def __init__(self, organization, project, personal_access_token, scrum_project=None):
         self.organization = organization
         self.project = requests.utils.quote(project)  # URL encode project name
+        self.scrum_project = requests.utils.quote(scrum_project) if scrum_project else self.project  # URL encode scrum project name
         self.personal_access_token = personal_access_token
         
         # Setup authentication header
@@ -1384,10 +1467,102 @@ class ADOExtractor:
         
         return all_state_changes
 
+    def update_sprints(self):
+        """Fetch all sprints from Azure DevOps and update the database"""
+        print("------>Fetching sprints from Azure DevOps")
+        
+        # Get team context first - use scrum project for sprints
+        teams_url = f"https://dev.azure.com/{self.organization}/_apis/projects/{self.scrum_project}/teams?api-version=7.0"
+        teams_response = requests.get(teams_url, headers=self.headers)
+        
+        if teams_response.status_code != 200:
+            print(f"Error fetching teams: {teams_response.status_code} - {teams_response.text}")
+            return 0
+        
+        teams = teams_response.json().get("value", [])
+        if not teams:
+            print("No teams found in the scrum project")
+            return 0
+        
+        all_sprints = []
+        
+        # Since all teams share the same sprints, we only need to fetch from the first team
+        if teams:
+            team = teams[0]  # Get only the first team
+            team_id = team["id"]
+            team_name = team["name"]
+            print(f"------>Fetching sprints for team: {team_name} (all teams share the same sprints)")
+            
+            # Get iterations (sprints) for this team - use scrum project
+            iterations_url = f"https://dev.azure.com/{self.organization}/{self.scrum_project}/{team_id}/_apis/work/teamsettings/iterations?api-version=7.0"
+            iterations_response = requests.get(iterations_url, headers=self.headers)
+            
+            if iterations_response.status_code != 200:
+                print(f"Error fetching iterations for team {team_name}: {iterations_response.status_code}")
+                return 0
+            
+            iterations = iterations_response.json().get("value", [])
+            
+            for iteration in iterations:
+                # Get detailed iteration information - use scrum project
+                iteration_id = iteration["id"]
+                iteration_detail_url = f"https://dev.azure.com/{self.organization}/{self.scrum_project}/{team_id}/_apis/work/teamsettings/iterations/{iteration_id}?api-version=7.0"
+                detail_response = requests.get(iteration_detail_url, headers=self.headers)
+                
+                if detail_response.status_code != 200:
+                    print(f"Error fetching iteration details for {iteration['name']}: {detail_response.status_code}")
+                    continue
+                
+                iteration_detail = detail_response.json()
+                attributes = iteration_detail.get("attributes", {})
+                
+                # Parse dates
+                start_date = None
+                finish_date = None
+                
+                if "startDate" in attributes and attributes["startDate"]:
+                    try:
+                        start_date = datetime.strptime(attributes["startDate"], "%Y-%m-%dT%H:%M:%S.%fZ")
+                    except ValueError:
+                        try:
+                            start_date = datetime.strptime(attributes["startDate"], "%Y-%m-%dT%H:%M:%SZ")
+                        except ValueError:
+                            print(f"Could not parse start date: {attributes['startDate']}")
+                
+                if "finishDate" in attributes and attributes["finishDate"]:
+                    try:
+                        finish_date = datetime.strptime(attributes["finishDate"], "%Y-%m-%dT%H:%M:%S.%fZ")
+                    except ValueError:
+                        try:
+                            finish_date = datetime.strptime(attributes["finishDate"], "%Y-%m-%dT%H:%M:%SZ")
+                        except ValueError:
+                            print(f"Could not parse finish date: {attributes['finishDate']}")
+                
+                sprint_data = {
+                    'id': iteration_detail["id"],
+                    'name': iteration_detail["name"],
+                    'path': iteration_detail["path"],
+                    'start_date': start_date,
+                    'finish_date': finish_date,
+                    'state': attributes.get("timeFrame", "")
+                }
+                
+                all_sprints.append(sprint_data)
+        
+        # Update database with sprints
+        if hasattr(self, 'db_connection') and self.db_connection:
+            processed_count = self.db_connection.upsert_sprints(all_sprints)
+            print(f"------>Processed {processed_count} sprints")
+            return processed_count
+        else:
+            print("------>No database connection available for sprints update")
+            return 0
+
 def main():
     # Load configuration from .env file
     organization = os.getenv('ADO_ORGANIZATION')
     project = os.getenv('ADO_PROJECT')
+    scrum_project = os.getenv('ADO_SCRUM_PROJECT')
     pat = os.getenv('ADO_PERSONAL_ACCESS_TOKEN')
     
     if not all([organization, project, pat]):
@@ -1397,7 +1572,7 @@ def main():
         raise ValueError("Please update the ADO_PERSONAL_ACCESS_TOKEN in your .env file with your actual PAT")
 
     # Initialize extractor and database connection
-    extractor = ADOExtractor(organization, project, pat)
+    extractor = ADOExtractor(organization, project, pat, scrum_project)
     db = get_database_connection()
     
     # Set the database connection for the extractor
@@ -1459,6 +1634,9 @@ def main():
             print("------>Cleaning up invalid parent issue references")
             db.update_parent_issue()
 
+            # Update sprints
+            processed_sprints = extractor.update_sprints()
+
             # Update history snapshots
             db.update_history_snapshots()
             print("------>Updated history snapshots")
@@ -1473,6 +1651,9 @@ def main():
             if processed_work_items > 0:
                 db.update_sync_status('work_item', processed_work_items)
 
+            if processed_sprints > 0:
+                db.update_sync_status('sprint', processed_sprints)
+
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"=== Sync cycle completed at {current_time} ===")
             print(f"Sleeping for {SLEEP_INTERVAL/60} minutes...\n")
@@ -1484,6 +1665,7 @@ def main():
             break
         except Exception as e:
             print(f"\nError during processing: {str(e)}")
+            print(f"\nError during processing: {e}")
             print("Will retry in the next cycle")
             print(f"Sleeping for {SLEEP_INTERVAL/60} minutes...")
             time.sleep(SLEEP_INTERVAL)
