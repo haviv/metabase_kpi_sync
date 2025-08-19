@@ -659,7 +659,29 @@ class ADOExtractor:
     def __init__(self, organization, project, personal_access_token, scrum_project=None):
         self.organization = organization
         self.project = requests.utils.quote(project)  # URL encode project name
-        self.scrum_project = requests.utils.quote(scrum_project) if scrum_project else self.project  # URL encode scrum project name
+        
+        # Handle multiple scrum projects in format "project1:team1,project2:team2"
+        if scrum_project:
+            self.scrum_projects = []
+            for project_team in scrum_project.split(','):
+                if ':' in project_team:
+                    project_name, team_name = project_team.strip().split(':', 1)
+                    self.scrum_projects.append({
+                        'project': requests.utils.quote(project_name.strip()),
+                        'team': team_name.strip()
+                    })
+                else:
+                    # Fallback to old format - treat as project only
+                    self.scrum_projects.append({
+                        'project': requests.utils.quote(scrum_project.strip()),
+                        'team': None
+                    })
+        else:
+            self.scrum_projects = [{
+                'project': self.project,
+                'team': None
+            }]
+        
         self.personal_access_token = personal_access_token
         
         # Setup authentication header
@@ -1471,42 +1493,65 @@ class ADOExtractor:
         """Fetch all sprints from Azure DevOps and update the database"""
         print("------>Fetching sprints from Azure DevOps")
         
-        # Get team context first - use scrum project for sprints
-        teams_url = f"https://dev.azure.com/{self.organization}/_apis/projects/{self.scrum_project}/teams?api-version=7.0"
-        teams_response = requests.get(teams_url, headers=self.headers)
-        
-        if teams_response.status_code != 200:
-            print(f"Error fetching teams: {teams_response.status_code} - {teams_response.text}")
-            return 0
-        
-        teams = teams_response.json().get("value", [])
-        if not teams:
-            print("No teams found in the scrum project")
-            return 0
-        
         all_sprints = []
+        total_processed = 0
         
-        # Since all teams share the same sprints, we only need to fetch from the first team
-        if teams:
-            team = teams[0]  # Get only the first team
-            team_id = team["id"]
-            team_name = team["name"]
-            print(f"------>Fetching sprints for team: {team_name} (all teams share the same sprints)")
+        # Iterate through all scrum project:team combinations
+        for scrum_config in self.scrum_projects:
+            project_name = scrum_config['project']
+            team_name = scrum_config['team']
             
-            # Get iterations (sprints) for this team - use scrum project
-            iterations_url = f"https://dev.azure.com/{self.organization}/{self.scrum_project}/{team_id}/_apis/work/teamsettings/iterations?api-version=7.0"
+            print(f"------>Processing sprints for project: {project_name}, team: {team_name}")
+            
+            # Get teams for this project
+            teams_url = f"https://dev.azure.com/{self.organization}/_apis/projects/{project_name}/teams?api-version=7.0"
+            teams_response = requests.get(teams_url, headers=self.headers)
+            
+            if teams_response.status_code != 200:
+                print(f"Error fetching teams for project {project_name}: {teams_response.status_code} - {teams_response.text}")
+                continue
+            
+            teams = teams_response.json().get("value", [])
+            if not teams:
+                print(f"No teams found in project {project_name}")
+                continue
+            
+            # Find the specific team if specified, otherwise use the first team
+            target_team = None
+            if team_name:
+                # Look for the specific team
+                for team in teams:
+                    if team["name"].lower() == team_name.lower():
+                        target_team = team
+                        break
+                
+                if not target_team:
+                    print(f"Team '{team_name}' not found in project {project_name}. Available teams: {[t['name'] for t in teams]}")
+                    continue
+            else:
+                # Use the first team if no specific team is specified
+                target_team = teams[0]
+                print(f"Using first team: {target_team['name']}")
+            
+            team_id = target_team["id"]
+            actual_team_name = target_team["name"]
+            print(f"------>Fetching sprints for team: {actual_team_name} in project: {project_name}")
+            
+            # Get iterations (sprints) for this team
+            iterations_url = f"https://dev.azure.com/{self.organization}/{project_name}/{team_id}/_apis/work/teamsettings/iterations?api-version=7.0"
             iterations_response = requests.get(iterations_url, headers=self.headers)
             
             if iterations_response.status_code != 200:
-                print(f"Error fetching iterations for team {team_name}: {iterations_response.status_code}")
-                return 0
+                print(f"Error fetching iterations for team {actual_team_name} in project {project_name}: {iterations_response.status_code}")
+                continue
             
             iterations = iterations_response.json().get("value", [])
+            print(f"------>Found {len(iterations)} iterations for team {actual_team_name}")
             
             for iteration in iterations:
-                # Get detailed iteration information - use scrum project
+                # Get detailed iteration information
                 iteration_id = iteration["id"]
-                iteration_detail_url = f"https://dev.azure.com/{self.organization}/{self.scrum_project}/{team_id}/_apis/work/teamsettings/iterations/{iteration_id}?api-version=7.0"
+                iteration_detail_url = f"https://dev.azure.com/{self.organization}/{project_name}/{team_id}/_apis/work/teamsettings/iterations/{iteration_id}?api-version=7.0"
                 detail_response = requests.get(iteration_detail_url, headers=self.headers)
                 
                 if detail_response.status_code != 200:
@@ -1552,7 +1597,7 @@ class ADOExtractor:
         # Update database with sprints
         if hasattr(self, 'db_connection') and self.db_connection:
             processed_count = self.db_connection.upsert_sprints(all_sprints)
-            print(f"------>Processed {processed_count} sprints")
+            print(f"------>Processed {processed_count} sprints from {len(self.scrum_projects)} project:team combinations")
             return processed_count
         else:
             print("------>No database connection available for sprints update")
