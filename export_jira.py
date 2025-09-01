@@ -301,14 +301,14 @@ class JIRADatabaseConnection:
             ('new_bugs', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state IN ('New Request')"),
             ('closed_bugs', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state IN ('DONE')"),
             ('reopened_bugs', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state = 'New Request' AND changed_date >= CURRENT_DATE - INTERVAL '1 day'"),
-            ('p1_bugs', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE severity = 'Critical' AND state NOT IN ('DONE')"),
-            ('p2_bugs', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE severity = 'High' AND state NOT IN ('DONE')"),
-            ('p1_p2_bugs_with_customer_issues', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state NOT IN ('DONE') AND severity IN ('Critical','High') AND parent_issue IS NOT NULL"),
-            ('p1_p2_bugs_in_dev', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state IN ('New Request', 'IN-PROGRESS', 'In Review') AND severity IN ('Critical','High')"),
-            ('open_bugs_QA_p1_p2', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state IN ('READY FOR QA', 'IN QA') AND severity IN ('Critical','High')"),
+            ('p1_bugs', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE severity = '1 - Critical' AND state NOT IN ('DONE')"),
+            ('p2_bugs', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE severity = '2 - High' AND state NOT IN ('DONE')"),
+            ('p1_p2_bugs_with_customer_issues', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state NOT IN ('DONE') AND severity IN ('1 - Critical','2 - High') AND parent_issue IS NOT NULL"),
+            ('p1_p2_bugs_in_dev', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state IN ('New Request', 'IN-PROGRESS', 'In Review') AND severity IN ('1 - Critical','2 - High')"),
+            ('open_bugs_QA_p1_p2', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state IN ('READY FOR QA', 'IN QA') AND severity IN ('1 - Critical','2 - High')"),
             ('total_customers', f"SELECT COUNT(DISTINCT customer_name) AS total_customers FROM {self.schema_name}.bugs WHERE customer_name IS NOT NULL AND customer_name != ''"),
             ('redline_bugs', f"SELECT COALESCE(COUNT(*) * 1.0 / NULLIF((SELECT COUNT(DISTINCT customer_name) FROM {self.schema_name}.bugs WHERE customer_name IS NOT NULL AND customer_name != ''), 0), 0) AS bugs_with_parent_per_customer FROM {self.schema_name}.bugs WHERE parent_issue IS NOT NULL AND DATE_TRUNC('month', created_date) = DATE_TRUNC('month', CURRENT_DATE)"),
-            ('open_p1_bugs_with_customer_issues', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state NOT IN ('DONE') AND severity = 'Critical' AND parent_issue IS NOT NULL")
+            ('open_p1_bugs_with_customer_issues', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state NOT IN ('DONE') AND severity = '1 - Critical' AND parent_issue IS NOT NULL")
         ]
 
         snapshot_date = datetime.now().date()
