@@ -596,6 +596,8 @@ class JIRAExtractor:
         # Default JIRA Sprint field is commonly customfield_10020
         self.sprint_field = os.getenv('JIRA_SPRINT_FIELD_ID', 'customfield_10020')
         
+
+        
         # Setup authentication header
         auth_string = f"{email}:{api_token}"
         auth_bytes = auth_string.encode('ascii')
@@ -708,7 +710,22 @@ class JIRAExtractor:
                 state = status.get("name") if status else ""
                 
                 # Extract customer name from configurable custom field
-                customer_name = fields.get(self.customer_name_field, "")
+                customer_name_raw = fields.get(self.customer_name_field, "")
+                # Handle different customer name field formats
+                if isinstance(customer_name_raw, list) and customer_name_raw:
+                    # If it's a list, extract the 'value' from the first item
+                    if isinstance(customer_name_raw[0], dict) and 'value' in customer_name_raw[0]:
+                        customer_name = customer_name_raw[0]['value']
+                    else:
+                        customer_name = str(customer_name_raw[0])
+                elif isinstance(customer_name_raw, dict) and 'value' in customer_name_raw:
+                    # If it's a dict, extract the 'value'
+                    customer_name = customer_name_raw['value']
+                else:
+                    # Otherwise, convert to string
+                    customer_name = str(customer_name_raw) if customer_name_raw else ""
+                
+
                 
                 # Extract components as area path
                 components = fields.get("components", [])
@@ -766,6 +783,7 @@ class JIRAExtractor:
                     'hotfix_delivered_version': "",  # JIRA doesn't have this field
                     'parent_issue': parent_issue
                 }
+
                 
                 bugs.append(bug_data)
                 
@@ -848,7 +866,20 @@ class JIRAExtractor:
                 state = status.get("name") if status else ""
                 
                 # Extract customer name from configurable custom field
-                customer_name = fields.get(self.customer_name_field, "")
+                customer_name_raw = fields.get(self.customer_name_field, "")
+                # Handle different customer name field formats
+                if isinstance(customer_name_raw, list) and customer_name_raw:
+                    # If it's a list, extract the 'value' from the first item
+                    if isinstance(customer_name_raw[0], dict) and 'value' in customer_name_raw[0]:
+                        customer_name = customer_name_raw[0]['value']
+                    else:
+                        customer_name = str(customer_name_raw[0])
+                elif isinstance(customer_name_raw, dict) and 'value' in customer_name_raw:
+                    # If it's a dict, extract the 'value'
+                    customer_name = customer_name_raw['value']
+                else:
+                    # Otherwise, convert to string
+                    customer_name = str(customer_name_raw) if customer_name_raw else ""
                 
                 # Extract components as area path
                 components = fields.get("components", [])
@@ -902,6 +933,7 @@ class JIRAExtractor:
                     'hotfix_delivered_version': "",  # JIRA doesn't have this field
                     'work_item_type': 'Story'
                 }
+
                 
                 stories.append(story_data)
             
@@ -1023,6 +1055,103 @@ class JIRAExtractor:
         
         return all_state_changes
 
+    def handle_story_changes(self, stories, db_connection=None):
+        """Get and store the state change history for stories using JIRA changelog"""
+        if not stories:
+            return {}
+
+        story_ids = [story['id'] if isinstance(story, dict) else story for story in stories]
+        all_state_changes = {}
+
+        for story_id in story_ids:
+            # Get changelog for the story
+            changelog_url = f"{self.jira_url}/rest/api/3/issue/{story_id}?expand=changelog"
+            response = requests.get(changelog_url, headers=self.headers)
+            
+            if response.status_code != 200:
+                print(f"Error fetching changelog for story {story_id}: {response.status_code}")
+                continue
+                
+            issue_data = response.json()
+            changelog = issue_data.get("changelog", {}).get("histories", [])
+            state_changes = []
+
+            # If we have a database connection, handle the database operations
+            if db_connection:
+                with db_connection.engine.connect() as connection:
+                    try:
+                        # First, delete all existing entries for this story
+                        connection.execute(text(f"DELETE FROM {db_connection.schema_name}.change_history WHERE record_id = :record_id"), 
+                                        {"record_id": story_id})
+                        
+                        # Insert new state changes
+                        for history in changelog:
+                            for item in history.get("items", []):
+                                if item.get("field") == "status":
+                                    changed_date = history.get("created", "")
+                                    old_value = item.get("fromString", "")
+                                    new_value = item.get("toString", "")
+                                    
+                                    if old_value and new_value:  # Only insert if both values exist
+                                        # Parse the changed date
+                                        try:
+                                            changed_date_obj = datetime.fromisoformat(changed_date.replace('Z', '+00:00'))
+                                        except ValueError:
+                                            try:
+                                                # Try parsing without timezone info
+                                                changed_date_obj = datetime.fromisoformat(changed_date.split('.')[0])
+                                            except ValueError:
+                                                changed_date_obj = None
+
+                                        if changed_date_obj:  # Only insert if we have a valid date
+                                            # Get the user who made the change
+                                            changed_by = history.get("author", {}).get("displayName", "")
+                                            
+                                            connection.execute(text(f"""
+                                                INSERT INTO {db_connection.schema_name}.change_history 
+                                                (record_id, table_name, field_changed, old_value, new_value, changed_by, changed_date)
+                                                VALUES (:record_id, :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
+                                            """), {
+                                                "record_id": story_id,
+                                                "table_name": "work_items",
+                                                "field_changed": "state",
+                                                "old_value": old_value,
+                                                "new_value": new_value,
+                                                "changed_by": changed_by,
+                                                "changed_date": changed_date_obj
+                                            })
+                                        
+                                        state_changes.append([
+                                            changed_date,
+                                            old_value,
+                                            new_value
+                                        ])
+                        
+                        connection.commit()
+                        print(f"------>Processed {len(state_changes)} state changes for story {story_id}")
+                        
+                    except Exception as e:
+                        print(f"Error processing state changes for story {story_id}: {str(e)}")
+                        connection.rollback()
+            else:
+                # If no database connection, just collect the state changes
+                for history in changelog:
+                    for item in history.get("items", []):
+                        if item.get("field") == "status":
+                            changed_date = history.get("created", "")
+                            old_value = item.get("fromString", "")
+                            new_value = item.get("toString", "")
+
+                            state_changes.append([
+                                changed_date,
+                                old_value,
+                                new_value
+                            ])
+            
+            all_state_changes[story_id] = state_changes
+        
+        return all_state_changes
+
 def main():
     # Load configuration from .env file
     jira_url = os.getenv('JIRA_CLOUD_URL')
@@ -1073,6 +1202,11 @@ def main():
             print("------>Processing bug state changes")
             extractor.handle_bug_changes(bugs, db)
             print(f"------>Processed state changes for {len(bugs)} bugs")
+
+            # Process state changes for all stories
+            print("------>Processing story state changes")
+            extractor.handle_story_changes(stories, db)
+            print(f"------>Processed state changes for {len(stories)} stories")
 
             # Update sync status for both bugs and stories
             if processed_bugs > 0:
