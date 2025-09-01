@@ -1044,7 +1044,7 @@ def main():
     # Set the database connection for the extractor
     extractor.db_connection = db
 
-    SLEEP_INTERVAL = 60   # 1 hour in seconds
+    SLEEP_INTERVAL = 80 * 60 
     
     print(f"Starting continuous JIRA sync with {SLEEP_INTERVAL/60} minute intervals")
     print(f"Using schema: {schema_name}")
