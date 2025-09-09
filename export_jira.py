@@ -648,16 +648,12 @@ class JIRAExtractor:
         return text
 
     def get_bugs_since_last_sync(self, last_sync_time):
-        """Query bugs from JIRA since last sync time with pagination"""
+        """Query bugs from JIRA since last sync time with pagination using new JQL API"""
         # Convert last_sync_time to JIRA date format
         last_sync_str = last_sync_time.strftime('%Y-%m-%d')
         
         # JQL query to get bugs updated since last sync
         jql_query = f'project = {self.project_key} AND issuetype = Bug AND updated >= "{last_sync_str}" ORDER BY updated DESC'
-        
-        # URL encode the JQL query
-        import urllib.parse
-        encoded_jql = urllib.parse.quote(jql_query)
         
         # Prepare fields parameter
         fields_param = "summary,description,assignee,priority,status,components,created,updated,parent"
@@ -672,14 +668,27 @@ class JIRAExtractor:
             fields_param += ",sprint"
         
         bugs = []
-        start_at = 0
+        next_page_token = None
         max_results = 100  # JIRA Cloud recommended page size
         total_fetched = 0
         
         while True:
-            search_url = f"{self.jira_url}/rest/api/3/search?jql={encoded_jql}&startAt={start_at}&maxResults={max_results}&fields={fields_param}&expand=renderedFields"
+            # Use the new JQL search endpoint
+            search_url = f"{self.jira_url}/rest/api/3/search/jql"
             
-            response = requests.get(search_url, headers=self.headers)
+            # Prepare query parameters
+            query_params = {
+                'jql': jql_query,
+                'maxResults': max_results,
+                'fields': fields_param,
+                'expand': 'renderedFields'
+            }
+            
+            # Add nextPageToken if we have one
+            if next_page_token:
+                query_params['nextPageToken'] = next_page_token
+            
+            response = requests.get(search_url, headers=self.headers, params=query_params)
             if response.status_code != 200:
                 print(f"Error fetching bugs from JIRA: {response.status_code} - {response.text}")
                 break
@@ -792,28 +801,28 @@ class JIRAExtractor:
                     relations = [{'type': 'parent', 'issue_id': parent_issue}]
                     self.db_connection.update_bug_relations(bug_data["id"], relations)
             
-            # Check if we need to fetch more pages
-            total_issues = issues_data.get("total", 0)
-            if start_at + len(issues) >= total_issues:
+            # Check if we need to fetch more pages using the new pagination method
+            is_last = issues_data.get("isLast", True)
+            if is_last:
                 break
                 
-            start_at += len(issues)
+            # Get the next page token for the next iteration
+            next_page_token = issues_data.get("nextPageToken")
+            if not next_page_token:
+                break
+                
             time.sleep(0.5)  # Rate limiting between pages
         
         print(f"------>Total bugs fetched: {total_fetched}")
         return bugs
 
     def get_stories_since_last_sync(self, last_sync_time):
-        """Query stories from JIRA since last sync time with pagination"""
+        """Query stories from JIRA since last sync time with pagination using new JQL API"""
         # Convert last_sync_time to JIRA date format
         last_sync_str = last_sync_time.strftime('%Y-%m-%d')
         
         # JQL query to get stories updated since last sync
         jql_query = f'project = {self.project_key} AND issuetype = Story AND updated >= "{last_sync_str}" ORDER BY updated DESC'
-        
-        # URL encode the JQL query
-        import urllib.parse
-        encoded_jql = urllib.parse.quote(jql_query)
         
         # Prepare fields parameter
         fields_param = "summary,description,assignee,priority,status,components,created,updated,sprint"
@@ -828,14 +837,27 @@ class JIRAExtractor:
             fields_param += ",sprint"
         
         stories = []
-        start_at = 0
+        next_page_token = None
         max_results = 100  # JIRA Cloud recommended page size
         total_fetched = 0
         
         while True:
-            search_url = f"{self.jira_url}/rest/api/3/search?jql={encoded_jql}&startAt={start_at}&maxResults={max_results}&fields={fields_param}&expand=renderedFields"
+            # Use the new JQL search endpoint
+            search_url = f"{self.jira_url}/rest/api/3/search/jql"
             
-            response = requests.get(search_url, headers=self.headers)
+            # Prepare query parameters
+            query_params = {
+                'jql': jql_query,
+                'maxResults': max_results,
+                'fields': fields_param,
+                'expand': 'renderedFields'
+            }
+            
+            # Add nextPageToken if we have one
+            if next_page_token:
+                query_params['nextPageToken'] = next_page_token
+            
+            response = requests.get(search_url, headers=self.headers, params=query_params)
             if response.status_code != 200:
                 print(f"Error fetching stories from JIRA: {response.status_code} - {response.text}")
                 break
@@ -937,12 +959,16 @@ class JIRAExtractor:
                 
                 stories.append(story_data)
             
-            # Check if we need to fetch more pages
-            total_issues = issues_data.get("total", 0)
-            if start_at + len(issues) >= total_issues:
+            # Check if we need to fetch more pages using the new pagination method
+            is_last = issues_data.get("isLast", True)
+            if is_last:
                 break
                 
-            start_at += len(issues)
+            # Get the next page token for the next iteration
+            next_page_token = issues_data.get("nextPageToken")
+            if not next_page_token:
+                break
+                
             time.sleep(0.5)  # Rate limiting between pages
         
         print(f"------>Total stories fetched: {total_fetched}")
@@ -1187,6 +1213,9 @@ def main():
             # Get last sync times from database
             bugs_last_sync = db.get_last_sync_time('bug')
             stories_last_sync = db.get_last_sync_time('story')
+
+            print(f"------>Last bug sync: {bugs_last_sync}")
+            print(f"------>Last story sync: {stories_last_sync}")
             
             # Extract and store bugs
             bugs = extractor.get_bugs_since_last_sync(bugs_last_sync)
