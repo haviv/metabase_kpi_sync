@@ -121,7 +121,8 @@ class DatabaseConnection:
         
         new_columns = {
             'iteration_path': 'VARCHAR(500)',
-            'hotfix_delivered_version': 'VARCHAR(200)'
+            'hotfix_delivered_version': 'VARCHAR(200)',
+            'target_date': 'TIMESTAMP'
         }
         
         # Add work_item_type column for work_items table if it doesn't exist
@@ -153,44 +154,6 @@ class DatabaseConnection:
     def setup_tables(self):
         """Create tables if they don't exist and add new columns if needed"""
         try:
-            # Check if tables exist
-            with self.engine.connect() as connection:
-                inspector = inspect(self.engine)
-                existing_tables = inspector.get_table_names()
-                
-                # Add new columns if tables exist
-                if 'issues' in existing_tables:
-                    self._add_new_columns(connection, 'issues')
-                
-                if 'bugs' in existing_tables:
-                    self._add_new_columns(connection, 'bugs')
-                
-                # Drop existing indexes if tables exist
-                if 'issues' in existing_tables:
-                    self._drop_index(connection, "idx_issues_changed_date", "issues")
-                
-                if 'bugs' in existing_tables:
-                    self._drop_index(connection, "idx_bugs_changed_date", "bugs")
-                    self._drop_index(connection, "idx_bugs_parent_issue", "bugs")
-                
-                if 'sync_status' in existing_tables:
-                    self._drop_index(connection, "idx_sync_status_entity_type", "sync_status")
-                
-                if 'sprints' in existing_tables:
-                    self._drop_index(connection, "idx_sprints_name", "sprints")
-                    self._drop_index(connection, "idx_sprints_start_date", "sprints")
-                    self._drop_index(connection, "idx_sprints_finish_date", "sprints")
-                
-                # Alter history_snapshots.number column to FLOAT if the table exists
-                if 'history_snapshots' in existing_tables:
-                    connection.execute(text("""
-                        ALTER TABLE history_snapshots 
-                        ALTER COLUMN number TYPE FLOAT 
-                        USING number::FLOAT
-                    """))
-                
-                connection.commit()
-
             text_type = self._get_text_type()
 
             # Issues table
@@ -207,7 +170,8 @@ class DatabaseConnection:
                 Column('created_date', DateTime, nullable=False),
                 Column('changed_date', DateTime, nullable=False),
                 Column('iteration_path', String(500), nullable=True),
-                Column('hotfix_delivered_version', String(200), nullable=True)
+                Column('hotfix_delivered_version', String(200), nullable=True),
+                Column('target_date', DateTime, nullable=True)
             )
 
             # Bugs relations table
@@ -233,7 +197,8 @@ class DatabaseConnection:
                 Column('created_date', DateTime, nullable=False),
                 Column('changed_date', DateTime, nullable=False),
                 Column('iteration_path', String(500), nullable=True),
-                Column('hotfix_delivered_version', String(200), nullable=True)
+                Column('hotfix_delivered_version', String(200), nullable=True),
+                Column('target_date', DateTime, nullable=True)
             )
 
             # Sync status table
@@ -261,7 +226,8 @@ class DatabaseConnection:
                 Column('changed_date', DateTime, nullable=False),
                 Column('iteration_path', String(500), nullable=True),
                 Column('hotfix_delivered_version', String(200), nullable=True),
-                Column('work_item_type', String(50), nullable=False)
+                Column('work_item_type', String(50), nullable=False),
+                Column('target_date', DateTime, nullable=True)
             )
 
             # History snapshots table
@@ -300,6 +266,47 @@ class DatabaseConnection:
 
             # Create tables if they don't exist
             self.metadata.create_all(self.engine, checkfirst=True)
+
+            # Add new columns to existing tables after table creation
+            with self.engine.connect() as connection:
+                inspector = inspect(self.engine)
+                existing_tables = inspector.get_table_names()
+                
+                # Add new columns if tables exist
+                if 'issues' in existing_tables:
+                    self._add_new_columns(connection, 'issues')
+                
+                if 'bugs' in existing_tables:
+                    self._add_new_columns(connection, 'bugs')
+                
+                if 'work_items' in existing_tables:
+                    self._add_new_columns(connection, 'work_items')
+                
+                # Drop existing indexes if tables exist
+                if 'issues' in existing_tables:
+                    self._drop_index(connection, "idx_issues_changed_date", "issues")
+                
+                if 'bugs' in existing_tables:
+                    self._drop_index(connection, "idx_bugs_changed_date", "bugs")
+                    self._drop_index(connection, "idx_bugs_parent_issue", "bugs")
+                
+                if 'sync_status' in existing_tables:
+                    self._drop_index(connection, "idx_sync_status_entity_type", "sync_status")
+                
+                if 'sprints' in existing_tables:
+                    self._drop_index(connection, "idx_sprints_name", "sprints")
+                    self._drop_index(connection, "idx_sprints_start_date", "sprints")
+                    self._drop_index(connection, "idx_sprints_finish_date", "sprints")
+                
+                # Alter history_snapshots.number column to FLOAT if the table exists
+                if 'history_snapshots' in existing_tables:
+                    connection.execute(text("""
+                        ALTER TABLE history_snapshots 
+                        ALTER COLUMN number TYPE FLOAT 
+                        USING number::FLOAT
+                    """))
+                
+                connection.commit()
 
             # Create indexes
             with self.engine.connect() as connection:
@@ -484,7 +491,8 @@ class DatabaseConnection:
                             created_date = :created_date,
                             changed_date = :changed_date,
                             iteration_path = :iteration_path,
-                            hotfix_delivered_version = :hotfix_delivered_version
+                            hotfix_delivered_version = :hotfix_delivered_version,
+                            target_date = :target_date
                         """
                         
                         if item_type == 'bug':
@@ -506,7 +514,8 @@ class DatabaseConnection:
                             "created_date": item['CreatedDate'],
                             "changed_date": item['ChangedDate'],
                             "iteration_path": item['IterationPath'],
-                            "hotfix_delivered_version": item['HotfixDeliveredVersion']
+                            "hotfix_delivered_version": item['HotfixDeliveredVersion'],
+                            "target_date": item.get('TargetDate')
                         }
                         
                         if item_type == 'bug':
@@ -524,7 +533,7 @@ class DatabaseConnection:
                         INSERT INTO {table.name} (
                             id, title, description, assigned_to, severity,
                             state, customer_name, area_path, created_date, changed_date,
-                            iteration_path, hotfix_delivered_version
+                            iteration_path, hotfix_delivered_version, target_date
                         """
                         
                         if item_type == 'bug':
@@ -536,7 +545,7 @@ class DatabaseConnection:
                         VALUES (
                             :id, :title, :description, :assigned_to, :severity,
                             :state, :customer_name, :area_path, :created_date, :changed_date,
-                            :iteration_path, :hotfix_delivered_version
+                            :iteration_path, :hotfix_delivered_version, :target_date
                         """
                         
                         if item_type == 'bug':
@@ -558,7 +567,8 @@ class DatabaseConnection:
                             "created_date": item['CreatedDate'],
                             "changed_date": item['ChangedDate'],
                             "iteration_path": item['IterationPath'],
-                            "hotfix_delivered_version": item['HotfixDeliveredVersion']
+                            "hotfix_delivered_version": item['HotfixDeliveredVersion'],
+                            "target_date": item.get('TargetDate')
                         }
                         
                         if item_type == 'bug':
@@ -714,7 +724,8 @@ class ADOExtractor:
                        [System.AreaPath],
                        [System.Parent],
                        [System.IterationPath],
-                       [Custom.HotfixDeliveredVersions]
+                       [Custom.HotfixDeliveredVersions],
+                       [Microsoft.VSTS.Scheduling.TargetDate]
                 FROM WorkItems
                 WHERE [System.WorkItemType] = '{work_item_type}'
                 AND [System.ChangedDate] > @Today - 1
@@ -766,6 +777,25 @@ class ADOExtractor:
                 else:
                     severity_value = fields.get('Microsoft.VSTS.Common.Priority', '')
                 
+                # Parse TargetDate if it exists
+                target_date = fields.get('Microsoft.VSTS.Scheduling.TargetDate', '')
+                if target_date:
+                    try:
+                        # Try parsing with milliseconds
+                        target_date = datetime.strptime(target_date, "%Y-%m-%dT%H:%M:%S.%fZ")
+                    except ValueError:
+                        try:
+                            # Try parsing without milliseconds
+                            target_date = datetime.strptime(target_date, "%Y-%m-%dT%H:%M:%SZ")
+                        except ValueError:
+                            try:
+                                # Try parsing date only
+                                target_date = datetime.strptime(target_date, "%Y-%m-%d")
+                            except ValueError:
+                                target_date = None
+                else:
+                    target_date = None
+
                 item_data = {
                     'ID': item["id"],
                     'Title': fields.get('System.Title', ''),
@@ -778,7 +808,8 @@ class ADOExtractor:
                     'CreatedDate': fields.get('System.CreatedDate', ''),
                     'ChangedDate': fields.get('System.ChangedDate', ''),
                     'IterationPath': fields.get('System.IterationPath', ''),
-                    'HotfixDeliveredVersion': fields.get('Custom.HotfixDeliveredVersions', '')
+                    'HotfixDeliveredVersion': fields.get('Custom.HotfixDeliveredVersions', ''),
+                    'TargetDate': target_date
                 }
 
                 if work_item_type == 'Bug':
@@ -1226,7 +1257,8 @@ class ADOExtractor:
                        [System.Parent],
                        [System.IterationPath],
                        [Custom.HotfixDeliveredVersions],
-                       [System.WorkItemType]
+                       [System.WorkItemType],
+                       [Microsoft.VSTS.Scheduling.TargetDate]
                 FROM WorkItems
                 WHERE [System.ChangedDate] > @Today - 1
                 ORDER BY [System.ChangedDate] DESC
@@ -1278,6 +1310,25 @@ class ADOExtractor:
                 else:
                     severity_value = fields.get('Microsoft.VSTS.Common.Priority', '')
                 
+                # Parse TargetDate if it exists
+                target_date = fields.get('Microsoft.VSTS.Scheduling.TargetDate', '')
+                if target_date:
+                    try:
+                        # Try parsing with milliseconds
+                        target_date = datetime.strptime(target_date, "%Y-%m-%dT%H:%M:%S.%fZ")
+                    except ValueError:
+                        try:
+                            # Try parsing without milliseconds
+                            target_date = datetime.strptime(target_date, "%Y-%m-%dT%H:%M:%SZ")
+                        except ValueError:
+                            try:
+                                # Try parsing date only
+                                target_date = datetime.strptime(target_date, "%Y-%m-%d")
+                            except ValueError:
+                                target_date = None
+                else:
+                    target_date = None
+
                 item_data = {
                     'ID': item["id"],
                     'Title': fields.get('System.Title', ''),
@@ -1291,7 +1342,8 @@ class ADOExtractor:
                     'ChangedDate': fields.get('System.ChangedDate', ''),
                     'IterationPath': fields.get('System.IterationPath', ''),
                     'HotfixDeliveredVersion': fields.get('Custom.HotfixDeliveredVersions', ''),
-                    'WorkItemType': work_item_type
+                    'WorkItemType': work_item_type,
+                    'TargetDate': target_date
                 }
 
                 batch_data.append(item_data)
@@ -1370,17 +1422,36 @@ class ADOExtractor:
                             else:
                                 severity_value = fields.get('Microsoft.VSTS.Common.Priority', '')
 
+                            # Parse TargetDate if it exists
+                            target_date = fields.get('Microsoft.VSTS.Scheduling.TargetDate', '')
+                            if target_date:
+                                try:
+                                    # Try parsing with milliseconds
+                                    target_date = datetime.strptime(target_date, "%Y-%m-%dT%H:%M:%S.%fZ")
+                                except ValueError:
+                                    try:
+                                        # Try parsing without milliseconds
+                                        target_date = datetime.strptime(target_date, "%Y-%m-%dT%H:%M:%SZ")
+                                    except ValueError:
+                                        try:
+                                            # Try parsing date only
+                                            target_date = datetime.strptime(target_date, "%Y-%m-%d")
+                                        except ValueError:
+                                            target_date = None
+                            else:
+                                target_date = None
+
                             # Insert the work item
                             connection.execute(
                                 text("""
                                     INSERT INTO work_items (
                                         id, title, description, assigned_to, severity,
                                         state, customer_name, area_path, created_date, changed_date,
-                                        iteration_path, hotfix_delivered_version, work_item_type
+                                        iteration_path, hotfix_delivered_version, work_item_type, target_date
                                     ) VALUES (
                                         :id, :title, :description, :assigned_to, :severity,
                                         :state, :customer_name, :area_path, :created_date, :changed_date,
-                                        :iteration_path, :hotfix_delivered_version, :work_item_type
+                                        :iteration_path, :hotfix_delivered_version, :work_item_type, :target_date
                                     )
                                 """),
                                 {
@@ -1396,7 +1467,8 @@ class ADOExtractor:
                                     "changed_date": fields.get('System.ChangedDate', ''),
                                     "iteration_path": fields.get('System.IterationPath', ''),
                                     "hotfix_delivered_version": fields.get('Custom.HotfixDeliveredVersions', ''),
-                                    "work_item_type": work_item_type
+                                    "work_item_type": work_item_type,
+                                    "target_date": target_date
                                 }
                             )
                             print(f"Inserted missing work item {work_item_id} of type {work_item_type}")
