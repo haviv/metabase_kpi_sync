@@ -64,6 +64,80 @@ class JIRADatabaseConnection:
             DROP INDEX IF EXISTS {index_name}
         """))
 
+    def _migrate_tables(self):
+        """Migrate existing tables to add new columns for JIRA integration"""
+        try:
+            with self.engine.connect() as connection:
+                inspector = inspect(self.engine)
+                existing_tables = inspector.get_table_names(schema=self.schema_name)
+                
+                # Define new columns to add to bugs table
+                bugs_new_columns = [
+                    ('test_iterations', 'VARCHAR(500)'),
+                    ('bugs_found', 'INTEGER'),
+                    ('regression', 'VARCHAR(100)'),
+                    ('time_spent', 'VARCHAR(50)'),
+                    ('fix_versions', 'VARCHAR(1000)'),
+                    ('tester', 'VARCHAR(200)'),
+                    ('story_points', 'FLOAT'),
+                    ('labels', 'VARCHAR(1000)'),
+                    ('worklog_total_time_spent', 'VARCHAR(50)'),
+                    ('worklog_entries_count', 'INTEGER')
+                ]
+                
+                # Define new columns to add to work_items table
+                work_items_new_columns = [
+                    ('test_iterations', 'VARCHAR(500)'),
+                    ('bugs_found', 'INTEGER'),
+                    ('regression', 'VARCHAR(100)'),
+                    ('time_spent', 'VARCHAR(50)'),
+                    ('fix_versions', 'VARCHAR(1000)'),
+                    ('tester', 'VARCHAR(200)'),
+                    ('story_points', 'FLOAT'),
+                    ('labels', 'VARCHAR(1000)'),
+                    ('worklog_total_time_spent', 'VARCHAR(50)'),
+                    ('worklog_entries_count', 'INTEGER')
+                ]
+                
+                # Migrate bugs table
+                if 'bugs' in existing_tables:
+                    print("------>Migrating bugs table...")
+                    for column_name, column_type in bugs_new_columns:
+                        try:
+                            # Check if column already exists
+                            existing_columns = [col['name'] for col in inspector.get_columns('bugs', schema=self.schema_name)]
+                            if column_name not in existing_columns:
+                                connection.execute(text(f"""
+                                    ALTER TABLE {self.schema_name}.bugs 
+                                    ADD COLUMN {column_name} {column_type}
+                                """))
+                                print(f"  Added column: {column_name}")
+                        except Exception as e:
+                            print(f"  Warning: Could not add column {column_name}: {str(e)}")
+                
+                # Migrate work_items table
+                if 'work_items' in existing_tables:
+                    print("------>Migrating work_items table...")
+                    for column_name, column_type in work_items_new_columns:
+                        try:
+                            # Check if column already exists
+                            existing_columns = [col['name'] for col in inspector.get_columns('work_items', schema=self.schema_name)]
+                            if column_name not in existing_columns:
+                                connection.execute(text(f"""
+                                    ALTER TABLE {self.schema_name}.work_items 
+                                    ADD COLUMN {column_name} {column_type}
+                                """))
+                                print(f"  Added column: {column_name}")
+                        except Exception as e:
+                            print(f"  Warning: Could not add column {column_name}: {str(e)}")
+                
+                connection.commit()
+                print("------>Schema migration completed")
+                
+        except Exception as e:
+            print(f"Error during schema migration: {str(e)}")
+            # Don't raise the exception as this shouldn't stop the sync process
+
     def setup_schema(self):
         """Create the JIRA schema if it doesn't exist"""
         try:
@@ -165,6 +239,17 @@ class JIRADatabaseConnection:
                 Column('changed_date', DateTime, nullable=False),
                 Column('iteration_path', String(500), nullable=True),
                 Column('hotfix_delivered_version', String(200), nullable=True),
+                # New fields for JIRA integration
+                Column('test_iterations', String(500), nullable=True),
+                Column('bugs_found', Integer, nullable=True),
+                Column('regression', String(100), nullable=True),
+                Column('time_spent', String(50), nullable=True),
+                Column('fix_versions', String(1000), nullable=True),
+                Column('tester', String(200), nullable=True),
+                Column('story_points', Float, nullable=True),
+                Column('labels', String(1000), nullable=True),
+                Column('worklog_total_time_spent', String(50), nullable=True),
+                Column('worklog_entries_count', Integer, nullable=True),
                 schema=self.schema_name
             )
 
@@ -228,11 +313,25 @@ class JIRADatabaseConnection:
                 Column('iteration_path', String(500), nullable=True),
                 Column('hotfix_delivered_version', String(200), nullable=True),
                 Column('work_item_type', String(50), nullable=False),
+                # New fields for JIRA integration
+                Column('test_iterations', String(500), nullable=True),
+                Column('bugs_found', Integer, nullable=True),
+                Column('regression', String(100), nullable=True),
+                Column('time_spent', String(50), nullable=True),
+                Column('fix_versions', String(1000), nullable=True),
+                Column('tester', String(200), nullable=True),
+                Column('story_points', Float, nullable=True),
+                Column('labels', String(1000), nullable=True),
+                Column('worklog_total_time_spent', String(50), nullable=True),
+                Column('worklog_entries_count', Integer, nullable=True),
                 schema=self.schema_name
             )
 
             # Create tables if they don't exist
             self.metadata.create_all(self.engine, checkfirst=True)
+            
+            # Migrate existing tables to add new columns
+            self._migrate_tables()
 
             # Create indexes
             with self.engine.connect() as connection:
@@ -406,7 +505,17 @@ class JIRADatabaseConnection:
                                 iteration_path = :iteration_path,
                                 hotfix_delivered_version = :hotfix_delivered_version,
                                 parent_issue = :parent_issue,
-                                numeric_id = :numeric_id
+                                numeric_id = :numeric_id,
+                                test_iterations = :test_iterations,
+                                bugs_found = :bugs_found,
+                                regression = :regression,
+                                time_spent = :time_spent,
+                                fix_versions = :fix_versions,
+                                tester = :tester,
+                                story_points = :story_points,
+                                labels = :labels,
+                                worklog_total_time_spent = :worklog_total_time_spent,
+                                worklog_entries_count = :worklog_entries_count
                             WHERE id = :id
                             """),
                             {
@@ -423,7 +532,17 @@ class JIRADatabaseConnection:
                                 "iteration_path": bug['iteration_path'],
                                 "hotfix_delivered_version": bug['hotfix_delivered_version'],
                                 "parent_issue": bug.get('parent_issue'),
-                                "numeric_id": bug.get('numeric_id')
+                                "numeric_id": bug.get('numeric_id'),
+                                "test_iterations": bug.get('test_iterations'),
+                                "bugs_found": bug.get('bugs_found'),
+                                "regression": bug.get('regression'),
+                                "time_spent": bug.get('time_spent'),
+                                "fix_versions": bug.get('fix_versions'),
+                                "tester": bug.get('tester'),
+                                "story_points": bug.get('story_points'),
+                                "labels": bug.get('labels'),
+                                "worklog_total_time_spent": bug.get('worklog_total_time_spent'),
+                                "worklog_entries_count": bug.get('worklog_entries_count')
                             }
                         )
                     else:
@@ -433,11 +552,19 @@ class JIRADatabaseConnection:
                             INSERT INTO {self.schema_name}.bugs (
                                 id, numeric_id, title, description, assigned_to, severity,
                                 state, customer_name, area_path, created_date, changed_date,
-                                iteration_path, hotfix_delivered_version, parent_issue
+                                iteration_path, hotfix_delivered_version, parent_issue,
+                                test_iterations, bugs_found, regression,
+                                time_spent,
+                                fix_versions, tester, story_points, labels,
+                                worklog_total_time_spent, worklog_entries_count
                             ) VALUES (
                                 :id, :numeric_id, :title, :description, :assigned_to, :severity,
                                 :state, :customer_name, :area_path, :created_date, :changed_date,
-                                :iteration_path, :hotfix_delivered_version, :parent_issue
+                                :iteration_path, :hotfix_delivered_version, :parent_issue,
+                                :test_iterations, :bugs_found, :regression,
+                                :time_spent,
+                                :fix_versions, :tester, :story_points, :labels,
+                                :worklog_total_time_spent, :worklog_entries_count
                             )
                             """),
                             {
@@ -454,7 +581,17 @@ class JIRADatabaseConnection:
                                 "changed_date": bug['changed_date'],
                                 "iteration_path": bug['iteration_path'],
                                 "hotfix_delivered_version": bug['hotfix_delivered_version'],
-                                "parent_issue": bug.get('parent_issue')
+                                "parent_issue": bug.get('parent_issue'),
+                                "test_iterations": bug.get('test_iterations'),
+                                "bugs_found": bug.get('bugs_found'),
+                                "regression": bug.get('regression'),
+                                "time_spent": bug.get('time_spent'),
+                                "fix_versions": bug.get('fix_versions'),
+                                "tester": bug.get('tester'),
+                                "story_points": bug.get('story_points'),
+                                "labels": bug.get('labels'),
+                                "worklog_total_time_spent": bug.get('worklog_total_time_spent'),
+                                "worklog_entries_count": bug.get('worklog_entries_count')
                             }
                         )
 
@@ -513,7 +650,17 @@ class JIRADatabaseConnection:
                                 iteration_path = :iteration_path,
                                 hotfix_delivered_version = :hotfix_delivered_version,
                                 work_item_type = :work_item_type,
-                                numeric_id = :numeric_id
+                                numeric_id = :numeric_id,
+                                test_iterations = :test_iterations,
+                                bugs_found = :bugs_found,
+                                regression = :regression,
+                                time_spent = :time_spent,
+                                fix_versions = :fix_versions,
+                                tester = :tester,
+                                story_points = :story_points,
+                                labels = :labels,
+                                worklog_total_time_spent = :worklog_total_time_spent,
+                                worklog_entries_count = :worklog_entries_count
                             WHERE id = :id
                             """),
                             {
@@ -530,7 +677,17 @@ class JIRADatabaseConnection:
                                 "iteration_path": item['iteration_path'],
                                 "hotfix_delivered_version": item['hotfix_delivered_version'],
                                 "work_item_type": item['work_item_type'],
-                                "numeric_id": item.get('numeric_id')
+                                "numeric_id": item.get('numeric_id'),
+                                "test_iterations": item.get('test_iterations'),
+                                "bugs_found": item.get('bugs_found'),
+                                "regression": item.get('regression'),
+                                "time_spent": item.get('time_spent'),
+                                "fix_versions": item.get('fix_versions'),
+                                "tester": item.get('tester'),
+                                "story_points": item.get('story_points'),
+                                "labels": item.get('labels'),
+                                "worklog_total_time_spent": item.get('worklog_total_time_spent'),
+                                "worklog_entries_count": item.get('worklog_entries_count')
                             }
                         )
                     else:
@@ -540,11 +697,19 @@ class JIRADatabaseConnection:
                             INSERT INTO {self.schema_name}.work_items (
                                 id, numeric_id, title, description, assigned_to, severity,
                                 state, customer_name, area_path, created_date, changed_date,
-                                iteration_path, hotfix_delivered_version, work_item_type
+                                iteration_path, hotfix_delivered_version, work_item_type,
+                                test_iterations, bugs_found, regression,
+                                time_spent,
+                                fix_versions, tester, story_points, labels,
+                                worklog_total_time_spent, worklog_entries_count
                             ) VALUES (
                                 :id, :numeric_id, :title, :description, :assigned_to, :severity,
                                 :state, :customer_name, :area_path, :created_date, :changed_date,
-                                :iteration_path, :hotfix_delivered_version, :work_item_type
+                                :iteration_path, :hotfix_delivered_version, :work_item_type,
+                                :test_iterations, :bugs_found, :regression,
+                                :time_spent,
+                                :fix_versions, :tester, :story_points, :labels,
+                                :worklog_total_time_spent, :worklog_entries_count
                             )
                             """),
                             {
@@ -561,7 +726,17 @@ class JIRADatabaseConnection:
                                 "changed_date": item['changed_date'],
                                 "iteration_path": item['iteration_path'],
                                 "hotfix_delivered_version": item['hotfix_delivered_version'],
-                                "work_item_type": item['work_item_type']
+                                "work_item_type": item['work_item_type'],
+                                "test_iterations": item.get('test_iterations'),
+                                "bugs_found": item.get('bugs_found'),
+                                "regression": item.get('regression'),
+                                "time_spent": item.get('time_spent'),
+                                "fix_versions": item.get('fix_versions'),
+                                "tester": item.get('tester'),
+                                "story_points": item.get('story_points'),
+                                "labels": item.get('labels'),
+                                "worklog_total_time_spent": item.get('worklog_total_time_spent'),
+                                "worklog_entries_count": item.get('worklog_entries_count')
                             }
                         )
 
@@ -595,6 +770,14 @@ class JIRAExtractor:
         self.customer_name_field = os.getenv('JIRA_CUSTOMER_NAME_FIELD_ID', 'customfield_10001')
         # Default JIRA Sprint field is commonly customfield_10020
         self.sprint_field = os.getenv('JIRA_SPRINT_FIELD_ID', 'customfield_10020')
+        # New custom field IDs for additional fields
+        # These can be configured via environment variables in .env file
+        # Updated with actual field IDs from Pathlock JIRA instance
+        self.test_iterations_field = os.getenv('JIRA_TEST_ITERATIONS_FIELD_ID', 'customfield_10856')
+        self.bugs_found_field = os.getenv('JIRA_BUGS_FOUND_FIELD_ID', 'customfield_10955')
+        self.regression_field = os.getenv('JIRA_REGRESSION_FIELD_ID', 'customfield_10814')
+        self.tester_field = os.getenv('JIRA_TESTER_FIELD_ID', 'customfield_10505')
+        self.story_points_field = os.getenv('JIRA_STORY_POINTS_FIELD_ID', 'customfield_10037')  # Updated for Pathlock JIRA
         
 
         
@@ -647,6 +830,97 @@ class JIRAExtractor:
         text = '\n'.join([line.rstrip() for line in text.splitlines()]).strip()
         return text
 
+    def _extract_custom_field_value(self, fields, field_id, field_type='string'):
+        """Extract value from a custom field with proper type handling"""
+        raw_value = fields.get(field_id)
+        if not raw_value:
+            return None
+            
+        if field_type == 'string':
+            if isinstance(raw_value, list) and raw_value:
+                if isinstance(raw_value[0], dict) and 'value' in raw_value[0]:
+                    return raw_value[0]['value']
+                else:
+                    return str(raw_value[0])
+            elif isinstance(raw_value, dict) and 'value' in raw_value:
+                return raw_value['value']
+            else:
+                return str(raw_value)
+        elif field_type == 'number':
+            if isinstance(raw_value, (int, float)):
+                return raw_value
+            elif isinstance(raw_value, str) and raw_value.isdigit():
+                return int(raw_value)
+            elif isinstance(raw_value, str) and raw_value.replace('.', '').isdigit():
+                return float(raw_value)
+            return None
+        elif field_type == 'user':
+            if isinstance(raw_value, dict):
+                return raw_value.get('displayName', '')
+            elif isinstance(raw_value, list) and raw_value and isinstance(raw_value[0], dict):
+                return raw_value[0].get('displayName', '')
+            return str(raw_value) if raw_value else ''
+        
+        return str(raw_value) if raw_value else ''
+
+    def _extract_time_tracking(self, fields):
+        """Extract time tracking information - focus on aggregatetimespent"""
+        timetracking = fields.get('timetracking', {})
+        # Extract the aggregatetimespent field which contains the total time spent
+        time_spent = timetracking.get('timeSpent', '')
+        return {
+            'time_spent': time_spent
+        }
+
+    def _extract_fix_versions(self, fields):
+        """Extract fix versions as comma-separated string"""
+        fix_versions = fields.get('fixVersions', [])
+        if not fix_versions:
+            return ''
+        version_names = []
+        for version in fix_versions:
+            if isinstance(version, dict) and 'name' in version:
+                version_names.append(version['name'])
+            elif isinstance(version, str):
+                version_names.append(version)
+        return ', '.join(version_names)
+
+    def _extract_labels(self, fields):
+        """Extract labels as comma-separated string"""
+        labels = fields.get('labels', [])
+        if not labels:
+            return ''
+        return ', '.join(labels)
+
+    def _extract_worklog_summary(self, fields):
+        """Extract worklog summary information"""
+        worklog = fields.get('worklog', {})
+        if not worklog:
+            return {'total_time_spent': '', 'entries_count': 0}
+        
+        worklogs = worklog.get('worklogs', [])
+        total_seconds = 0
+        for entry in worklogs:
+            time_spent = entry.get('timeSpentSeconds', 0)
+            if isinstance(time_spent, (int, float)):
+                total_seconds += time_spent
+        
+        # Convert seconds to readable format
+        if total_seconds > 0:
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
+            if hours > 0:
+                time_str = f"{hours}h {minutes}m" if minutes > 0 else f"{hours}h"
+            else:
+                time_str = f"{minutes}m"
+        else:
+            time_str = ''
+            
+        return {
+            'total_time_spent': time_str,
+            'entries_count': len(worklogs)
+        }
+
     def get_bugs_since_last_sync(self, last_sync_time):
         """Query bugs from JIRA since last sync time with pagination using new JQL API"""
         # Convert last_sync_time to JIRA date format
@@ -656,7 +930,7 @@ class JIRAExtractor:
         jql_query = f'project = {self.project_key} AND issuetype = Bug AND updated >= "{last_sync_str}" ORDER BY updated DESC'
         
         # Prepare fields parameter
-        fields_param = "summary,description,assignee,priority,status,components,created,updated,parent"
+        fields_param = "summary,description,assignee,priority,status,components,created,updated,parent,timetracking,fixVersions,labels,worklog"
         if self.customer_name_field not in fields_param:
             fields_param += f",{self.customer_name_field}"
         if self.sprint_field not in fields_param:
@@ -666,6 +940,17 @@ class JIRAExtractor:
             fields_param += ",customfield_10020"
         if 'sprint' not in fields_param and self.sprint_field != 'sprint':
             fields_param += ",sprint"
+        # Add new custom fields
+        if self.test_iterations_field not in fields_param:
+            fields_param += f",{self.test_iterations_field}"
+        if self.bugs_found_field not in fields_param:
+            fields_param += f",{self.bugs_found_field}"
+        if self.regression_field not in fields_param:
+            fields_param += f",{self.regression_field}"
+        if self.tester_field not in fields_param:
+            fields_param += f",{self.tester_field}"
+        if self.story_points_field not in fields_param:
+            fields_param += f",{self.story_points_field}"
         
         bugs = []
         next_page_token = None
@@ -776,6 +1061,25 @@ class JIRAExtractor:
                         from html import unescape
                         description_text = unescape(re.sub(r"<[^>]+>", "", rendered_desc)).strip()
 
+                # Extract new fields
+                test_iterations = self._extract_custom_field_value(fields, self.test_iterations_field, 'string')
+                bugs_found = self._extract_custom_field_value(fields, self.bugs_found_field, 'number')
+                regression = self._extract_custom_field_value(fields, self.regression_field, 'string')
+                tester = self._extract_custom_field_value(fields, self.tester_field, 'user')
+                story_points = self._extract_custom_field_value(fields, self.story_points_field, 'number')
+                
+                # Extract time tracking
+                time_tracking = self._extract_time_tracking(fields)
+                
+                # Extract fix versions
+                fix_versions = self._extract_fix_versions(fields)
+                
+                # Extract labels
+                labels = self._extract_labels(fields)
+                
+                # Extract worklog summary
+                worklog_summary = self._extract_worklog_summary(fields)
+
                 bug_data = {
                     'id': issue["key"],  # use human-readable key as primary id (e.g., PN-15092)
                     'numeric_id': int(issue["id"]) if str(issue.get("id", "")).isdigit() else None,
@@ -790,7 +1094,18 @@ class JIRAExtractor:
                     'changed_date': fields.get("updated", ""),
                     'iteration_path': iteration_path,
                     'hotfix_delivered_version': "",  # JIRA doesn't have this field
-                    'parent_issue': parent_issue
+                    'parent_issue': parent_issue,
+                    # New fields
+                    'test_iterations': test_iterations,
+                    'bugs_found': bugs_found,
+                    'regression': regression,
+                    'time_spent': time_tracking['time_spent'],
+                    'fix_versions': fix_versions,
+                    'tester': tester,
+                    'story_points': story_points,
+                    'labels': labels,
+                    'worklog_total_time_spent': worklog_summary['total_time_spent'],
+                    'worklog_entries_count': worklog_summary['entries_count']
                 }
 
                 
@@ -825,7 +1140,7 @@ class JIRAExtractor:
         jql_query = f'project = {self.project_key} AND issuetype = Story AND updated >= "{last_sync_str}" ORDER BY updated DESC'
         
         # Prepare fields parameter
-        fields_param = "summary,description,assignee,priority,status,components,created,updated,sprint"
+        fields_param = "summary,description,assignee,priority,status,components,created,updated,sprint,timetracking,fixVersions,labels,worklog"
         if self.customer_name_field not in fields_param:
             fields_param += f",{self.customer_name_field}"
         if self.sprint_field not in fields_param:
@@ -835,6 +1150,17 @@ class JIRAExtractor:
             fields_param += ",customfield_10020"
         if 'sprint' not in fields_param and self.sprint_field != 'sprint':
             fields_param += ",sprint"
+        # Add new custom fields
+        if self.test_iterations_field not in fields_param:
+            fields_param += f",{self.test_iterations_field}"
+        if self.bugs_found_field not in fields_param:
+            fields_param += f",{self.bugs_found_field}"
+        if self.regression_field not in fields_param:
+            fields_param += f",{self.regression_field}"
+        if self.tester_field not in fields_param:
+            fields_param += f",{self.tester_field}"
+        if self.story_points_field not in fields_param:
+            fields_param += f",{self.story_points_field}"
         
         stories = []
         next_page_token = None
@@ -939,6 +1265,25 @@ class JIRAExtractor:
                         from html import unescape
                         description_text = unescape(re.sub(r"<[^>]+>", "", rendered_desc)).strip()
 
+                # Extract new fields
+                test_iterations = self._extract_custom_field_value(fields, self.test_iterations_field, 'string')
+                bugs_found = self._extract_custom_field_value(fields, self.bugs_found_field, 'number')
+                regression = self._extract_custom_field_value(fields, self.regression_field, 'string')
+                tester = self._extract_custom_field_value(fields, self.tester_field, 'user')
+                story_points = self._extract_custom_field_value(fields, self.story_points_field, 'number')
+                
+                # Extract time tracking
+                time_tracking = self._extract_time_tracking(fields)
+                
+                # Extract fix versions
+                fix_versions = self._extract_fix_versions(fields)
+                
+                # Extract labels
+                labels = self._extract_labels(fields)
+                
+                # Extract worklog summary
+                worklog_summary = self._extract_worklog_summary(fields)
+
                 story_data = {
                     'id': issue["key"],  # use human-readable key as primary id (e.g., PN-15092)
                     'numeric_id': int(issue["id"]) if str(issue.get("id", "")).isdigit() else None,
@@ -953,7 +1298,18 @@ class JIRAExtractor:
                     'changed_date': fields.get("updated", ""),
                     'iteration_path': iteration_path,
                     'hotfix_delivered_version': "",  # JIRA doesn't have this field
-                    'work_item_type': 'Story'
+                    'work_item_type': 'Story',
+                    # New fields
+                    'test_iterations': test_iterations,
+                    'bugs_found': bugs_found,
+                    'regression': regression,
+                    'time_spent': time_tracking['time_spent'],
+                    'fix_versions': fix_versions,
+                    'tester': tester,
+                    'story_points': story_points,
+                    'labels': labels,
+                    'worklog_total_time_spent': worklog_summary['total_time_spent'],
+                    'worklog_entries_count': worklog_summary['entries_count']
                 }
 
                 
