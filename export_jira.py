@@ -76,7 +76,7 @@ class JIRADatabaseConnection:
                     ('test_iterations', 'VARCHAR(500)'),
                     ('bugs_found', 'INTEGER'),
                     ('regression', 'VARCHAR(100)'),
-                    ('time_spent', 'VARCHAR(50)'),
+                    ('time_spent', 'INTEGER'),
                     ('fix_versions', 'VARCHAR(1000)'),
                     ('tester', 'VARCHAR(200)'),
                     ('story_points', 'FLOAT'),
@@ -90,7 +90,7 @@ class JIRADatabaseConnection:
                     ('test_iterations', 'VARCHAR(500)'),
                     ('bugs_found', 'INTEGER'),
                     ('regression', 'VARCHAR(100)'),
-                    ('time_spent', 'VARCHAR(50)'),
+                    ('time_spent', 'INTEGER'),
                     ('fix_versions', 'VARCHAR(1000)'),
                     ('tester', 'VARCHAR(200)'),
                     ('story_points', 'FLOAT'),
@@ -130,6 +130,36 @@ class JIRADatabaseConnection:
                                 print(f"  Added column: {column_name}")
                         except Exception as e:
                             print(f"  Warning: Could not add column {column_name}: {str(e)}")
+                
+                # Migrate time_spent column from VARCHAR to INTEGER if it exists
+                for table_name in ['bugs', 'work_items']:
+                    if table_name in existing_tables:
+                        try:
+                            # Check if time_spent column exists and is VARCHAR
+                            existing_columns = [col['name'] for col in inspector.get_columns(table_name, schema=self.schema_name)]
+                            if 'time_spent' in existing_columns:
+                                # Check current data type
+                                column_info = inspector.get_columns(table_name, schema=self.schema_name)
+                                time_spent_col = next((col for col in column_info if col['name'] == 'time_spent'), None)
+                                if time_spent_col and time_spent_col['type'].__class__.__name__ == 'VARCHAR':
+                                    print(f"  Converting time_spent column in {table_name} from VARCHAR to INTEGER...")
+                                    # First, try to convert existing data
+                                    connection.execute(text(f"""
+                                        UPDATE {self.schema_name}.{table_name} 
+                                        SET time_spent = CASE 
+                                            WHEN time_spent ~ '^[0-9]+$' THEN time_spent::INTEGER
+                                            ELSE NULL
+                                        END
+                                        WHERE time_spent IS NOT NULL
+                                    """))
+                                    # Then alter the column type
+                                    connection.execute(text(f"""
+                                        ALTER TABLE {self.schema_name}.{table_name} 
+                                        ALTER COLUMN time_spent TYPE INTEGER USING time_spent::INTEGER
+                                    """))
+                                    print(f"  Converted time_spent column in {table_name} to INTEGER")
+                        except Exception as e:
+                            print(f"  Warning: Could not convert time_spent column in {table_name}: {str(e)}")
                 
                 connection.commit()
                 print("------>Schema migration completed")
@@ -243,7 +273,7 @@ class JIRADatabaseConnection:
                 Column('test_iterations', String(500), nullable=True),
                 Column('bugs_found', Integer, nullable=True),
                 Column('regression', String(100), nullable=True),
-                Column('time_spent', String(50), nullable=True),
+                Column('time_spent', Integer, nullable=True),
                 Column('fix_versions', String(1000), nullable=True),
                 Column('tester', String(200), nullable=True),
                 Column('story_points', Float, nullable=True),
@@ -317,7 +347,7 @@ class JIRADatabaseConnection:
                 Column('test_iterations', String(500), nullable=True),
                 Column('bugs_found', Integer, nullable=True),
                 Column('regression', String(100), nullable=True),
-                Column('time_spent', String(50), nullable=True),
+                Column('time_spent', Integer, nullable=True),
                 Column('fix_versions', String(1000), nullable=True),
                 Column('tester', String(200), nullable=True),
                 Column('story_points', Float, nullable=True),
@@ -864,10 +894,12 @@ class JIRAExtractor:
         return str(raw_value) if raw_value else ''
 
     def _extract_time_tracking(self, fields):
-        """Extract time tracking information - focus on aggregatetimespent"""
+        """Extract time tracking information - focus on aggregatetimespent in seconds"""
         timetracking = fields.get('timetracking', {})
-        # Extract the aggregatetimespent field which contains the total time spent
-        time_spent = timetracking.get('timeSpent', '')
+        # Extract the aggregatetimespent field which contains the total time spent in seconds
+        time_spent_seconds = timetracking.get('timeSpentSeconds')
+        # Return as integer for database storage, or None if no time tracking data
+        time_spent = int(time_spent_seconds) if time_spent_seconds else None
         return {
             'time_spent': time_spent
         }
@@ -1132,15 +1164,15 @@ class JIRAExtractor:
         return bugs
 
     def get_stories_since_last_sync(self, last_sync_time):
-        """Query stories from JIRA since last sync time with pagination using new JQL API"""
+        """Query all work items from JIRA since last sync time with pagination using new JQL API"""
         # Convert last_sync_time to JIRA date format
         last_sync_str = last_sync_time.strftime('%Y-%m-%d')
         
-        # JQL query to get stories updated since last sync
-        jql_query = f'project = {self.project_key} AND issuetype = Story AND updated >= "{last_sync_str}" ORDER BY updated DESC'
+        # JQL query to get all issue types updated since last sync
+        jql_query = f'project = {self.project_key} AND issuetype in (Story, Bug, Task, Epic, "New Feature", Improvement, Enhancement, "Sub-task") AND updated >= "{last_sync_str}" ORDER BY updated DESC'
         
         # Prepare fields parameter
-        fields_param = "summary,description,assignee,priority,status,components,created,updated,sprint,timetracking,fixVersions,labels,worklog"
+        fields_param = "summary,description,assignee,priority,status,components,created,updated,sprint,timetracking,fixVersions,labels,worklog,issuetype"
         if self.customer_name_field not in fields_param:
             fields_param += f",{self.customer_name_field}"
         if self.sprint_field not in fields_param:
@@ -1162,7 +1194,7 @@ class JIRAExtractor:
         if self.story_points_field not in fields_param:
             fields_param += f",{self.story_points_field}"
         
-        stories = []
+        work_items = []
         next_page_token = None
         max_results = 100  # JIRA Cloud recommended page size
         total_fetched = 0
@@ -1185,7 +1217,7 @@ class JIRAExtractor:
             
             response = requests.get(search_url, headers=self.headers, params=query_params)
             if response.status_code != 200:
-                print(f"Error fetching stories from JIRA: {response.status_code} - {response.text}")
+                print(f"Error fetching work items from JIRA: {response.status_code} - {response.text}")
                 break
 
             issues_data = response.json()
@@ -1194,12 +1226,16 @@ class JIRAExtractor:
             if not issues:
                 break
                 
-            print(f"------>Fetched {len(issues)} stories (total so far: {total_fetched + len(issues)})")
+            print(f"------>Fetched {len(issues)} work items (total so far: {total_fetched + len(issues)})")
             total_fetched += len(issues)
 
             # Process this batch of issues
             for issue in issues:
                 fields = issue["fields"]
+                
+                # Extract issue type
+                issue_type_obj = fields.get("issuetype")
+                work_item_type = issue_type_obj.get("name") if issue_type_obj else "Unknown"
                 
                 # Extract assignee
                 assignee = fields.get("assignee")
@@ -1284,7 +1320,7 @@ class JIRAExtractor:
                 # Extract worklog summary
                 worklog_summary = self._extract_worklog_summary(fields)
 
-                story_data = {
+                work_item_data = {
                     'id': issue["key"],  # use human-readable key as primary id (e.g., PN-15092)
                     'numeric_id': int(issue["id"]) if str(issue.get("id", "")).isdigit() else None,
                     'title': fields.get("summary", ""),
@@ -1298,7 +1334,7 @@ class JIRAExtractor:
                     'changed_date': fields.get("updated", ""),
                     'iteration_path': iteration_path,
                     'hotfix_delivered_version': "",  # JIRA doesn't have this field
-                    'work_item_type': 'Story',
+                    'work_item_type': work_item_type,  # Use the actual issue type from JIRA
                     # New fields
                     'test_iterations': test_iterations,
                     'bugs_found': bugs_found,
@@ -1313,7 +1349,7 @@ class JIRAExtractor:
                 }
 
                 
-                stories.append(story_data)
+                work_items.append(work_item_data)
             
             # Check if we need to fetch more pages using the new pagination method
             is_last = issues_data.get("isLast", True)
@@ -1327,8 +1363,8 @@ class JIRAExtractor:
                 
             time.sleep(0.5)  # Rate limiting between pages
         
-        print(f"------>Total stories fetched: {total_fetched}")
-        return stories
+        print(f"------>Total work items fetched: {total_fetched}")
+        return work_items
 
     def handle_bug_changes(self, bugs, db_connection=None):
         """Get and store the state change history for bugs using JIRA changelog"""
@@ -1578,26 +1614,26 @@ def main():
             processed_bugs = db.upsert_bugs(bugs)
             print(f"------>Processed {processed_bugs} bugs")
 
-            # Extract and store stories
-            stories = extractor.get_stories_since_last_sync(stories_last_sync)
-            processed_stories = db.upsert_work_items(stories)
-            print(f"------>Processed {processed_stories} stories")
+            # Extract and store all work items
+            work_items = extractor.get_stories_since_last_sync(stories_last_sync)
+            processed_work_items = db.upsert_work_items(work_items)
+            print(f"------>Processed {processed_work_items} work items")
 
             # Process state changes for all bugs
             print("------>Processing bug state changes")
             extractor.handle_bug_changes(bugs, db)
             print(f"------>Processed state changes for {len(bugs)} bugs")
 
-            # Process state changes for all stories
-            print("------>Processing story state changes")
-            extractor.handle_story_changes(stories, db)
-            print(f"------>Processed state changes for {len(stories)} stories")
+            # Process state changes for all work items
+            print("------>Processing work item state changes")
+            extractor.handle_story_changes(work_items, db)
+            print(f"------>Processed state changes for {len(work_items)} work items")
 
-            # Update sync status for both bugs and stories
+            # Update sync status for both bugs and work items
             if processed_bugs > 0:
                 db.update_sync_status('bug', processed_bugs)
-            if processed_stories > 0:
-                db.update_sync_status('story', processed_stories)
+            if processed_work_items > 0:
+                db.update_sync_status('story', processed_work_items)
 
             # Update history snapshots
             db.update_history_snapshots()
