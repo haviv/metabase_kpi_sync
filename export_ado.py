@@ -351,8 +351,8 @@ class DatabaseConnection:
             if result:
                 return result[0]
             
-            # If no sync history, default to 6 months ago
-            return datetime.now() - timedelta(days=180)
+            # If no sync history, default to March 1st, 2025
+            return datetime(2025, 3, 1)
 
     def update_sync_status(self, entity_type, records_processed, status='completed'):
         """Update the sync status for the entity type"""
