@@ -82,7 +82,8 @@ class JIRADatabaseConnection:
                     ('story_points', 'FLOAT'),
                     ('labels', 'VARCHAR(1000)'),
                     ('worklog_total_time_spent', 'VARCHAR(50)'),
-                    ('worklog_entries_count', 'INTEGER')
+                    ('worklog_entries_count', 'INTEGER'),
+                    ('developer', 'VARCHAR(200)')
                 ]
                 
                 # Define new columns to add to work_items table
@@ -96,7 +97,8 @@ class JIRADatabaseConnection:
                     ('story_points', 'FLOAT'),
                     ('labels', 'VARCHAR(1000)'),
                     ('worklog_total_time_spent', 'VARCHAR(50)'),
-                    ('worklog_entries_count', 'INTEGER')
+                    ('worklog_entries_count', 'INTEGER'),
+                    ('developer', 'VARCHAR(200)')
                 ]
                 
                 # Migrate bugs table
@@ -280,6 +282,7 @@ class JIRADatabaseConnection:
                 Column('labels', String(1000), nullable=True),
                 Column('worklog_total_time_spent', String(50), nullable=True),
                 Column('worklog_entries_count', Integer, nullable=True),
+                Column('developer', String(200), nullable=True),
                 schema=self.schema_name
             )
 
@@ -354,6 +357,7 @@ class JIRADatabaseConnection:
                 Column('labels', String(1000), nullable=True),
                 Column('worklog_total_time_spent', String(50), nullable=True),
                 Column('worklog_entries_count', Integer, nullable=True),
+                Column('developer', String(200), nullable=True),
                 schema=self.schema_name
             )
 
@@ -545,7 +549,8 @@ class JIRADatabaseConnection:
                                 story_points = :story_points,
                                 labels = :labels,
                                 worklog_total_time_spent = :worklog_total_time_spent,
-                                worklog_entries_count = :worklog_entries_count
+                                worklog_entries_count = :worklog_entries_count,
+                                developer = :developer
                             WHERE id = :id
                             """),
                             {
@@ -572,7 +577,8 @@ class JIRADatabaseConnection:
                                 "story_points": bug.get('story_points'),
                                 "labels": bug.get('labels'),
                                 "worklog_total_time_spent": bug.get('worklog_total_time_spent'),
-                                "worklog_entries_count": bug.get('worklog_entries_count')
+                                "worklog_entries_count": bug.get('worklog_entries_count'),
+                                "developer": bug.get('developer')
                             }
                         )
                     else:
@@ -586,7 +592,7 @@ class JIRADatabaseConnection:
                                 test_iterations, bugs_found, regression,
                                 time_spent,
                                 fix_versions, tester, story_points, labels,
-                                worklog_total_time_spent, worklog_entries_count
+                                worklog_total_time_spent, worklog_entries_count, developer
                             ) VALUES (
                                 :id, :numeric_id, :title, :description, :assigned_to, :severity,
                                 :state, :customer_name, :area_path, :created_date, :changed_date,
@@ -594,7 +600,7 @@ class JIRADatabaseConnection:
                                 :test_iterations, :bugs_found, :regression,
                                 :time_spent,
                                 :fix_versions, :tester, :story_points, :labels,
-                                :worklog_total_time_spent, :worklog_entries_count
+                                :worklog_total_time_spent, :worklog_entries_count, :developer
                             )
                             """),
                             {
@@ -621,7 +627,8 @@ class JIRADatabaseConnection:
                                 "story_points": bug.get('story_points'),
                                 "labels": bug.get('labels'),
                                 "worklog_total_time_spent": bug.get('worklog_total_time_spent'),
-                                "worklog_entries_count": bug.get('worklog_entries_count')
+                                "worklog_entries_count": bug.get('worklog_entries_count'),
+                                "developer": bug.get('developer')
                             }
                         )
 
@@ -690,7 +697,8 @@ class JIRADatabaseConnection:
                                 story_points = :story_points,
                                 labels = :labels,
                                 worklog_total_time_spent = :worklog_total_time_spent,
-                                worklog_entries_count = :worklog_entries_count
+                                worklog_entries_count = :worklog_entries_count,
+                                developer = :developer
                             WHERE id = :id
                             """),
                             {
@@ -717,7 +725,8 @@ class JIRADatabaseConnection:
                                 "story_points": item.get('story_points'),
                                 "labels": item.get('labels'),
                                 "worklog_total_time_spent": item.get('worklog_total_time_spent'),
-                                "worklog_entries_count": item.get('worklog_entries_count')
+                                "worklog_entries_count": item.get('worklog_entries_count'),
+                                "developer": item.get('developer')
                             }
                         )
                     else:
@@ -731,7 +740,7 @@ class JIRADatabaseConnection:
                                 test_iterations, bugs_found, regression,
                                 time_spent,
                                 fix_versions, tester, story_points, labels,
-                                worklog_total_time_spent, worklog_entries_count
+                                worklog_total_time_spent, worklog_entries_count, developer
                             ) VALUES (
                                 :id, :numeric_id, :title, :description, :assigned_to, :severity,
                                 :state, :customer_name, :area_path, :created_date, :changed_date,
@@ -739,7 +748,7 @@ class JIRADatabaseConnection:
                                 :test_iterations, :bugs_found, :regression,
                                 :time_spent,
                                 :fix_versions, :tester, :story_points, :labels,
-                                :worklog_total_time_spent, :worklog_entries_count
+                                :worklog_total_time_spent, :worklog_entries_count, :developer
                             )
                             """),
                             {
@@ -766,7 +775,8 @@ class JIRADatabaseConnection:
                                 "story_points": item.get('story_points'),
                                 "labels": item.get('labels'),
                                 "worklog_total_time_spent": item.get('worklog_total_time_spent'),
-                                "worklog_entries_count": item.get('worklog_entries_count')
+                                "worklog_entries_count": item.get('worklog_entries_count'),
+                                "developer": item.get('developer')
                             }
                         )
 
@@ -806,8 +816,9 @@ class JIRAExtractor:
         self.test_iterations_field = os.getenv('JIRA_TEST_ITERATIONS_FIELD_ID', 'customfield_10856')
         self.bugs_found_field = os.getenv('JIRA_BUGS_FOUND_FIELD_ID', 'customfield_10955')
         self.regression_field = os.getenv('JIRA_REGRESSION_FIELD_ID', 'customfield_10814')
-        self.tester_field = os.getenv('JIRA_TESTER_FIELD_ID', 'customfield_10505')
+        self.tester_field = os.getenv('JIRA_TESTER_FIELD_ID', 'customfield_10454')
         self.story_points_field = os.getenv('JIRA_STORY_POINTS_FIELD_ID', 'customfield_10037')  # Updated for Pathlock JIRA
+        self.developer_field = os.getenv('JIRA_DEVELOPER_FIELD_ID', 'customfield_10399')  # Developer field
         
 
         
@@ -983,6 +994,8 @@ class JIRAExtractor:
             fields_param += f",{self.tester_field}"
         if self.story_points_field not in fields_param:
             fields_param += f",{self.story_points_field}"
+        if self.developer_field not in fields_param:
+            fields_param += f",{self.developer_field}"
         
         bugs = []
         next_page_token = None
@@ -1099,6 +1112,7 @@ class JIRAExtractor:
                 regression = self._extract_custom_field_value(fields, self.regression_field, 'string')
                 tester = self._extract_custom_field_value(fields, self.tester_field, 'user')
                 story_points = self._extract_custom_field_value(fields, self.story_points_field, 'number')
+                developer = self._extract_custom_field_value(fields, self.developer_field, 'user')
                 
                 # Extract time tracking
                 time_tracking = self._extract_time_tracking(fields)
@@ -1137,7 +1151,8 @@ class JIRAExtractor:
                     'story_points': story_points,
                     'labels': labels,
                     'worklog_total_time_spent': worklog_summary['total_time_spent'],
-                    'worklog_entries_count': worklog_summary['entries_count']
+                    'worklog_entries_count': worklog_summary['entries_count'],
+                    'developer': developer
                 }
 
                 
@@ -1193,6 +1208,8 @@ class JIRAExtractor:
             fields_param += f",{self.tester_field}"
         if self.story_points_field not in fields_param:
             fields_param += f",{self.story_points_field}"
+        if self.developer_field not in fields_param:
+            fields_param += f",{self.developer_field}"
         
         work_items = []
         next_page_token = None
@@ -1307,6 +1324,7 @@ class JIRAExtractor:
                 regression = self._extract_custom_field_value(fields, self.regression_field, 'string')
                 tester = self._extract_custom_field_value(fields, self.tester_field, 'user')
                 story_points = self._extract_custom_field_value(fields, self.story_points_field, 'number')
+                developer = self._extract_custom_field_value(fields, self.developer_field, 'user')
                 
                 # Extract time tracking
                 time_tracking = self._extract_time_tracking(fields)
@@ -1345,7 +1363,8 @@ class JIRAExtractor:
                     'story_points': story_points,
                     'labels': labels,
                     'worklog_total_time_spent': worklog_summary['total_time_spent'],
-                    'worklog_entries_count': worklog_summary['entries_count']
+                    'worklog_entries_count': worklog_summary['entries_count'],
+                    'developer': developer
                 }
 
                 
@@ -1397,7 +1416,7 @@ class JIRAExtractor:
                                 DELETE FROM {db_connection.schema_name}.change_history 
                                 WHERE record_id = :record_id 
                                 AND table_name = 'bugs'
-                                AND field_changed = 'System.State'
+                                AND field_changed IN ('System.State', 'Work Log Entry')
                             """),
                             {"record_id": bug_id}
                         )
@@ -1405,7 +1424,8 @@ class JIRAExtractor:
                         # Now process and insert all state changes
                         for history in changelog:
                             for item in history.get("items", []):
-                                if item.get("field") == "status":
+                                field_name = item.get("field")
+                                if field_name in ["status", "WorklogId"]:
                                     changed_date = history.get("created", "")
                                     changed_by = history.get("author", {}).get("displayName", "")
                                     old_value = item.get("fromString", "")
@@ -1424,6 +1444,22 @@ class JIRAExtractor:
                                                 changed_date_obj = None
 
                                     if changed_date_obj:  # Only insert if we have a valid date
+                                        # Map field names to display names
+                                        field_display_name = "System.State" if field_name == "status" else "Work Log Entry"
+                                        
+                                        # For work log entries, get the time spent value and ensure old_value is empty
+                                        if field_name == "WorklogId" and new_value:
+                                            # Work logs are additions, so old_value should always be empty
+                                            old_value = ""
+                                            worklog_details = self._get_worklog_details(bug_id, new_value)
+                                            if worklog_details:
+                                                # Use time spent in seconds if available, otherwise use the timeSpent string
+                                                time_spent_seconds = worklog_details.get('timeSpentSeconds')
+                                                if time_spent_seconds:
+                                                    new_value = str(time_spent_seconds)
+                                                else:
+                                                    new_value = worklog_details.get('timeSpent', new_value)
+                                        
                                         # Insert the change record
                                         connection.execute(
                                             text(f"""
@@ -1435,7 +1471,7 @@ class JIRAExtractor:
                                             {
                                                 "record_id": bug_id,
                                                 "table_name": "bugs",
-                                                "field_changed": "System.State",
+                                                "field_changed": field_display_name,
                                                 "old_value": old_value,
                                                 "new_value": new_value,
                                                 "changed_by": changed_by,
@@ -1473,6 +1509,28 @@ class JIRAExtractor:
         
         return all_state_changes
 
+    def _get_worklog_details(self, issue_id, worklog_id):
+        """Get work log details by ID for enhanced tracking"""
+        try:
+            worklog_url = f"{self.jira_url}/rest/api/3/issue/{issue_id}/worklog"
+            response = requests.get(worklog_url, headers=self.headers)
+            
+            if response.status_code != 200:
+                return None
+                
+            worklog_data = response.json()
+            worklogs = worklog_data.get('worklogs', [])
+            
+            # Find the work log with matching ID
+            for worklog in worklogs:
+                if str(worklog.get('id')) == str(worklog_id):
+                    return worklog
+                    
+            return None
+        except Exception as e:
+            print(f"Error fetching work log details: {str(e)}")
+            return None
+
     def handle_story_changes(self, stories, db_connection=None):
         """Get and store the state change history for stories using JIRA changelog"""
         if not stories:
@@ -1499,45 +1557,65 @@ class JIRAExtractor:
                 with db_connection.engine.connect() as connection:
                     try:
                         # First, delete all existing entries for this story
-                        connection.execute(text(f"DELETE FROM {db_connection.schema_name}.change_history WHERE record_id = :record_id"), 
-                                        {"record_id": story_id})
+                        connection.execute(text(f"""
+                            DELETE FROM {db_connection.schema_name}.change_history 
+                            WHERE record_id = :record_id 
+                            AND field_changed IN ('state', 'Work Log Entry')
+                        """), 
+                        {"record_id": story_id})
                         
                         # Insert new state changes
                         for history in changelog:
                             for item in history.get("items", []):
-                                if item.get("field") == "status":
+                                field_name = item.get("field")
+                                if field_name in ["status", "WorklogId"]:
                                     changed_date = history.get("created", "")
                                     old_value = item.get("fromString", "")
                                     new_value = item.get("toString", "")
                                     
-                                    if old_value and new_value:  # Only insert if both values exist
-                                        # Parse the changed date
+                                    # Parse the changed date
+                                    try:
+                                        changed_date_obj = datetime.fromisoformat(changed_date.replace('Z', '+00:00'))
+                                    except ValueError:
                                         try:
-                                            changed_date_obj = datetime.fromisoformat(changed_date.replace('Z', '+00:00'))
+                                            # Try parsing without timezone info
+                                            changed_date_obj = datetime.fromisoformat(changed_date.split('.')[0])
                                         except ValueError:
-                                            try:
-                                                # Try parsing without timezone info
-                                                changed_date_obj = datetime.fromisoformat(changed_date.split('.')[0])
-                                            except ValueError:
-                                                changed_date_obj = None
+                                            changed_date_obj = None
 
-                                        if changed_date_obj:  # Only insert if we have a valid date
-                                            # Get the user who made the change
-                                            changed_by = history.get("author", {}).get("displayName", "")
-                                            
-                                            connection.execute(text(f"""
-                                                INSERT INTO {db_connection.schema_name}.change_history 
-                                                (record_id, table_name, field_changed, old_value, new_value, changed_by, changed_date)
-                                                VALUES (:record_id, :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
-                                            """), {
-                                                "record_id": story_id,
-                                                "table_name": "work_items",
-                                                "field_changed": "state",
-                                                "old_value": old_value,
-                                                "new_value": new_value,
-                                                "changed_by": changed_by,
-                                                "changed_date": changed_date_obj
-                                            })
+                                    if changed_date_obj:  # Only insert if we have a valid date
+                                        # Get the user who made the change
+                                        changed_by = history.get("author", {}).get("displayName", "")
+                                        
+                                        # Map field names to display names
+                                        field_display_name = "state" if field_name == "status" else "Work Log Entry"
+                                        
+                                        # For work log entries, get the time spent value and ensure old_value is empty
+                                        if field_name == "WorklogId" and new_value:
+                                            # Work logs are additions, so old_value should always be empty
+                                            old_value = ""
+                                            worklog_details = self._get_worklog_details(story_id, new_value)
+                                            if worklog_details:
+                                                # Use time spent in seconds if available, otherwise use the timeSpent string
+                                                time_spent_seconds = worklog_details.get('timeSpentSeconds')
+                                                if time_spent_seconds:
+                                                    new_value = str(time_spent_seconds)
+                                                else:
+                                                    new_value = worklog_details.get('timeSpent', new_value)
+                                        
+                                        connection.execute(text(f"""
+                                            INSERT INTO {db_connection.schema_name}.change_history 
+                                            (record_id, table_name, field_changed, old_value, new_value, changed_by, changed_date)
+                                            VALUES (:record_id, :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
+                                        """), {
+                                            "record_id": story_id,
+                                            "table_name": "work_items",
+                                            "field_changed": field_display_name,
+                                            "old_value": old_value,
+                                            "new_value": new_value,
+                                            "changed_by": changed_by,
+                                            "changed_date": changed_date_obj
+                                        })
                                         
                                         state_changes.append([
                                             changed_date,
@@ -1628,6 +1706,7 @@ def main():
             print("------>Processing work item state changes")
             extractor.handle_story_changes(work_items, db)
             print(f"------>Processed state changes for {len(work_items)} work items")
+
 
             # Update sync status for both bugs and work items
             if processed_bugs > 0:
