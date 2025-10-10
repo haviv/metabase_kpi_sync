@@ -852,7 +852,7 @@ class ADOExtractor:
 
     def handle_bug_changes(self, bugs, db_connection=None):
         """
-        Get and store the state change history for a list of bugs
+        Get and store the change history for a list of bugs (State, HF Status, HF Target Date)
         Args:
             bugs: List of bug dictionaries or bug IDs
             db_connection: Optional database connection for storing changes
@@ -871,7 +871,7 @@ class ADOExtractor:
             response = requests.get(updates_url, headers=self.headers)
             
             if response.status_code != 200:
-                print(f"Error fetching state changes for bug {bug_id}: {response.status_code}")
+                print(f"Error fetching changes for bug {bug_id}: {response.status_code}")
                 continue
                 
             updates = response.json().get("value", [])
@@ -887,60 +887,88 @@ class ADOExtractor:
                                 DELETE FROM change_history 
                                 WHERE record_id = :record_id 
                                 AND table_name = 'bugs'
-                                AND field_changed = 'System.State'
+                                AND field_changed IN ('System.State', 'Custom.HotfixDeliveredVersions', 'Microsoft.VSTS.Scheduling.TargetDate')
                             """),
                             {"record_id": bug_id}
                         )
                         
-                        # Now process and insert all state changes
+                        # Define fields to track with their display names
+                        fields_to_track = {
+                            'System.State': 'State',
+                            'Custom.HotfixDeliveredVersions': 'HF Status',
+                            'Microsoft.VSTS.Scheduling.TargetDate': 'HF Target Date'
+                        }
+                        
+                        # Now process and insert all tracked field changes
                         for update in updates:
-                            if "System.State" in update.get("fields", {}):
-                                state_change = update["fields"]["System.State"]
-                                # Get the changed date from the update object
-                                changed_date = update.get("fields", {}).get("System.ChangedDate", {}).get("newValue", "")
-                                changed_by = update.get("revisedBy", {}).get("displayName", "")
-                                old_value = state_change.get("oldValue", "")
-                                new_value = state_change.get("newValue", "")
+                            for field_name, display_name in fields_to_track.items():
+                                if field_name in update.get("fields", {}):
+                                    field_change = update["fields"][field_name]
+                                    # Get the changed date from the update object
+                                    changed_date = update.get("fields", {}).get("System.ChangedDate", {}).get("newValue", "")
+                                    changed_by = update.get("revisedBy", {}).get("displayName", "")
+                                    old_value = field_change.get("oldValue", "")
+                                    new_value = field_change.get("newValue", "")
+                                    
+                                    # Convert datetime objects to strings for target date field
+                                    if field_name == 'Microsoft.VSTS.Scheduling.TargetDate':
+                                        if isinstance(old_value, str) and old_value:
+                                            # Keep as string, will be truncated to 500 chars in DB
+                                            pass
+                                        elif old_value:
+                                            old_value = str(old_value)
+                                        else:
+                                            old_value = ""
+                                            
+                                        if isinstance(new_value, str) and new_value:
+                                            # Keep as string, will be truncated to 500 chars in DB
+                                            pass
+                                        elif new_value:
+                                            new_value = str(new_value)
+                                        else:
+                                            new_value = ""
 
-                                # Convert date string to datetime object
-                                try:
-                                    changed_date_obj = datetime.strptime(changed_date, "%Y-%m-%dT%H:%M:%S.%fZ")
-                                except ValueError:
+                                    # Convert date string to datetime object
                                     try:
-                                        changed_date_obj = datetime.strptime(changed_date, "%Y-%m-%dT%H:%M:%SZ")
+                                        changed_date_obj = datetime.strptime(changed_date, "%Y-%m-%dT%H:%M:%S.%fZ")
                                     except ValueError:
-                                        changed_date_obj = None
+                                        try:
+                                            changed_date_obj = datetime.strptime(changed_date, "%Y-%m-%dT%H:%M:%SZ")
+                                        except ValueError:
+                                            changed_date_obj = None
 
-                                if changed_date_obj:  # Only insert if we have a valid date
-                                    # Insert the change record
-                                    connection.execute(
-                                        text("""
-                                            INSERT INTO change_history 
-                                            (record_id, table_name, field_changed, old_value, new_value, changed_by, changed_date)
-                                            VALUES 
-                                            (:record_id, :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
-                                        """),
-                                        {
-                                            "record_id": bug_id,
-                                            "table_name": "bugs",
-                                            "field_changed": "System.State",
-                                            "old_value": old_value,
-                                            "new_value": new_value,
-                                            "changed_by": changed_by,
-                                            "changed_date": changed_date_obj
-                                        }
-                                    )
+                                    if changed_date_obj:  # Only insert if we have a valid date
+                                        # Insert the change record
+                                        connection.execute(
+                                            text("""
+                                                INSERT INTO change_history 
+                                                (record_id, table_name, field_changed, old_value, new_value, changed_by, changed_date)
+                                                VALUES 
+                                                (:record_id, :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
+                                            """),
+                                            {
+                                                "record_id": bug_id,
+                                                "table_name": "bugs",
+                                                "field_changed": field_name,
+                                                "old_value": str(old_value) if old_value else "",
+                                                "new_value": str(new_value) if new_value else "",
+                                                "changed_by": changed_by,
+                                                "changed_date": changed_date_obj
+                                            }
+                                        )
 
-                                state_changes.append([
-                                    changed_date,
-                                    old_value,
-                                    new_value
-                                ])
+                                    # For backward compatibility, store state changes in the return value
+                                    if field_name == 'System.State':
+                                        state_changes.append([
+                                            changed_date,
+                                            old_value,
+                                            new_value
+                                        ])
                         
                         connection.commit()
                         
                     except SQLAlchemyError as e:
-                        print(f"Error processing state changes for bug {bug_id}: {str(e)}")
+                        print(f"Error processing changes for bug {bug_id}: {str(e)}")
                         connection.rollback()
             else:
                 # If no database connection, just collect the state changes
