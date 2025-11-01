@@ -124,7 +124,8 @@ class DatabaseConnection:
             'hotfix_delivered_version': 'VARCHAR(200)',
 
             'target_date': 'TIMESTAMP',
-            'hf_status': 'VARCHAR(200)'
+            'hf_status': 'VARCHAR(200)',
+            'hf_requested_versions': 'VARCHAR(200)'
         }
         
         # Add work_item_type column for work_items table if it doesn't exist
@@ -174,7 +175,8 @@ class DatabaseConnection:
                 Column('iteration_path', String(500), nullable=True),
                 Column('hotfix_delivered_version', String(200), nullable=True),
                 Column('target_date', DateTime, nullable=True),
-                Column('hf_status', String(200), nullable=True)
+                Column('hf_status', String(200), nullable=True),
+                Column('hf_requested_versions', String(200), nullable=True)
             )
 
             # Bugs relations table
@@ -202,7 +204,8 @@ class DatabaseConnection:
                 Column('iteration_path', String(500), nullable=True),
                 Column('hotfix_delivered_version', String(200), nullable=True),
                 Column('target_date', DateTime, nullable=True),
-                Column('hf_status', String(200), nullable=True)
+                Column('hf_status', String(200), nullable=True),
+                Column('hf_requested_versions', String(200), nullable=True)
             )
 
             # Sync status table
@@ -232,7 +235,8 @@ class DatabaseConnection:
                 Column('hotfix_delivered_version', String(200), nullable=True),
                 Column('work_item_type', String(50), nullable=False),
                 Column('target_date', DateTime, nullable=True),
-                Column('hf_status', String(200), nullable=True)
+                Column('hf_status', String(200), nullable=True),
+                Column('hf_requested_versions', String(200), nullable=True)
             )
 
             # History snapshots table
@@ -498,7 +502,8 @@ class DatabaseConnection:
                             iteration_path = :iteration_path,
                             hotfix_delivered_version = :hotfix_delivered_version,
                             target_date = :target_date,
-                            hf_status = :hf_status
+                            hf_status = :hf_status,
+                            hf_requested_versions = :hf_requested_versions
                         """
                         
                         if item_type == 'bug':
@@ -522,7 +527,8 @@ class DatabaseConnection:
                             "iteration_path": item['IterationPath'],
                             "hotfix_delivered_version": item['HotfixDeliveredVersion'],
                             "target_date": item.get('TargetDate'),
-                            "hf_status": item.get('HFStatus')
+                            "hf_status": item.get('HFStatus'),
+                            "hf_requested_versions": item.get('HFRequestedVersions')
                         }
                         
                         if item_type == 'bug':
@@ -540,7 +546,7 @@ class DatabaseConnection:
                         INSERT INTO {table.name} (
                             id, title, description, assigned_to, severity,
                             state, customer_name, area_path, created_date, changed_date,
-                            iteration_path, hotfix_delivered_version, target_date, hf_status
+                            iteration_path, hotfix_delivered_version, target_date, hf_status, hf_requested_versions
                         """
                         
                         if item_type == 'bug':
@@ -552,7 +558,7 @@ class DatabaseConnection:
                         VALUES (
                             :id, :title, :description, :assigned_to, :severity,
                             :state, :customer_name, :area_path, :created_date, :changed_date,
-                            :iteration_path, :hotfix_delivered_version, :target_date, :hf_status
+                            :iteration_path, :hotfix_delivered_version, :target_date, :hf_status, :hf_requested_versions
                         """
                         
                         if item_type == 'bug':
@@ -576,7 +582,8 @@ class DatabaseConnection:
                             "iteration_path": item['IterationPath'],
                             "hotfix_delivered_version": item['HotfixDeliveredVersion'],
                             "target_date": item.get('TargetDate'),
-                            "hf_status": item.get('HFStatus')
+                            "hf_status": item.get('HFStatus'),
+                            "hf_requested_versions": item.get('HFRequestedVersions')
                         }
                         
                         if item_type == 'bug':
@@ -734,7 +741,8 @@ class ADOExtractor:
                        [System.IterationPath],
                        [Custom.HotfixDeliveredVersions],
                        [Microsoft.VSTS.Scheduling.TargetDate],
-                       [Custom.HFstatus]
+                       [Custom.HFstatus],
+                       [Custom.HFrequestedversions]
                 FROM WorkItems
                 WHERE [System.WorkItemType] = '{work_item_type}'
                 AND [System.ChangedDate] > @Today - 1
@@ -819,7 +827,8 @@ class ADOExtractor:
                     'IterationPath': fields.get('System.IterationPath', ''),
                     'HotfixDeliveredVersion': fields.get('Custom.HotfixDeliveredVersions', ''),
                     'TargetDate': target_date,
-                    'HFStatus': fields.get('Custom.HFstatus', '')
+                    'HFStatus': fields.get('Custom.HFstatus', ''),
+                    'HFRequestedVersions': fields.get('Custom.HFrequestedversions', '')
                 }
 
                 if work_item_type == 'Bug':
@@ -897,7 +906,7 @@ class ADOExtractor:
                                 DELETE FROM change_history 
                                 WHERE record_id = :record_id 
                                 AND table_name = 'bugs'
-                                AND field_changed IN ('System.State', 'Custom.HFstatus', 'Microsoft.VSTS.Scheduling.TargetDate')
+                                AND field_changed IN ('System.State', 'Custom.HFstatus', 'Microsoft.VSTS.Scheduling.TargetDate', 'Custom.HFrequestedversions')
                             """),
                             {"record_id": bug_id}
                         )
@@ -906,7 +915,8 @@ class ADOExtractor:
                         fields_to_track = {
                             'System.State': 'State',
                             'Custom.HFstatus': 'HF Status',
-                            'Microsoft.VSTS.Scheduling.TargetDate': 'HF Target Date'
+                            'Microsoft.VSTS.Scheduling.TargetDate': 'HF Target Date',
+                            'Custom.HFrequestedversions': 'HF Requested Versions'
                         }
                         
                         # Now process and insert all tracked field changes
@@ -1297,7 +1307,8 @@ class ADOExtractor:
                        [Custom.HotfixDeliveredVersions],
                        [System.WorkItemType],
                        [Microsoft.VSTS.Scheduling.TargetDate],
-                       [Custom.HFstatus]
+                       [Custom.HFstatus],
+                       [Custom.HFrequestedversions]
                 FROM WorkItems
                 WHERE [System.ChangedDate] > @Today - 1
                 ORDER BY [System.ChangedDate] DESC
@@ -1383,7 +1394,8 @@ class ADOExtractor:
                     'HotfixDeliveredVersion': fields.get('Custom.HotfixDeliveredVersions', ''),
                     'WorkItemType': work_item_type,
                     'TargetDate': target_date,
-                    'HFStatus': fields.get('Custom.HFstatus', '')
+                    'HFStatus': fields.get('Custom.HFstatus', ''),
+                    'HFRequestedVersions': fields.get('Custom.HFrequestedversions', '')
                 }
 
                 batch_data.append(item_data)
@@ -1487,11 +1499,11 @@ class ADOExtractor:
                                     INSERT INTO work_items (
                                         id, title, description, assigned_to, severity,
                                         state, customer_name, area_path, created_date, changed_date,
-                                        iteration_path, hotfix_delivered_version, work_item_type, target_date, hf_status
+                                        iteration_path, hotfix_delivered_version, work_item_type, target_date, hf_status, hf_requested_versions
                                     ) VALUES (
                                         :id, :title, :description, :assigned_to, :severity,
                                         :state, :customer_name, :area_path, :created_date, :changed_date,
-                                        :iteration_path, :hotfix_delivered_version, :work_item_type, :target_date, :hf_status
+                                        :iteration_path, :hotfix_delivered_version, :work_item_type, :target_date, :hf_status, :hf_requested_versions
                                     )
                                 """),
                                 {
@@ -1509,7 +1521,8 @@ class ADOExtractor:
                                     "hotfix_delivered_version": fields.get('Custom.HotfixDeliveredVersions', ''),
                                     "work_item_type": work_item_type,
                                     "target_date": target_date,
-                                    "hf_status": fields.get('Custom.HFstatus', '')
+                                    "hf_status": fields.get('Custom.HFstatus', ''),
+                                    "hf_requested_versions": fields.get('Custom.HFrequestedversions', '')
                                 }
                             )
                             print(f"Inserted missing work item {work_item_id} of type {work_item_type}")
