@@ -441,7 +441,8 @@ class JIRADatabaseConnection:
             ('open_bugs_QA_p1_p2', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state IN ('READY FOR QA', 'IN QA') AND severity IN ('1 - Critical','2 - High')"),
             ('total_customers', f"SELECT COUNT(DISTINCT customer_name) AS total_customers FROM {self.schema_name}.bugs WHERE customer_name IS NOT NULL AND customer_name != ''"),
             ('redline_bugs', f"SELECT COALESCE(COUNT(*) * 1.0 / NULLIF((SELECT COUNT(DISTINCT customer_name) FROM {self.schema_name}.bugs WHERE customer_name IS NOT NULL AND customer_name != ''), 0), 0) AS bugs_with_parent_per_customer FROM {self.schema_name}.bugs WHERE parent_issue IS NOT NULL AND DATE_TRUNC('month', created_date) = DATE_TRUNC('month', CURRENT_DATE)"),
-            ('open_p1_bugs_with_customer_issues', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state NOT IN ('DONE') AND severity = '1 - Critical' AND parent_issue IS NOT NULL")
+            ('open_p1_bugs_with_customer_issues', f"SELECT COUNT(*) FROM {self.schema_name}.bugs WHERE state NOT IN ('DONE') AND severity = '1 - Critical' AND parent_issue IS NOT NULL"),
+            ('avg_days_to_close_p1_p2', f"WITH first_inprog AS (SELECT record_id, MIN(changed_date) AS first_inprog_at FROM {self.schema_name}.change_history WHERE table_name = 'bugs' AND field_changed = 'System.State' AND REPLACE(UPPER(new_value), '-', ' ') = 'IN PROGRESS' AND changed_date >= DATE_TRUNC('month', NOW() - INTERVAL '6 months') AND changed_date < DATE_TRUNC('month', NOW()) GROUP BY record_id) SELECT AVG(EXTRACT(EPOCH FROM (COALESCE(f.first_inprog_at, now()) - b.created_date)) / 86400.0) AS avg_days_create_to_inprog_including_open FROM {self.schema_name}.bugs b INNER JOIN first_inprog f ON f.record_id = b.id WHERE b.customer_name IS NOT NULL AND b.severity IN ('1 - Critical','2 - High')")
         ]
 
         snapshot_date = datetime.now().date()
