@@ -363,6 +363,40 @@ class DatabaseConnection:
             # If no sync history, default to March 1st, 2025
             return datetime(2025, 3, 1)
 
+    def get_last_full_sync_time(self):
+        """Get the last full sync time (weekly full sync)"""
+        with self.engine.connect() as connection:
+            result = connection.execute(
+                text("""
+                    SELECT last_sync_time 
+                    FROM sync_status 
+                    WHERE entity_type = 'full_sync' 
+                    ORDER BY last_sync_time DESC
+                    LIMIT 1
+                """)
+            ).first()
+
+            if result:
+                return result[0]
+            
+            # If no full sync history, return None to trigger first full sync
+            return None
+
+    def update_full_sync_status(self):
+        """Update the full sync status timestamp"""
+        with self.engine.connect() as connection:
+            try:
+                connection.execute(
+                    text("""
+                        INSERT INTO sync_status (entity_type, last_sync_time, status, records_processed)
+                        VALUES ('full_sync', CURRENT_TIMESTAMP, 'completed', 0)
+                    """)
+                )
+                connection.commit()
+            except SQLAlchemyError as e:
+                print(f"Error updating full sync status: {str(e)}")
+                connection.rollback()
+
     def update_sync_status(self, entity_type, records_processed, status='completed'):
         """Update the sync status for the entity type"""
         with self.engine.connect() as connection:
@@ -721,7 +755,12 @@ class ADOExtractor:
         query_url = f"https://dev.azure.com/{self.organization}/{self.project}/_apis/wit/wiql?api-version=7.1-preview.2"
         
         # Handle last_update whether it's a string or datetime
-        last_update_str = last_update if isinstance(last_update, str) else last_update.strftime('%Y-%m-%d')
+        if isinstance(last_update, datetime):
+            last_update_str = last_update.strftime('%Y-%m-%d')
+        else:
+            last_update_str = last_update
+        
+        print(f"------>Fetching {work_item_type} items with ChangedDate >= {last_update_str}")
         
         # Modified WIQL query to include all required fields
         query_payload = {
@@ -745,7 +784,7 @@ class ADOExtractor:
                        [Custom.HFrequestedversions]
                 FROM WorkItems
                 WHERE [System.WorkItemType] = '{work_item_type}'
-                AND [System.ChangedDate] > @Today - 1
+                AND [System.ChangedDate] >= '{last_update_str}'
                 ORDER BY [System.ChangedDate] DESC
             """
         }
@@ -1286,7 +1325,12 @@ class ADOExtractor:
         query_url = f"https://dev.azure.com/{self.organization}/{self.project}/_apis/wit/wiql?api-version=7.1-preview.2"
         
         # Handle last_update whether it's a string or datetime
-        last_update_str = last_update if isinstance(last_update, str) else last_update.strftime('%Y-%m-%d')
+        if isinstance(last_update, datetime):
+            last_update_str = last_update.strftime('%Y-%m-%d')
+        else:
+            last_update_str = last_update
+        
+        print(f"------>Fetching all work items with ChangedDate >= {last_update_str}")
         
         # Modified WIQL query to include all required fields without type filter
         query_payload = {
@@ -1310,7 +1354,7 @@ class ADOExtractor:
                        [Custom.HFstatus],
                        [Custom.HFrequestedversions]
                 FROM WorkItems
-                WHERE [System.ChangedDate] > @Today - 1
+                WHERE [System.ChangedDate] >= '{last_update_str}'
                 ORDER BY [System.ChangedDate] DESC
             """
         }
@@ -1771,10 +1815,37 @@ def main():
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"\n=== Starting sync cycle at {current_time} ===")
             
+            # Check if we need to run a full sync (weekly, going back 1 month)
+            last_full_sync = db.get_last_full_sync_time()
+            should_run_full_sync = False
+            sync_date_override = None
+            
+            if last_full_sync is None:
+                # First time running, do a full sync
+                should_run_full_sync = True
+                sync_date_override = datetime.now() - timedelta(days=30)
+                print(f"------>No previous full sync found. Running initial full sync (1 month back)")
+            else:
+                # Check if a week has passed since last full sync
+                days_since_full_sync = (datetime.now() - last_full_sync).days
+                if days_since_full_sync >= 7:
+                    should_run_full_sync = True
+                    sync_date_override = datetime.now() - timedelta(days=30)
+                    print(f"------>Last full sync was {days_since_full_sync} days ago. Running weekly full sync (1 month back)")
+                else:
+                    print(f"------>Last full sync was {days_since_full_sync} days ago. Running delta sync")
+            
             # Get last sync times from database
             issues_last_sync = db.get_last_sync_time('issue')
             bugs_last_sync = db.get_last_sync_time('bug')
             work_items_last_sync = db.get_last_sync_time('work_item')
+            
+            # Override with full sync date if needed
+            if should_run_full_sync:
+                issues_last_sync = sync_date_override
+                bugs_last_sync = sync_date_override
+                work_items_last_sync = sync_date_override
+                print(f"------>Using sync date: {sync_date_override.strftime('%Y-%m-%d')} (1 month back)")
             
             # Extract and store all work items first
             work_items = extractor.get_all_work_items(work_items_last_sync.strftime('%Y-%m-%d'))
@@ -1824,6 +1895,11 @@ def main():
 
             if processed_sprints > 0:
                 db.update_sync_status('sprint', processed_sprints)
+
+            # Update full sync status if we ran a full sync
+            if should_run_full_sync:
+                db.update_full_sync_status()
+                print("------>Updated full sync timestamp")
 
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"=== Sync cycle completed at {current_time} ===")

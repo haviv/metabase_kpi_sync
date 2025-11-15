@@ -406,6 +406,40 @@ class JIRADatabaseConnection:
             # If no sync history, default to March 1st, 2025
             return datetime(2025, 3, 1)
 
+    def get_last_full_sync_time(self):
+        """Get the last full sync time (weekly full sync)"""
+        with self.engine.connect() as connection:
+            result = connection.execute(
+                text(f"""
+                    SELECT last_sync_time 
+                    FROM {self.schema_name}.sync_status 
+                    WHERE entity_type = 'full_sync' 
+                    ORDER BY last_sync_time DESC
+                    LIMIT 1
+                """)
+            ).first()
+
+            if result:
+                return result[0]
+            
+            # If no full sync history, return None to trigger first full sync
+            return None
+
+    def update_full_sync_status(self):
+        """Update the full sync status timestamp"""
+        with self.engine.connect() as connection:
+            try:
+                connection.execute(
+                    text(f"""
+                        INSERT INTO {self.schema_name}.sync_status (entity_type, last_sync_time, status, records_processed)
+                        VALUES ('full_sync', CURRENT_TIMESTAMP, 'completed', 0)
+                    """)
+                )
+                connection.commit()
+            except SQLAlchemyError as e:
+                print(f"Error updating full sync status: {str(e)}")
+                connection.rollback()
+
     def update_sync_status(self, entity_type, records_processed, status='completed'):
         """Update the sync status for the entity type"""
         with self.engine.connect() as connection:
@@ -968,7 +1002,12 @@ class JIRAExtractor:
     def get_bugs_since_last_sync(self, last_sync_time):
         """Query bugs from JIRA since last sync time with pagination using new JQL API"""
         # Convert last_sync_time to JIRA date format
-        last_sync_str = last_sync_time.strftime('%Y-%m-%d')
+        if isinstance(last_sync_time, datetime):
+            last_sync_str = last_sync_time.strftime('%Y-%m-%d')
+        else:
+            last_sync_str = last_sync_time
+        
+        print(f"------>Fetching bugs with updated >= {last_sync_str}")
         
         # JQL query to get bugs updated since last sync
         jql_query = f'project = {self.project_key} AND issuetype = Bug AND updated >= "{last_sync_str}" ORDER BY updated DESC'
@@ -1182,7 +1221,12 @@ class JIRAExtractor:
     def get_stories_since_last_sync(self, last_sync_time):
         """Query all work items from JIRA since last sync time with pagination using new JQL API"""
         # Convert last_sync_time to JIRA date format
-        last_sync_str = last_sync_time.strftime('%Y-%m-%d')
+        if isinstance(last_sync_time, datetime):
+            last_sync_str = last_sync_time.strftime('%Y-%m-%d')
+        else:
+            last_sync_str = last_sync_time
+        
+        print(f"------>Fetching work items with updated >= {last_sync_str}")
         
         # JQL query to get all issue types updated since last sync
         jql_query = f'project = {self.project_key} AND issuetype in (Story, Bug, Task, Epic, "New Feature", Improvement, Enhancement, "Sub-task") AND updated >= "{last_sync_str}" ORDER BY updated DESC'
@@ -1681,9 +1725,35 @@ def main():
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"\n=== Starting JIRA sync cycle at {current_time} ===")
             
+            # Check if we need to run a full sync (weekly, going back 1 month)
+            last_full_sync = db.get_last_full_sync_time()
+            should_run_full_sync = False
+            sync_date_override = None
+            
+            if last_full_sync is None:
+                # First time running, do a full sync
+                should_run_full_sync = True
+                sync_date_override = datetime.now() - timedelta(days=30)
+                print(f"------>No previous full sync found. Running initial full sync (1 month back)")
+            else:
+                # Check if a week has passed since last full sync
+                days_since_full_sync = (datetime.now() - last_full_sync).days
+                if days_since_full_sync >= 7:
+                    should_run_full_sync = True
+                    sync_date_override = datetime.now() - timedelta(days=30)
+                    print(f"------>Last full sync was {days_since_full_sync} days ago. Running weekly full sync (1 month back)")
+                else:
+                    print(f"------>Last full sync was {days_since_full_sync} days ago. Running delta sync")
+            
             # Get last sync times from database
             bugs_last_sync = db.get_last_sync_time('bug')
             stories_last_sync = db.get_last_sync_time('story')
+            
+            # Override with full sync date if needed
+            if should_run_full_sync:
+                bugs_last_sync = sync_date_override
+                stories_last_sync = sync_date_override
+                print(f"------>Using sync date: {sync_date_override.strftime('%Y-%m-%d')} (1 month back)")
 
             print(f"------>Last bug sync: {bugs_last_sync}")
             print(f"------>Last story sync: {stories_last_sync}")
@@ -1718,6 +1788,11 @@ def main():
             # Update history snapshots
             db.update_history_snapshots()
             print("------>Updated history snapshots")
+
+            # Update full sync status if we ran a full sync
+            if should_run_full_sync:
+                db.update_full_sync_status()
+                print("------>Updated full sync timestamp")
 
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"=== JIRA sync cycle completed at {current_time} ===")
