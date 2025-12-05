@@ -132,6 +132,21 @@ class DatabaseConnection:
         if table_name == 'work_items' and 'work_item_type' not in existing_columns:
             new_columns['work_item_type'] = 'VARCHAR(50)'
         
+        # Add effort-related columns for work_items table
+        if table_name == 'work_items':
+            work_item_columns = {
+                'effort': 'FLOAT',
+                'effort_dev_estimate': 'FLOAT',
+                'effort_dev_actual': 'FLOAT',
+                'qa_effort_estimation': 'FLOAT',
+                'qa_effort_actual': 'FLOAT',
+                'tshirt_estimation': 'VARCHAR(50)',
+                'parent_work_item': 'INTEGER'
+            }
+            for col_name, col_type in work_item_columns.items():
+                if col_name not in existing_columns:
+                    new_columns[col_name] = col_type
+        
         for col_name, col_type in new_columns.items():
             if col_name not in existing_columns:
                 connection.execute(text(f"""
@@ -236,7 +251,14 @@ class DatabaseConnection:
                 Column('work_item_type', String(50), nullable=False),
                 Column('target_date', DateTime, nullable=True),
                 Column('hf_status', String(200), nullable=True),
-                Column('hf_requested_versions', String(200), nullable=True)
+                Column('hf_requested_versions', String(200), nullable=True),
+                Column('effort', Float, nullable=True),
+                Column('effort_dev_estimate', Float, nullable=True),
+                Column('effort_dev_actual', Float, nullable=True),
+                Column('qa_effort_estimation', Float, nullable=True),
+                Column('qa_effort_actual', Float, nullable=True),
+                Column('tshirt_estimation', String(50), nullable=True),
+                Column('parent_work_item', Integer, nullable=True)
             )
 
             # History snapshots table
@@ -543,7 +565,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             update_stmt += ", parent_issue = :parent_issue"
                         elif item_type == 'work_item':
-                            update_stmt += ", work_item_type = :work_item_type"
+                            update_stmt += ", work_item_type = :work_item_type, effort = :effort, effort_dev_estimate = :effort_dev_estimate, effort_dev_actual = :effort_dev_actual, qa_effort_estimation = :qa_effort_estimation, qa_effort_actual = :qa_effort_actual, tshirt_estimation = :tshirt_estimation, parent_work_item = :parent_work_item"
                         
                         update_stmt += " WHERE id = :id"
 
@@ -569,6 +591,13 @@ class DatabaseConnection:
                             params["parent_issue"] = item.get('ParentID')
                         elif item_type == 'work_item':
                             params["work_item_type"] = item.get('WorkItemType', '')
+                            params["effort"] = item.get('Effort')
+                            params["effort_dev_estimate"] = item.get('EffortDevEstimate')
+                            params["effort_dev_actual"] = item.get('EffortDevActual')
+                            params["qa_effort_estimation"] = item.get('QAEffortEstimation')
+                            params["qa_effort_actual"] = item.get('QAEffortActual')
+                            params["tshirt_estimation"] = item.get('TShirtEstimation', '')
+                            params["parent_work_item"] = item.get('ParentWorkItem')
 
                         connection.execute(text(update_stmt), params)
                     else:
@@ -586,9 +615,10 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             insert_stmt += ", parent_issue"
                         elif item_type == 'work_item':
-                            insert_stmt += ", work_item_type"
+                            insert_stmt += ", work_item_type, effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item"
                         
-                        insert_stmt += """)
+                        insert_stmt += """
+                        )
                         VALUES (
                             :id, :title, :description, :assigned_to, :severity,
                             :state, :customer_name, :area_path, :created_date, :changed_date,
@@ -598,7 +628,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             insert_stmt += ", :parent_issue"
                         elif item_type == 'work_item':
-                            insert_stmt += ", :work_item_type"
+                            insert_stmt += ", :work_item_type, :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item"
                         
                         insert_stmt += ")"
 
@@ -624,6 +654,13 @@ class DatabaseConnection:
                             params["parent_issue"] = item.get('ParentID')
                         elif item_type == 'work_item':
                             params["work_item_type"] = item.get('WorkItemType', '')
+                            params["effort"] = item.get('Effort')
+                            params["effort_dev_estimate"] = item.get('EffortDevEstimate')
+                            params["effort_dev_actual"] = item.get('EffortDevActual')
+                            params["qa_effort_estimation"] = item.get('QAEffortEstimation')
+                            params["qa_effort_actual"] = item.get('QAEffortActual')
+                            params["tshirt_estimation"] = item.get('TShirtEstimation', '')
+                            params["parent_work_item"] = item.get('ParentWorkItem')
 
                         connection.execute(text(insert_stmt), params)
                         
@@ -1352,7 +1389,13 @@ class ADOExtractor:
                        [System.WorkItemType],
                        [Microsoft.VSTS.Scheduling.TargetDate],
                        [Custom.HFstatus],
-                       [Custom.HFrequestedversions]
+                       [Custom.HFrequestedversions],
+                       [Microsoft.VSTS.Scheduling.Effort],
+                       [Custom.EffortDevestimate],
+                       [Custom.EffortDevactual],
+                       [Custom.QAeffortestimation],
+                       [Custom.QAeffortactual],
+                       [Custom.TShirtestimation]
                 FROM WorkItems
                 WHERE [System.ChangedDate] >= '{last_update_str}'
                 ORDER BY [System.ChangedDate] DESC
@@ -1423,6 +1466,37 @@ class ADOExtractor:
                 else:
                     target_date = None
 
+                # Parse effort fields (they might be numbers or None)
+                effort = fields.get('Microsoft.VSTS.Scheduling.Effort')
+                try:
+                    effort = float(effort) if effort is not None else None
+                except (ValueError, TypeError):
+                    effort = None
+                
+                effort_dev_estimate = fields.get('Custom.EffortDevestimate')
+                try:
+                    effort_dev_estimate = float(effort_dev_estimate) if effort_dev_estimate is not None else None
+                except (ValueError, TypeError):
+                    effort_dev_estimate = None
+                
+                effort_dev_actual = fields.get('Custom.EffortDevactual')
+                try:
+                    effort_dev_actual = float(effort_dev_actual) if effort_dev_actual is not None else None
+                except (ValueError, TypeError):
+                    effort_dev_actual = None
+                
+                qa_effort_estimation = fields.get('Custom.QAeffortestimation')
+                try:
+                    qa_effort_estimation = float(qa_effort_estimation) if qa_effort_estimation is not None else None
+                except (ValueError, TypeError):
+                    qa_effort_estimation = None
+                
+                qa_effort_actual = fields.get('Custom.QAeffortactual')
+                try:
+                    qa_effort_actual = float(qa_effort_actual) if qa_effort_actual is not None else None
+                except (ValueError, TypeError):
+                    qa_effort_actual = None
+
                 item_data = {
                     'ID': item["id"],
                     'Title': fields.get('System.Title', ''),
@@ -1439,7 +1513,14 @@ class ADOExtractor:
                     'WorkItemType': work_item_type,
                     'TargetDate': target_date,
                     'HFStatus': fields.get('Custom.HFstatus', ''),
-                    'HFRequestedVersions': fields.get('Custom.HFrequestedversions', '')
+                    'HFRequestedVersions': fields.get('Custom.HFrequestedversions', ''),
+                    'Effort': effort,
+                    'EffortDevEstimate': effort_dev_estimate,
+                    'EffortDevActual': effort_dev_actual,
+                    'QAEffortEstimation': qa_effort_estimation,
+                    'QAEffortActual': qa_effort_actual,
+                    'TShirtEstimation': fields.get('Custom.TShirtestimation', ''),
+                    'ParentWorkItem': fields.get('System.Parent', None)
                 }
 
                 batch_data.append(item_data)
@@ -1537,17 +1618,50 @@ class ADOExtractor:
                             else:
                                 target_date = None
 
+                            # Parse effort fields (they might be numbers or None)
+                            effort = fields.get('Microsoft.VSTS.Scheduling.Effort')
+                            try:
+                                effort = float(effort) if effort is not None else None
+                            except (ValueError, TypeError):
+                                effort = None
+                            
+                            effort_dev_estimate = fields.get('Custom.EffortDevestimate')
+                            try:
+                                effort_dev_estimate = float(effort_dev_estimate) if effort_dev_estimate is not None else None
+                            except (ValueError, TypeError):
+                                effort_dev_estimate = None
+                            
+                            effort_dev_actual = fields.get('Custom.EffortDevactual')
+                            try:
+                                effort_dev_actual = float(effort_dev_actual) if effort_dev_actual is not None else None
+                            except (ValueError, TypeError):
+                                effort_dev_actual = None
+                            
+                            qa_effort_estimation = fields.get('Custom.QAeffortestimation')
+                            try:
+                                qa_effort_estimation = float(qa_effort_estimation) if qa_effort_estimation is not None else None
+                            except (ValueError, TypeError):
+                                qa_effort_estimation = None
+                            
+                            qa_effort_actual = fields.get('Custom.QAeffortactual')
+                            try:
+                                qa_effort_actual = float(qa_effort_actual) if qa_effort_actual is not None else None
+                            except (ValueError, TypeError):
+                                qa_effort_actual = None
+
                             # Insert the work item
                             connection.execute(
                                 text("""
                                     INSERT INTO work_items (
                                         id, title, description, assigned_to, severity,
                                         state, customer_name, area_path, created_date, changed_date,
-                                        iteration_path, hotfix_delivered_version, work_item_type, target_date, hf_status, hf_requested_versions
+                                        iteration_path, hotfix_delivered_version, work_item_type, target_date, hf_status, hf_requested_versions,
+                                        effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item
                                     ) VALUES (
                                         :id, :title, :description, :assigned_to, :severity,
                                         :state, :customer_name, :area_path, :created_date, :changed_date,
-                                        :iteration_path, :hotfix_delivered_version, :work_item_type, :target_date, :hf_status, :hf_requested_versions
+                                        :iteration_path, :hotfix_delivered_version, :work_item_type, :target_date, :hf_status, :hf_requested_versions,
+                                        :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item
                                     )
                                 """),
                                 {
@@ -1566,7 +1680,14 @@ class ADOExtractor:
                                     "work_item_type": work_item_type,
                                     "target_date": target_date,
                                     "hf_status": fields.get('Custom.HFstatus', ''),
-                                    "hf_requested_versions": fields.get('Custom.HFrequestedversions', '')
+                                    "hf_requested_versions": fields.get('Custom.HFrequestedversions', ''),
+                                    "effort": effort,
+                                    "effort_dev_estimate": effort_dev_estimate,
+                                    "effort_dev_actual": effort_dev_actual,
+                                    "qa_effort_estimation": qa_effort_estimation,
+                                    "qa_effort_actual": qa_effort_actual,
+                                    "tshirt_estimation": fields.get('Custom.TShirtestimation', ''),
+                                    "parent_work_item": fields.get('System.Parent', None)
                                 }
                             )
                             print(f"Inserted missing work item {work_item_id} of type {work_item_type}")
