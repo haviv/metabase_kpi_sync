@@ -141,7 +141,8 @@ class DatabaseConnection:
                 'qa_effort_estimation': 'FLOAT',
                 'qa_effort_actual': 'FLOAT',
                 'tshirt_estimation': 'VARCHAR(50)',
-                'parent_work_item': 'INTEGER'
+                'parent_work_item': 'INTEGER',
+                'ticket_type': 'VARCHAR(200)'
             }
             for col_name, col_type in work_item_columns.items():
                 if col_name not in existing_columns:
@@ -258,7 +259,8 @@ class DatabaseConnection:
                 Column('qa_effort_estimation', Float, nullable=True),
                 Column('qa_effort_actual', Float, nullable=True),
                 Column('tshirt_estimation', String(50), nullable=True),
-                Column('parent_work_item', Integer, nullable=True)
+                Column('parent_work_item', Integer, nullable=True),
+                Column('ticket_type', String(200), nullable=True)
             )
 
             # History snapshots table
@@ -565,7 +567,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             update_stmt += ", parent_issue = :parent_issue"
                         elif item_type == 'work_item':
-                            update_stmt += ", work_item_type = :work_item_type, effort = :effort, effort_dev_estimate = :effort_dev_estimate, effort_dev_actual = :effort_dev_actual, qa_effort_estimation = :qa_effort_estimation, qa_effort_actual = :qa_effort_actual, tshirt_estimation = :tshirt_estimation, parent_work_item = :parent_work_item"
+                            update_stmt += ", work_item_type = :work_item_type, effort = :effort, effort_dev_estimate = :effort_dev_estimate, effort_dev_actual = :effort_dev_actual, qa_effort_estimation = :qa_effort_estimation, qa_effort_actual = :qa_effort_actual, tshirt_estimation = :tshirt_estimation, parent_work_item = :parent_work_item, ticket_type = :ticket_type"
                         
                         update_stmt += " WHERE id = :id"
 
@@ -598,6 +600,7 @@ class DatabaseConnection:
                             params["qa_effort_actual"] = item.get('QAEffortActual')
                             params["tshirt_estimation"] = item.get('TShirtEstimation', '')
                             params["parent_work_item"] = item.get('ParentWorkItem')
+                            params["ticket_type"] = item.get('TicketType', '')
 
                         connection.execute(text(update_stmt), params)
                     else:
@@ -615,7 +618,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             insert_stmt += ", parent_issue"
                         elif item_type == 'work_item':
-                            insert_stmt += ", work_item_type, effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item"
+                            insert_stmt += ", work_item_type, effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type"
                         
                         insert_stmt += """
                         )
@@ -628,7 +631,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             insert_stmt += ", :parent_issue"
                         elif item_type == 'work_item':
-                            insert_stmt += ", :work_item_type, :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item"
+                            insert_stmt += ", :work_item_type, :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type"
                         
                         insert_stmt += ")"
 
@@ -661,6 +664,7 @@ class DatabaseConnection:
                             params["qa_effort_actual"] = item.get('QAEffortActual')
                             params["tshirt_estimation"] = item.get('TShirtEstimation', '')
                             params["parent_work_item"] = item.get('ParentWorkItem')
+                            params["ticket_type"] = item.get('TicketType', '')
 
                         connection.execute(text(insert_stmt), params)
                         
@@ -1395,7 +1399,8 @@ class ADOExtractor:
                        [Custom.EffortDevactual],
                        [Custom.QAeffortestimation],
                        [Custom.QAeffortactual],
-                       [Custom.TShirtestimation]
+                       [Custom.TShirtestimation],
+                       [Custom.Tickettype]
                 FROM WorkItems
                 WHERE [System.ChangedDate] >= '{last_update_str}'
                 ORDER BY [System.ChangedDate] DESC
@@ -1520,7 +1525,8 @@ class ADOExtractor:
                     'QAEffortEstimation': qa_effort_estimation,
                     'QAEffortActual': qa_effort_actual,
                     'TShirtEstimation': fields.get('Custom.TShirtestimation', ''),
-                    'ParentWorkItem': fields.get('System.Parent', None)
+                    'ParentWorkItem': fields.get('System.Parent', None),
+                    'TicketType': fields.get('Custom.Tickettype', '')
                 }
 
                 batch_data.append(item_data)
@@ -1656,12 +1662,12 @@ class ADOExtractor:
                                         id, title, description, assigned_to, severity,
                                         state, customer_name, area_path, created_date, changed_date,
                                         iteration_path, hotfix_delivered_version, work_item_type, target_date, hf_status, hf_requested_versions,
-                                        effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item
+                                        effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type
                                     ) VALUES (
                                         :id, :title, :description, :assigned_to, :severity,
                                         :state, :customer_name, :area_path, :created_date, :changed_date,
                                         :iteration_path, :hotfix_delivered_version, :work_item_type, :target_date, :hf_status, :hf_requested_versions,
-                                        :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item
+                                        :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type
                                     )
                                 """),
                                 {
@@ -1687,7 +1693,8 @@ class ADOExtractor:
                                     "qa_effort_estimation": qa_effort_estimation,
                                     "qa_effort_actual": qa_effort_actual,
                                     "tshirt_estimation": fields.get('Custom.TShirtestimation', ''),
-                                    "parent_work_item": fields.get('System.Parent', None)
+                                    "parent_work_item": fields.get('System.Parent', None),
+                                    "ticket_type": fields.get('Custom.Tickettype', '')
                                 }
                             )
                             print(f"Inserted missing work item {work_item_id} of type {work_item_type}")
