@@ -329,6 +329,20 @@ class JIRADatabaseConnection:
                 schema=self.schema_name
             )
 
+            # Sprints table
+            self.sprints = Table(
+                'sprints', self.metadata,
+                Column('id', Integer, primary_key=True),
+                Column('name', String(500), nullable=False),
+                Column('state', String(50), nullable=True),
+                Column('start_date', DateTime, nullable=True),
+                Column('end_date', DateTime, nullable=True),
+                Column('complete_date', DateTime, nullable=True),
+                Column('created_date', DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP')),
+                Column('updated_date', DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP')),
+                schema=self.schema_name
+            )
+
             # Work items table for stories and other issue types
             self.work_items = Table(
                 'work_items', self.metadata,
@@ -376,6 +390,7 @@ class JIRADatabaseConnection:
                     self._create_index(connection, "idx_bugs_relations_bug_id", "bugs_relations", "bug_id")
                     self._create_index(connection, "idx_work_items_changed_date", "work_items", "changed_date")
                     self._create_index(connection, "idx_work_items_type", "work_items", "work_item_type")
+                    self._create_index(connection, "idx_sprints_name", "sprints", "name")
                     connection.commit()
                 except SQLAlchemyError as e:
                     print(f"Error creating indexes: {str(e)}")
@@ -459,6 +474,65 @@ class JIRADatabaseConnection:
             except SQLAlchemyError as e:
                 print(f"Error updating sync status: {str(e)}")
                 connection.rollback()
+
+    def upsert_sprints(self, sprints):
+        """Upsert sprints into the sprints table"""
+        processed_count = 0
+        with self.engine.connect() as connection:
+            for sprint in sprints:
+                try:
+                    # Check if sprint exists
+                    result = connection.execute(
+                        text(f"SELECT id FROM {self.schema_name}.sprints WHERE id = :id"),
+                        {"id": sprint['id']}
+                    ).first()
+
+                    if result:
+                        # Update existing sprint
+                        connection.execute(
+                            text(f"""
+                                UPDATE {self.schema_name}.sprints 
+                                SET name = :name, 
+                                    state = :state,
+                                    start_date = :start_date, 
+                                    end_date = :end_date,
+                                    complete_date = :complete_date,
+                                    updated_date = CURRENT_TIMESTAMP
+                                WHERE id = :id
+                            """),
+                            {
+                                "id": sprint['id'],
+                                "name": sprint['name'],
+                                "state": sprint['state'],
+                                "start_date": sprint['start_date'],
+                                "end_date": sprint['end_date'],
+                                "complete_date": sprint['complete_date']
+                            }
+                        )
+                    else:
+                        # Insert new sprint
+                        connection.execute(
+                            text(f"""
+                                INSERT INTO {self.schema_name}.sprints (id, name, state, start_date, end_date, complete_date)
+                                VALUES (:id, :name, :state, :start_date, :end_date, :complete_date)
+                            """),
+                            {
+                                "id": sprint['id'],
+                                "name": sprint['name'],
+                                "state": sprint['state'],
+                                "start_date": sprint['start_date'],
+                                "end_date": sprint['end_date'],
+                                "complete_date": sprint['complete_date']
+                            }
+                        )
+
+                    connection.commit()
+                    processed_count += 1
+                except SQLAlchemyError as e:
+                    print(f"Error upserting sprint {sprint.get('id', 'unknown')}: {str(e)}")
+                    connection.rollback()
+
+        return processed_count
 
     def update_history_snapshots(self):
         """Update the history snapshots table with current metrics"""
@@ -1576,6 +1650,170 @@ class JIRAExtractor:
             print(f"Error fetching work log details: {str(e)}")
             return None
 
+    def _get_sprint_details(self, sprint_id):
+        """Get sprint details from JIRA Agile API"""
+        try:
+            sprint_url = f"{self.jira_url}/rest/agile/1.0/sprint/{sprint_id}"
+            response = requests.get(sprint_url, headers=self.headers)
+            
+            if response.status_code != 200:
+                print(f"Error fetching sprint {sprint_id}: {response.status_code} - {response.text}")
+                return None
+            
+            sprint_data = response.json()
+            
+            # Parse dates
+            start_date = None
+            end_date = None
+            complete_date = None
+            
+            if sprint_data.get('startDate'):
+                try:
+                    start_date = datetime.fromisoformat(sprint_data['startDate'].replace('Z', '+00:00'))
+                except ValueError:
+                    try:
+                        start_date = datetime.strptime(sprint_data['startDate'], "%Y-%m-%dT%H:%M:%S.%f%z")
+                    except ValueError:
+                        start_date = None
+            
+            if sprint_data.get('endDate'):
+                try:
+                    end_date = datetime.fromisoformat(sprint_data['endDate'].replace('Z', '+00:00'))
+                except ValueError:
+                    try:
+                        end_date = datetime.strptime(sprint_data['endDate'], "%Y-%m-%dT%H:%M:%S.%f%z")
+                    except ValueError:
+                        end_date = None
+            
+            if sprint_data.get('completeDate'):
+                try:
+                    complete_date = datetime.fromisoformat(sprint_data['completeDate'].replace('Z', '+00:00'))
+                except ValueError:
+                    try:
+                        complete_date = datetime.strptime(sprint_data['completeDate'], "%Y-%m-%dT%H:%M:%S.%f%z")
+                    except ValueError:
+                        complete_date = None
+            
+            return {
+                'id': sprint_data.get('id'),
+                'name': sprint_data.get('name', ''),
+                'state': sprint_data.get('state', ''),
+                'start_date': start_date,
+                'end_date': end_date,
+                'complete_date': complete_date
+            }
+        except Exception as e:
+            print(f"Error fetching sprint details for {sprint_id}: {str(e)}")
+            return None
+
+    def update_sprints(self):
+        """Fetch all sprints from JIRA boards and update database"""
+        print("------>Fetching sprints from JIRA")
+        
+        try:
+            # Get all boards for the project
+            boards_url = f"{self.jira_url}/rest/agile/1.0/board"
+            boards_params = {'projectKeyOrId': self.project_key}
+            boards_response = requests.get(boards_url, headers=self.headers, params=boards_params)
+            
+            if boards_response.status_code != 200:
+                print(f"Error fetching boards: {boards_response.status_code} - {boards_response.text}")
+                return 0
+            
+            boards_data = boards_response.json()
+            boards = boards_data.get('values', [])
+            
+            if not boards:
+                print("------>No boards found for project")
+                return 0
+            
+            all_sprints = []
+            
+            # Fetch sprints from all boards
+            for board in boards:
+                board_id = board.get('id')
+                board_name = board.get('name', 'Unknown')
+                print(f"------>Fetching sprints from board: {board_name} (ID: {board_id})")
+                
+                sprints_url = f"{self.jira_url}/rest/agile/1.0/board/{board_id}/sprint"
+                sprints_params = {'maxResults': 100}
+                
+                while True:
+                    sprints_response = requests.get(sprints_url, headers=self.headers, params=sprints_params)
+                    
+                    if sprints_response.status_code != 200:
+                        print(f"Error fetching sprints from board {board_id}: {sprints_response.status_code}")
+                        break
+                    
+                    sprints_data = sprints_response.json()
+                    sprints = sprints_data.get('values', [])
+                    
+                    if not sprints:
+                        break
+                    
+                    for sprint in sprints:
+                        sprint_id = sprint.get('id')
+                        if sprint_id and sprint_id not in [s['id'] for s in all_sprints]:
+                            # Parse dates
+                            start_date = None
+                            end_date = None
+                            complete_date = None
+                            
+                            if sprint.get('startDate'):
+                                try:
+                                    start_date = datetime.fromisoformat(sprint['startDate'].replace('Z', '+00:00'))
+                                except ValueError:
+                                    try:
+                                        start_date = datetime.strptime(sprint['startDate'], "%Y-%m-%dT%H:%M:%S.%f%z")
+                                    except ValueError:
+                                        start_date = None
+                            
+                            if sprint.get('endDate'):
+                                try:
+                                    end_date = datetime.fromisoformat(sprint['endDate'].replace('Z', '+00:00'))
+                                except ValueError:
+                                    try:
+                                        end_date = datetime.strptime(sprint['endDate'], "%Y-%m-%dT%H:%M:%S.%f%z")
+                                    except ValueError:
+                                        end_date = None
+                            
+                            if sprint.get('completeDate'):
+                                try:
+                                    complete_date = datetime.fromisoformat(sprint['completeDate'].replace('Z', '+00:00'))
+                                except ValueError:
+                                    try:
+                                        complete_date = datetime.strptime(sprint['completeDate'], "%Y-%m-%dT%H:%M:%S.%f%z")
+                                    except ValueError:
+                                        complete_date = None
+                            
+                            sprint_info = {
+                                'id': sprint_id,
+                                'name': sprint.get('name', ''),
+                                'state': sprint.get('state', ''),
+                                'start_date': start_date,
+                                'end_date': end_date,
+                                'complete_date': complete_date
+                            }
+                            all_sprints.append(sprint_info)
+                    
+                    # Check for more pages
+                    if sprints_data.get('isLast', True):
+                        break
+                    sprints_params['startAt'] = sprints_data.get('startAt', 0) + len(sprints)
+            
+            # Update database with sprints
+            if hasattr(self, 'db_connection') and self.db_connection:
+                processed_count = self.db_connection.upsert_sprints(all_sprints)
+                print(f"------>Processed {processed_count} sprints from {len(boards)} board(s)")
+                return processed_count
+            else:
+                print("------>No database connection available for sprints update")
+                return 0
+                
+        except Exception as e:
+            print(f"Error updating sprints: {str(e)}")
+            return 0
+
     def handle_story_changes(self, stories, db_connection=None):
         """Get and store the state change history for stories using JIRA changelog"""
         if not stories:
@@ -1778,12 +2016,16 @@ def main():
             extractor.handle_story_changes(work_items, db)
             print(f"------>Processed state changes for {len(work_items)} work items")
 
+            # Update sprints
+            processed_sprints = extractor.update_sprints()
 
             # Update sync status for both bugs and work items
             if processed_bugs > 0:
                 db.update_sync_status('bug', processed_bugs)
             if processed_work_items > 0:
                 db.update_sync_status('story', processed_work_items)
+            if processed_sprints > 0:
+                db.update_sync_status('sprint', processed_sprints)
 
             # Update history snapshots
             db.update_history_snapshots()
