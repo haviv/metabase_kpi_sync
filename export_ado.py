@@ -297,6 +297,25 @@ class DatabaseConnection:
                 Column('updated_date', DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP')),
             )
 
+            # Sprint capacity table - stores capacity per developer per sprint
+            self.sprint_capacity = Table(
+                'sprint_capacity', self.metadata,
+                Column('id', Integer, primary_key=True, autoincrement=True),
+                Column('sprint_id', String(255), nullable=False),
+                Column('sprint_name', String(500), nullable=False),
+                Column('team_member_id', String(255), nullable=False),
+                Column('team_member_name', String(200), nullable=False),
+                Column('activity', String(100), nullable=True),
+                Column('capacity_per_day', Float, nullable=True),
+                Column('days_off_count', Integer, nullable=True, default=0),
+                Column('days_off_start', DateTime, nullable=True),
+                Column('days_off_end', DateTime, nullable=True),
+                Column('project_name', String(200), nullable=True),
+                Column('team_name', String(200), nullable=True),
+                Column('created_date', DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP')),
+                Column('updated_date', DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP')),
+            )
+
             # Create tables if they don't exist
             self.metadata.create_all(self.engine, checkfirst=True)
 
@@ -331,6 +350,11 @@ class DatabaseConnection:
                     self._drop_index(connection, "idx_sprints_start_date", "sprints")
                     self._drop_index(connection, "idx_sprints_finish_date", "sprints")
                 
+                if 'sprint_capacity' in existing_tables:
+                    self._drop_index(connection, "idx_sprint_capacity_sprint_id", "sprint_capacity")
+                    self._drop_index(connection, "idx_sprint_capacity_team_member", "sprint_capacity")
+                    self._drop_index(connection, "idx_sprint_capacity_composite", "sprint_capacity")
+                
                 # Alter history_snapshots.number column to FLOAT if the table exists
                 if 'history_snapshots' in existing_tables:
                     connection.execute(text("""
@@ -362,6 +386,11 @@ class DatabaseConnection:
                     self._create_index(connection, "idx_sprints_name", "sprints", "name")
                     self._create_index(connection, "idx_sprints_start_date", "sprints", "start_date")
                     self._create_index(connection, "idx_sprints_finish_date", "sprints", "finish_date")
+                    
+                    # Add indexes for sprint_capacity table
+                    self._create_index(connection, "idx_sprint_capacity_sprint_id", "sprint_capacity", "sprint_id")
+                    self._create_index(connection, "idx_sprint_capacity_team_member", "sprint_capacity", "team_member_id")
+                    self._create_index(connection, "idx_sprint_capacity_composite", "sprint_capacity", "sprint_id, team_member_id, activity")
                     
                     connection.commit()
                 except SQLAlchemyError as e:
@@ -744,6 +773,104 @@ class DatabaseConnection:
                     connection.rollback()
 
         return processed_count
+
+    def upsert_sprint_capacities(self, capacities):
+        """Upsert sprint capacities into the sprint_capacity table"""
+        processed_count = 0
+        with self.engine.connect() as connection:
+            for capacity in capacities:
+                try:
+                    # Check if capacity record exists (based on sprint_id, team_member_id, and activity)
+                    result = connection.execute(
+                        text("""
+                            SELECT id FROM sprint_capacity 
+                            WHERE sprint_id = :sprint_id 
+                            AND team_member_id = :team_member_id 
+                            AND COALESCE(activity, '') = COALESCE(:activity, '')
+                        """),
+                        {
+                            "sprint_id": capacity['sprint_id'],
+                            "team_member_id": capacity['team_member_id'],
+                            "activity": capacity.get('activity')
+                        }
+                    ).first()
+
+                    if result:
+                        # Update existing capacity record
+                        connection.execute(
+                            text("""
+                                UPDATE sprint_capacity 
+                                SET sprint_name = :sprint_name,
+                                    team_member_name = :team_member_name,
+                                    capacity_per_day = :capacity_per_day,
+                                    days_off_count = :days_off_count,
+                                    days_off_start = :days_off_start,
+                                    days_off_end = :days_off_end,
+                                    project_name = :project_name,
+                                    team_name = :team_name,
+                                    updated_date = CURRENT_TIMESTAMP
+                                WHERE id = :id
+                            """),
+                            {
+                                "id": result[0],
+                                "sprint_name": capacity['sprint_name'],
+                                "team_member_name": capacity['team_member_name'],
+                                "capacity_per_day": capacity.get('capacity_per_day'),
+                                "days_off_count": capacity.get('days_off_count', 0),
+                                "days_off_start": capacity.get('days_off_start'),
+                                "days_off_end": capacity.get('days_off_end'),
+                                "project_name": capacity.get('project_name'),
+                                "team_name": capacity.get('team_name')
+                            }
+                        )
+                    else:
+                        # Insert new capacity record
+                        connection.execute(
+                            text("""
+                                INSERT INTO sprint_capacity 
+                                (sprint_id, sprint_name, team_member_id, team_member_name, 
+                                 activity, capacity_per_day, days_off_count, days_off_start, 
+                                 days_off_end, project_name, team_name)
+                                VALUES (:sprint_id, :sprint_name, :team_member_id, :team_member_name,
+                                        :activity, :capacity_per_day, :days_off_count, :days_off_start,
+                                        :days_off_end, :project_name, :team_name)
+                            """),
+                            {
+                                "sprint_id": capacity['sprint_id'],
+                                "sprint_name": capacity['sprint_name'],
+                                "team_member_id": capacity['team_member_id'],
+                                "team_member_name": capacity['team_member_name'],
+                                "activity": capacity.get('activity'),
+                                "capacity_per_day": capacity.get('capacity_per_day'),
+                                "days_off_count": capacity.get('days_off_count', 0),
+                                "days_off_start": capacity.get('days_off_start'),
+                                "days_off_end": capacity.get('days_off_end'),
+                                "project_name": capacity.get('project_name'),
+                                "team_name": capacity.get('team_name')
+                            }
+                        )
+
+                    connection.commit()
+                    processed_count += 1
+                except SQLAlchemyError as e:
+                    print(f"Error upserting sprint capacity for {capacity.get('team_member_name', 'unknown')} in sprint {capacity.get('sprint_id', 'unknown')}: {str(e)}")
+                    connection.rollback()
+
+        return processed_count
+
+    def get_last_sprint_capacity_sync(self):
+        """Get the last sync time for sprint capacity"""
+        with self.engine.connect() as connection:
+            result = connection.execute(
+                text(self._get_last_sync_query()),
+                {"entity_type": "sprint_capacity"}
+            ).first()
+
+            if result:
+                return result[0]
+            
+            # If no sync history, return None to indicate first run
+            return None
 
 def get_database_connection():
     """Factory function to create the appropriate database connection"""
@@ -1903,6 +2030,236 @@ class ADOExtractor:
             print("------>No database connection available for sprints update")
             return 0
 
+    def update_sprint_capacities(self, current_sprint_only=True):
+        """
+        Fetch and store sprint capacity data from Azure DevOps.
+        
+        Args:
+            current_sprint_only: If True, only fetch capacity for current sprints.
+                               If False, fetch for all sprints (used for initial sync).
+        """
+        all_capacities = []
+        
+        for scrum_config in self.scrum_projects:
+            project_name = scrum_config['project']
+            team_name = scrum_config['team']
+            
+            print(f"------>Processing sprint capacities for project: {project_name}, team: {team_name}")
+            
+            # Get teams for this project
+            teams_url = f"https://dev.azure.com/{self.organization}/_apis/projects/{project_name}/teams?api-version=7.0"
+            teams_response = requests.get(teams_url, headers=self.headers)
+            
+            if teams_response.status_code != 200:
+                print(f"Error fetching teams for project {project_name}: {teams_response.status_code} - {teams_response.text}")
+                continue
+            
+            teams = teams_response.json().get("value", [])
+            if not teams:
+                print(f"No teams found in project {project_name}")
+                continue
+            
+            # Find the specific team if specified, otherwise use the first team
+            target_team = None
+            if team_name:
+                for team in teams:
+                    if team["name"].lower() == team_name.lower():
+                        target_team = team
+                        break
+                
+                if not target_team:
+                    print(f"Team '{team_name}' not found in project {project_name}. Available teams: {[t['name'] for t in teams]}")
+                    continue
+            else:
+                target_team = teams[0]
+                print(f"Using first team: {target_team['name']}")
+            
+            team_id = target_team["id"]
+            actual_team_name = target_team["name"]
+            print(f"------>Fetching sprint capacities for team: {actual_team_name} in project: {project_name}")
+            
+            # Get iterations (sprints) for this team
+            iterations_url = f"https://dev.azure.com/{self.organization}/{project_name}/{team_id}/_apis/work/teamsettings/iterations?api-version=7.0"
+            iterations_response = requests.get(iterations_url, headers=self.headers)
+            
+            if iterations_response.status_code != 200:
+                print(f"Error fetching iterations for team {actual_team_name} in project {project_name}: {iterations_response.status_code}")
+                continue
+            
+            iterations = iterations_response.json().get("value", [])
+            print(f"------>Found {len(iterations)} iterations for team {actual_team_name}")
+            
+            # Filter iterations based on current_sprint_only flag
+            iterations_to_process = []
+            current_date = datetime.now()
+            
+            for iteration in iterations:
+                # Get detailed iteration information to check dates
+                iteration_id = iteration["id"]
+                iteration_detail_url = f"https://dev.azure.com/{self.organization}/{project_name}/{team_id}/_apis/work/teamsettings/iterations/{iteration_id}?api-version=7.0"
+                detail_response = requests.get(iteration_detail_url, headers=self.headers)
+                
+                if detail_response.status_code != 200:
+                    continue
+                
+                iteration_detail = detail_response.json()
+                attributes = iteration_detail.get("attributes", {})
+                time_frame = attributes.get("timeFrame", "")
+                
+                # Parse dates for filtering
+                start_date = None
+                finish_date = None
+                
+                if "startDate" in attributes and attributes["startDate"]:
+                    try:
+                        start_date = datetime.strptime(attributes["startDate"], "%Y-%m-%dT%H:%M:%S.%fZ")
+                    except ValueError:
+                        try:
+                            start_date = datetime.strptime(attributes["startDate"], "%Y-%m-%dT%H:%M:%SZ")
+                        except ValueError:
+                            pass
+                
+                if "finishDate" in attributes and attributes["finishDate"]:
+                    try:
+                        finish_date = datetime.strptime(attributes["finishDate"], "%Y-%m-%dT%H:%M:%S.%fZ")
+                    except ValueError:
+                        try:
+                            finish_date = datetime.strptime(attributes["finishDate"], "%Y-%m-%dT%H:%M:%SZ")
+                        except ValueError:
+                            pass
+                
+                # Decide whether to include this iteration
+                if current_sprint_only:
+                    # Only include current sprint (timeFrame == "current" or dates encompass today)
+                    is_current = time_frame == "current"
+                    is_date_current = (start_date and finish_date and 
+                                      start_date <= current_date <= finish_date)
+                    if is_current or is_date_current:
+                        iterations_to_process.append({
+                            'iteration': iteration,
+                            'detail': iteration_detail
+                        })
+                else:
+                    # Include all iterations for initial full sync
+                    iterations_to_process.append({
+                        'iteration': iteration,
+                        'detail': iteration_detail
+                    })
+            
+            print(f"------>Processing capacities for {len(iterations_to_process)} iteration(s)")
+            
+            for iter_data in iterations_to_process:
+                iteration = iter_data['iteration']
+                iteration_detail = iter_data['detail']
+                iteration_id = iteration["id"]
+                iteration_name = iteration["name"]
+                
+                # Fetch capacity for this iteration - use team name (URL encoded) instead of team_id
+                team_name_encoded = requests.utils.quote(actual_team_name)
+                capacity_url = f"https://dev.azure.com/{self.organization}/{project_name}/{team_name_encoded}/_apis/work/teamsettings/iterations/{iteration_id}/capacities?api-version=7.0"
+                capacity_response = requests.get(capacity_url, headers=self.headers)
+                
+                if capacity_response.status_code != 200:
+                    print(f"Error fetching capacity for iteration {iteration_name}: {capacity_response.status_code} - {capacity_response.text}")
+                    continue
+                
+                response_json = capacity_response.json()
+                # API returns data in 'teamMembers' key, not 'value'
+                capacity_data = response_json.get("teamMembers", [])
+                print(f"------>Found {len(capacity_data)} team member capacity records for sprint: {iteration_name}")
+                
+                for member_capacity in capacity_data:
+                    team_member = member_capacity.get("teamMember", {})
+                    team_member_id = team_member.get("id", "")
+                    team_member_name = team_member.get("displayName", "Unknown")
+                    
+                    activities = member_capacity.get("activities", [])
+                    days_off = member_capacity.get("daysOff", [])
+                    
+                    # Calculate days off count and date range
+                    days_off_count = 0
+                    days_off_start = None
+                    days_off_end = None
+                    
+                    if days_off:
+                        for day_off in days_off:
+                            start_str = day_off.get("start", "")
+                            end_str = day_off.get("end", "")
+                            
+                            if start_str:
+                                try:
+                                    start_dt = datetime.strptime(start_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+                                except ValueError:
+                                    try:
+                                        start_dt = datetime.strptime(start_str, "%Y-%m-%dT%H:%M:%SZ")
+                                    except ValueError:
+                                        start_dt = None
+                                
+                                if start_dt and (days_off_start is None or start_dt < days_off_start):
+                                    days_off_start = start_dt
+                            
+                            if end_str:
+                                try:
+                                    end_dt = datetime.strptime(end_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+                                except ValueError:
+                                    try:
+                                        end_dt = datetime.strptime(end_str, "%Y-%m-%dT%H:%M:%SZ")
+                                    except ValueError:
+                                        end_dt = None
+                                
+                                if end_dt and (days_off_end is None or end_dt > days_off_end):
+                                    days_off_end = end_dt
+                        
+                        # Calculate total days off
+                        if days_off_start and days_off_end:
+                            days_off_count = (days_off_end - days_off_start).days + 1
+                    
+                    # Process activities - each activity gets its own record
+                    if activities:
+                        for activity in activities:
+                            activity_name = activity.get("name", "")
+                            capacity_per_day = activity.get("capacityPerDay", 0)
+                            
+                            capacity_record = {
+                                'sprint_id': iteration_id,
+                                'sprint_name': iteration_name,
+                                'team_member_id': team_member_id,
+                                'team_member_name': team_member_name,
+                                'activity': activity_name if activity_name else None,
+                                'capacity_per_day': float(capacity_per_day) if capacity_per_day else 0,
+                                'days_off_count': days_off_count,
+                                'days_off_start': days_off_start,
+                                'days_off_end': days_off_end,
+                                'project_name': project_name,
+                                'team_name': actual_team_name
+                            }
+                            all_capacities.append(capacity_record)
+                    else:
+                        # No activities defined, still record the team member with null activity
+                        capacity_record = {
+                            'sprint_id': iteration_id,
+                            'sprint_name': iteration_name,
+                            'team_member_id': team_member_id,
+                            'team_member_name': team_member_name,
+                            'activity': None,
+                            'capacity_per_day': 0,
+                            'days_off_count': days_off_count,
+                            'days_off_start': days_off_start,
+                            'days_off_end': days_off_end,
+                            'project_name': project_name,
+                            'team_name': actual_team_name
+                        }
+                        all_capacities.append(capacity_record)
+        
+        # Update database with capacities
+        if hasattr(self, 'db_connection') and self.db_connection:
+            processed_count = self.db_connection.upsert_sprint_capacities(all_capacities)
+            print(f"------>Processed {processed_count} sprint capacity records from {len(self.scrum_projects)} project:team combinations")
+            return processed_count
+        else:
+            print("------>No database connection available for sprint capacities update")
+            return 0
+
 def main():
     # Load configuration from .env file
     organization = os.getenv('ADO_ORGANIZATION')
@@ -2009,6 +2366,18 @@ def main():
             # Update sprints
             processed_sprints = extractor.update_sprints()
 
+            # Update sprint capacities
+            # Check if this is the first sprint capacity sync
+            last_capacity_sync = db.get_last_sprint_capacity_sync()
+            if last_capacity_sync is None:
+                # First run - sync all historical sprint capacities
+                print("------>First sprint capacity sync - fetching all historical data")
+                processed_capacities = extractor.update_sprint_capacities(current_sprint_only=False)
+            else:
+                # Daily run - only sync current sprint capacity
+                print("------>Daily sprint capacity sync - fetching current sprint only")
+                processed_capacities = extractor.update_sprint_capacities(current_sprint_only=True)
+
             # Update history snapshots
             db.update_history_snapshots()
             print("------>Updated history snapshots")
@@ -2025,6 +2394,9 @@ def main():
 
             if processed_sprints > 0:
                 db.update_sync_status('sprint', processed_sprints)
+
+            if processed_capacities > 0:
+                db.update_sync_status('sprint_capacity', processed_capacities)
 
             # Update full sync status if we ran a full sync
             if should_run_full_sync:
