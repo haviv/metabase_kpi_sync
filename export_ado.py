@@ -12,6 +12,13 @@ from sqlalchemy.exc import SQLAlchemyError
 import json
 from abc import ABC, abstractmethod
 
+# Import GitHub Copilot metrics extractor
+try:
+    from export_github_copilot import GitHubCopilotExtractor, CopilotMetricsDatabase
+    COPILOT_AVAILABLE = True
+except ImportError:
+    COPILOT_AVAILABLE = False
+
 # Load environment variables from .env file
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
@@ -2378,6 +2385,27 @@ def main():
                 print("------>Daily sprint capacity sync - fetching current sprint only")
                 processed_capacities = extractor.update_sprint_capacities(current_sprint_only=True)
 
+            # Update GitHub Copilot metrics (if configured)
+            processed_copilot = 0
+            if COPILOT_AVAILABLE:
+                github_org = os.getenv('GITHUB_ORG')
+                github_teams = os.getenv('GITHUB_TEAMS')
+                github_team_sizes = os.getenv('GITHUB_TEAM_SIZES')
+                
+                if github_org and os.getenv('GITHUB_TOKEN'):
+                    print("------>Syncing GitHub Copilot metrics")
+                    try:
+                        copilot_extractor = GitHubCopilotExtractor(
+                            organization=github_org,
+                            teams=github_teams,
+                            team_sizes=github_team_sizes
+                        )
+                        processed_copilot = copilot_extractor.sync_to_database(db)
+                    except Exception as e:
+                        print(f"------>Error syncing Copilot metrics: {str(e)}")
+                else:
+                    print("------>Skipping Copilot metrics (GITHUB_ORG or GITHUB_TOKEN not configured)")
+
             # Update history snapshots
             db.update_history_snapshots()
             print("------>Updated history snapshots")
@@ -2397,6 +2425,9 @@ def main():
 
             if processed_capacities > 0:
                 db.update_sync_status('sprint_capacity', processed_capacities)
+
+            if processed_copilot > 0:
+                db.update_sync_status('copilot_metrics', processed_copilot)
 
             # Update full sync status if we ran a full sync
             if should_run_full_sync:
