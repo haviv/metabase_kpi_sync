@@ -19,6 +19,13 @@ try:
 except ImportError:
     COPILOT_AVAILABLE = False
 
+# Import GitHub Tests extractor
+try:
+    from export_github_tests import GitHubTestsExtractor
+    GITHUB_TESTS_AVAILABLE = True
+except ImportError:
+    GITHUB_TESTS_AVAILABLE = False
+
 # Load environment variables from .env file
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
@@ -2406,6 +2413,30 @@ def main():
                 else:
                     print("------>Skipping Copilot metrics (GITHUB_ORG or GITHUB_TOKEN not configured)")
 
+            # Update GitHub Actions test results (if configured)
+            processed_tests = 0
+            if GITHUB_TESTS_AVAILABLE:
+                github_test_workflows = os.getenv('GITHUB_TEST_WORKFLOWS')
+                
+                if os.getenv('GITHUB_TOKEN') and github_test_workflows:
+                    print("------>Syncing GitHub Actions test results")
+                    try:
+                        tests_extractor = GitHubTestsExtractor(db_connection=db)
+                        
+                        # Check if this is the first test sync (use sync_status, not table data)
+                        last_tests_sync = db.get_last_sync_time('github_tests')
+                        # get_last_sync_time returns default date (2025-03-01) if no sync found
+                        # If it's the default, this is first sync
+                        if last_tests_sync == datetime(2025, 3, 1):
+                            print("------>First GitHub tests sync - fetching last 60 days")
+                            processed_tests = tests_extractor.sync_test_runs(initial_sync=True)
+                        else:
+                            processed_tests = tests_extractor.sync_test_runs(days_back=1)
+                    except Exception as e:
+                        print(f"------>Error syncing GitHub tests: {str(e)}")
+                else:
+                    print("------>Skipping GitHub tests (GITHUB_TOKEN or GITHUB_TEST_WORKFLOWS not configured)")
+
             # Update history snapshots
             db.update_history_snapshots()
             print("------>Updated history snapshots")
@@ -2428,6 +2459,9 @@ def main():
 
             if processed_copilot > 0:
                 db.update_sync_status('copilot_metrics', processed_copilot)
+
+            if processed_tests > 0:
+                db.update_sync_status('github_tests', processed_tests)
 
             # Update full sync status if we ran a full sync
             if should_run_full_sync:
