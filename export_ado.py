@@ -2416,9 +2416,11 @@ def main():
             # Update GitHub Actions test results (if configured)
             processed_tests = 0
             if GITHUB_TESTS_AVAILABLE:
+                # Support both new GITHUB_TEST_CONFIGS and legacy GITHUB_TEST_WORKFLOWS
+                github_test_configs = os.getenv('GITHUB_TEST_CONFIGS')
                 github_test_workflows = os.getenv('GITHUB_TEST_WORKFLOWS')
                 
-                if os.getenv('GITHUB_TOKEN') and github_test_workflows:
+                if os.getenv('GITHUB_TOKEN') and (github_test_configs or github_test_workflows):
                     print("------>Syncing GitHub Actions test results")
                     try:
                         tests_extractor = GitHubTestsExtractor(db_connection=db)
@@ -2435,7 +2437,7 @@ def main():
                     except Exception as e:
                         print(f"------>Error syncing GitHub tests: {str(e)}")
                 else:
-                    print("------>Skipping GitHub tests (GITHUB_TOKEN or GITHUB_TEST_WORKFLOWS not configured)")
+                    print("------>Skipping GitHub tests (GITHUB_TOKEN or GITHUB_TEST_CONFIGS not configured)")
 
             # Update history snapshots
             db.update_history_snapshots()
