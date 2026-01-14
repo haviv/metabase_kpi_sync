@@ -317,6 +317,155 @@ class ExtentSummaryParser:
         except Exception as e:
             print(f"Error parsing Extent summary: {e}")
             return None
+
+
+class ExtentExcelParser:
+    """Parser for Extent Reports Excel files (Phase 1/2 connector tests)."""
+    
+    @staticmethod
+    def parse(excel_content: bytes) -> dict:
+        """
+        Parse Extent Reports Excel file.
+        
+        Excel columns:
+        - Test Case ID
+        - Scenario Name  
+        - Tags
+        - Status (PASSED/FAILED)
+        - Duration (e.g., "04:44 mins")
+        - Failure Stacktrace
+        
+        Returns:
+            Dictionary containing run_info, summary, and individual tests
+        """
+        try:
+            from openpyxl import load_workbook
+            
+            result = {
+                'run_info': {
+                    'id': '',
+                    'name': 'Extent Report',
+                    'total_duration_seconds': 0,
+                },
+                'summary': {
+                    'total': 0,
+                    'passed': 0,
+                    'failed': 0,
+                    'not_executed': 0,
+                },
+                'tests': []
+            }
+            
+            # Load workbook from bytes
+            wb = load_workbook(filename=io.BytesIO(excel_content), read_only=True)
+            ws = wb.active
+            
+            # Get headers from first row
+            headers = []
+            for cell in next(ws.iter_rows(min_row=1, max_row=1)):
+                headers.append(str(cell.value or '').lower().strip())
+            
+            # Find column indices
+            col_map = {}
+            for i, h in enumerate(headers):
+                if 'test case' in h or 'testcase' in h or h == 'id':
+                    col_map['test_id'] = i
+                elif 'scenario' in h:
+                    col_map['scenario'] = i
+                elif 'tag' in h:
+                    col_map['tags'] = i
+                elif h == 'status':
+                    col_map['status'] = i
+                elif 'duration' in h:
+                    col_map['duration'] = i
+                elif 'stacktrace' in h or 'failure' in h:
+                    col_map['stacktrace'] = i
+            
+            total_duration = 0.0
+            
+            # Process data rows
+            for row in ws.iter_rows(min_row=2):
+                row_values = [cell.value for cell in row]
+                
+                # Skip empty rows
+                if not any(row_values):
+                    continue
+                
+                # Extract values
+                test_id = str(row_values[col_map.get('test_id', 0)] or '')
+                scenario = str(row_values[col_map.get('scenario', 1)] or '')
+                tags = str(row_values[col_map.get('tags', 2)] or '')
+                status = str(row_values[col_map.get('status', 3)] or '').strip().upper()
+                duration_str = str(row_values[col_map.get('duration', 4)] or '')
+                stacktrace = row_values[col_map.get('stacktrace', 5)] if col_map.get('stacktrace') else None
+                
+                # Parse duration (e.g., "04:44 mins" or "00:30 secs")
+                duration_seconds = ExtentExcelParser._parse_duration(duration_str)
+                total_duration += duration_seconds
+                
+                # Normalize status
+                outcome = 'Passed' if status == 'PASSED' else 'Failed'
+                
+                test_data = {
+                    'test_id': test_id[:100] if test_id else '',
+                    'execution_id': '',
+                    'test_name': scenario[:1000] if scenario else test_id[:1000],
+                    'test_class': tags[:1000] if tags else None,
+                    'computer_name': None,
+                    'outcome': outcome,
+                    'duration_ms': duration_seconds * 1000,
+                    'start_time': None,
+                    'end_time': None,
+                    'error_message': str(stacktrace)[:2000] if stacktrace else None,
+                    'stack_trace': str(stacktrace)[:4000] if stacktrace else None,
+                    'stdout': None,
+                }
+                
+                result['tests'].append(test_data)
+                
+                # Update summary
+                result['summary']['total'] += 1
+                if outcome == 'Passed':
+                    result['summary']['passed'] += 1
+                else:
+                    result['summary']['failed'] += 1
+            
+            result['run_info']['total_duration_seconds'] = total_duration
+            
+            wb.close()
+            return result
+            
+        except ImportError:
+            print("Error: openpyxl not installed. Run: pip install openpyxl")
+            return None
+        except Exception as e:
+            print(f"Error parsing Extent Excel: {e}")
+            return None
+    
+    @staticmethod
+    def _parse_duration(duration_str: str) -> float:
+        """Parse duration string like '04:44 mins' or '00:30 secs' to seconds."""
+        if not duration_str:
+            return 0.0
+        
+        total_seconds = 0.0
+        duration_str = duration_str.lower().strip()
+        
+        # Try to match "MM:SS mins" format
+        match = re.search(r'(\d+):(\d+)\s*min', duration_str)
+        if match:
+            minutes = int(match.group(1))
+            seconds = int(match.group(2))
+            return minutes * 60 + seconds
+        
+        # Try to match "SS secs" format  
+        match = re.search(r'(\d+):?(\d*)\s*sec', duration_str)
+        if match:
+            if match.group(2):
+                return int(match.group(1)) * 60 + int(match.group(2))
+            return int(match.group(1))
+        
+        return total_seconds
     
     @staticmethod
     def _parse_duration(duration_str: str) -> float:
@@ -847,9 +996,10 @@ class GitHubTestsExtractor:
         return None
     
     def _parse_extent_artifact(self, zip_content: bytes) -> dict:
-        """Extract and parse Extent summary from a ZIP archive."""
+        """Extract and parse Extent report from a ZIP archive (text or Excel)."""
         try:
             with zipfile.ZipFile(io.BytesIO(zip_content), 'r') as zf:
+                # First try text summary file
                 for filename in zf.namelist():
                     if filename.endswith('test-summary.txt'):
                         content = zf.read(filename).decode('utf-8')
@@ -857,6 +1007,25 @@ class GitHubTestsExtractor:
                         if result:
                             result['_source_file'] = filename
                             return result
+                
+                # Fall back to Excel files (Phase 1/2 connector tests)
+                for filename in zf.namelist():
+                    if filename.endswith('.xlsx') and ('summary' in filename.lower() or 'result' in filename.lower()):
+                        content = zf.read(filename)
+                        result = ExtentExcelParser.parse(content)
+                        if result:
+                            result['_source_file'] = filename
+                            return result
+                
+                # Last resort: try any Excel file in the archive
+                for filename in zf.namelist():
+                    if filename.endswith('.xlsx'):
+                        content = zf.read(filename)
+                        result = ExtentExcelParser.parse(content)
+                        if result:
+                            result['_source_file'] = filename
+                            return result
+                            
         except zipfile.BadZipFile as e:
             print(f"Error extracting Extent ZIP: {e}")
         return None
