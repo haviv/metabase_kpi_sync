@@ -156,7 +156,14 @@ class DatabaseConnection:
                 'qa_effort_actual': 'FLOAT',
                 'tshirt_estimation': 'VARCHAR(50)',
                 'parent_work_item': 'INTEGER',
-                'ticket_type': 'VARCHAR(200)'
+                'ticket_type': 'VARCHAR(200)',
+                'freshdesk_ticket': 'VARCHAR(200)',
+                'target_version': 'VARCHAR(200)',
+                'tags': 'VARCHAR(500)',
+                'connector': 'VARCHAR(1000)',
+                'created_by': 'VARCHAR(200)',
+                'blocker': 'VARCHAR(200)',
+                'business_value': 'INTEGER'
             }
             for col_name, col_type in work_item_columns.items():
                 if col_name not in existing_columns:
@@ -274,7 +281,14 @@ class DatabaseConnection:
                 Column('qa_effort_actual', Float, nullable=True),
                 Column('tshirt_estimation', String(50), nullable=True),
                 Column('parent_work_item', Integer, nullable=True),
-                Column('ticket_type', String(200), nullable=True)
+                Column('ticket_type', String(200), nullable=True),
+                Column('freshdesk_ticket', String(200), nullable=True),
+                Column('target_version', String(200), nullable=True),
+                Column('tags', String(500), nullable=True),
+                Column('connector', String(1000), nullable=True),
+                Column('created_by', String(200), nullable=True),
+                Column('blocker', String(200), nullable=True),
+                Column('business_value', Integer, nullable=True)
             )
 
             # History snapshots table
@@ -375,6 +389,13 @@ class DatabaseConnection:
                         ALTER TABLE history_snapshots 
                         ALTER COLUMN number TYPE FLOAT 
                         USING number::FLOAT
+                    """))
+                
+                # Alter work_items.connector column to VARCHAR(1000) if the table exists
+                if 'work_items' in existing_tables:
+                    connection.execute(text("""
+                        ALTER TABLE work_items 
+                        ALTER COLUMN connector TYPE VARCHAR(1000);
                     """))
                 
                 connection.commit()
@@ -612,7 +633,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             update_stmt += ", parent_issue = :parent_issue"
                         elif item_type == 'work_item':
-                            update_stmt += ", work_item_type = :work_item_type, effort = :effort, effort_dev_estimate = :effort_dev_estimate, effort_dev_actual = :effort_dev_actual, qa_effort_estimation = :qa_effort_estimation, qa_effort_actual = :qa_effort_actual, tshirt_estimation = :tshirt_estimation, parent_work_item = :parent_work_item, ticket_type = :ticket_type"
+                            update_stmt += ", work_item_type = :work_item_type, effort = :effort, effort_dev_estimate = :effort_dev_estimate, effort_dev_actual = :effort_dev_actual, qa_effort_estimation = :qa_effort_estimation, qa_effort_actual = :qa_effort_actual, tshirt_estimation = :tshirt_estimation, parent_work_item = :parent_work_item, ticket_type = :ticket_type, freshdesk_ticket = :freshdesk_ticket, target_version = :target_version, tags = :tags, connector = :connector, created_by = :created_by, blocker = :blocker, business_value = :business_value"
                         
                         update_stmt += " WHERE id = :id"
 
@@ -646,6 +667,13 @@ class DatabaseConnection:
                             params["tshirt_estimation"] = item.get('TShirtEstimation', '')
                             params["parent_work_item"] = item.get('ParentWorkItem')
                             params["ticket_type"] = item.get('TicketType', '')
+                            params["freshdesk_ticket"] = item.get('FreshdeskTicket', '')
+                            params["target_version"] = item.get('TargetVersion', '')
+                            params["tags"] = item.get('Tags', '')
+                            params["connector"] = item.get('Connector', '')
+                            params["created_by"] = item.get('CreatedBy', '')
+                            params["blocker"] = item.get('Blocker', '')
+                            params["business_value"] = item.get('BusinessValue')
 
                         connection.execute(text(update_stmt), params)
                     else:
@@ -663,7 +691,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             insert_stmt += ", parent_issue"
                         elif item_type == 'work_item':
-                            insert_stmt += ", work_item_type, effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type"
+                            insert_stmt += ", work_item_type, effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type, freshdesk_ticket, target_version, tags, connector, created_by, blocker, business_value"
                         
                         insert_stmt += """
                         )
@@ -676,7 +704,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             insert_stmt += ", :parent_issue"
                         elif item_type == 'work_item':
-                            insert_stmt += ", :work_item_type, :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type"
+                            insert_stmt += ", :work_item_type, :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type, :freshdesk_ticket, :target_version, :tags, :connector, :created_by, :blocker, :business_value"
                         
                         insert_stmt += ")"
 
@@ -710,6 +738,13 @@ class DatabaseConnection:
                             params["tshirt_estimation"] = item.get('TShirtEstimation', '')
                             params["parent_work_item"] = item.get('ParentWorkItem')
                             params["ticket_type"] = item.get('TicketType', '')
+                            params["freshdesk_ticket"] = item.get('FreshdeskTicket', '')
+                            params["target_version"] = item.get('TargetVersion', '')
+                            params["tags"] = item.get('Tags', '')
+                            params["connector"] = item.get('Connector', '')
+                            params["created_by"] = item.get('CreatedBy', '')
+                            params["blocker"] = item.get('Blocker', '')
+                            params["business_value"] = item.get('BusinessValue')
 
                         connection.execute(text(insert_stmt), params)
                         
@@ -1543,7 +1578,14 @@ class ADOExtractor:
                        [Custom.QAeffortestimation],
                        [Custom.QAeffortactual],
                        [Custom.TShirtestimation],
-                       [Custom.Tickettype]
+                       [Custom.Tickettype],
+                       [Custom.FreshdeskTicket],
+                       [Custom.Targetversion],
+                       [System.Tags],
+                       [Custom.Connector],
+                       [System.CreatedBy],
+                       [Custom.Blocker],
+                       [Microsoft.VSTS.Common.BusinessValue]
                 FROM WorkItems
                 WHERE [System.ChangedDate] >= '{last_update_str}'
                 ORDER BY [System.ChangedDate] DESC
@@ -1645,6 +1687,20 @@ class ADOExtractor:
                 except (ValueError, TypeError):
                     qa_effort_actual = None
 
+                # Handle CreatedBy field properly
+                created_by = fields.get('System.CreatedBy')
+                if isinstance(created_by, dict):
+                    created_by = created_by.get('displayName', '')
+                else:
+                    created_by = str(created_by) if created_by is not None else ''
+                
+                # Parse BusinessValue as integer
+                business_value = fields.get('Microsoft.VSTS.Common.BusinessValue')
+                try:
+                    business_value = int(business_value) if business_value is not None else None
+                except (ValueError, TypeError):
+                    business_value = None
+                
                 item_data = {
                     'ID': item["id"],
                     'Title': fields.get('System.Title', ''),
@@ -1669,7 +1725,14 @@ class ADOExtractor:
                     'QAEffortActual': qa_effort_actual,
                     'TShirtEstimation': fields.get('Custom.TShirtestimation', ''),
                     'ParentWorkItem': fields.get('System.Parent', None),
-                    'TicketType': fields.get('Custom.Tickettype', '')
+                    'TicketType': fields.get('Custom.Tickettype', ''),
+                    'FreshdeskTicket': fields.get('Custom.FreshdeskTicket', ''),
+                    'TargetVersion': fields.get('Custom.Targetversion', ''),
+                    'Tags': (fields.get('System.Tags', '') or '')[:500],
+                    'Connector': (fields.get('Custom.Connector', '') or '')[:1000],
+                    'CreatedBy': created_by,
+                    'Blocker': fields.get('Custom.Blocker', ''),
+                    'BusinessValue': business_value
                 }
 
                 batch_data.append(item_data)
@@ -1798,6 +1861,20 @@ class ADOExtractor:
                             except (ValueError, TypeError):
                                 qa_effort_actual = None
 
+                            # Parse BusinessValue as integer
+                            business_value = fields.get('Microsoft.VSTS.Common.BusinessValue')
+                            try:
+                                business_value = int(business_value) if business_value is not None else None
+                            except (ValueError, TypeError):
+                                business_value = None
+                            
+                            # Handle CreatedBy field properly
+                            created_by_field = fields.get('System.CreatedBy')
+                            if isinstance(created_by_field, dict):
+                                created_by_field = created_by_field.get('displayName', '')
+                            else:
+                                created_by_field = str(created_by_field) if created_by_field is not None else ''
+                            
                             # Insert the work item
                             connection.execute(
                                 text("""
@@ -1805,12 +1882,14 @@ class ADOExtractor:
                                         id, title, description, assigned_to, severity,
                                         state, customer_name, area_path, created_date, changed_date,
                                         iteration_path, hotfix_delivered_version, work_item_type, target_date, hf_status, hf_requested_versions,
-                                        effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type
+                                        effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type,
+                                        freshdesk_ticket, target_version, tags, connector, created_by, blocker, business_value
                                     ) VALUES (
                                         :id, :title, :description, :assigned_to, :severity,
                                         :state, :customer_name, :area_path, :created_date, :changed_date,
                                         :iteration_path, :hotfix_delivered_version, :work_item_type, :target_date, :hf_status, :hf_requested_versions,
-                                        :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type
+                                        :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type,
+                                        :freshdesk_ticket, :target_version, :tags, :connector, :created_by, :blocker, :business_value
                                     )
                                 """),
                                 {
@@ -1837,7 +1916,14 @@ class ADOExtractor:
                                     "qa_effort_actual": qa_effort_actual,
                                     "tshirt_estimation": fields.get('Custom.TShirtestimation', ''),
                                     "parent_work_item": fields.get('System.Parent', None),
-                                    "ticket_type": fields.get('Custom.Tickettype', '')
+                                    "ticket_type": fields.get('Custom.Tickettype', ''),
+                                    "freshdesk_ticket": fields.get('Custom.FreshdeskTicket', ''),
+                                    "target_version": fields.get('Custom.Targetversion', ''),
+                                    "tags": (fields.get('System.Tags', '') or '')[:500],
+                                    "connector": (fields.get('Custom.Connector', '') or '')[:1000],
+                                    "created_by": created_by_field,
+                                    "blocker": fields.get('Custom.Blocker', ''),
+                                    "business_value": business_value
                                 }
                             )
                             print(f"Inserted missing work item {work_item_id} of type {work_item_type}")
