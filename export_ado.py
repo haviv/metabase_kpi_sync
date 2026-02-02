@@ -26,6 +26,13 @@ try:
 except ImportError:
     GITHUB_TESTS_AVAILABLE = False
 
+# Import GitHub PR metrics extractor
+try:
+    from export_github_prs import GitHubPRExtractor, PRMetricsDatabase
+    PR_METRICS_AVAILABLE = True
+except ImportError:
+    PR_METRICS_AVAILABLE = False
+
 # Load environment variables from .env file
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
@@ -2402,12 +2409,18 @@ def main():
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"\n=== Starting sync cycle at {current_time} ===")
             
+            # Check if full sync is disabled (for local development)
+            disable_full_sync = os.getenv('DISABLE_FULL_SYNC', 'false').lower() == 'true'
+            
             # Check if we need to run a full sync (weekly, going back 1 month)
             last_full_sync = db.get_last_full_sync_time()
             should_run_full_sync = False
             sync_date_override = None
             
-            if last_full_sync is None:
+            if disable_full_sync:
+                print(f"------>Full sync disabled (DISABLE_FULL_SYNC=true). Running delta sync only")
+                should_run_full_sync = False
+            elif last_full_sync is None:
                 # First time running, do a full sync
                 should_run_full_sync = True
                 sync_date_override = datetime.now() - timedelta(days=30)
@@ -2499,6 +2512,35 @@ def main():
                 else:
                     print("------>Skipping Copilot metrics (GITHUB_ORG or GITHUB_TOKEN not configured)")
 
+            # Update GitHub PR metrics (if configured)
+            processed_prs = 0
+            if PR_METRICS_AVAILABLE:
+                github_org = os.getenv('GITHUB_ORG')
+                github_pr_repos = os.getenv('GITHUB_PR_REPOS')  # Comma-separated list of repos
+                github_teams = os.getenv('GITHUB_TEAMS')
+                
+                if github_org and github_pr_repos and os.getenv('GITHUB_TOKEN'):
+                    print("------>Syncing GitHub PR metrics")
+                    try:
+                        pr_extractor = GitHubPRExtractor(
+                            organization=github_org,
+                            repositories=github_pr_repos,  # Now supports multiple repos
+                            teams=github_teams
+                        )
+                        
+                        # Check if this is the first PR metrics sync
+                        last_pr_sync = db.get_last_sync_time('pr_metrics')
+                        # get_last_sync_time returns default date (2025-03-01) if no sync found
+                        if last_pr_sync == datetime(2025, 3, 1):
+                            print("------>First PR metrics sync - fetching last 90 days")
+                            processed_prs = pr_extractor.sync_to_database(db, initial_sync=True)
+                        else:
+                            processed_prs = pr_extractor.sync_to_database(db)
+                    except Exception as e:
+                        print(f"------>Error syncing PR metrics: {str(e)}")
+                else:
+                    print("------>Skipping PR metrics (GITHUB_ORG, GITHUB_PR_REPOS or GITHUB_TOKEN not configured)")
+
             # Update GitHub Actions test results (if configured)
             processed_tests = 0
             if GITHUB_TESTS_AVAILABLE:
@@ -2547,6 +2589,9 @@ def main():
 
             if processed_copilot > 0:
                 db.update_sync_status('copilot_metrics', processed_copilot)
+
+            if processed_prs > 0:
+                db.update_sync_status('pr_metrics', processed_prs)
 
             if processed_tests > 0:
                 db.update_sync_status('github_tests', processed_tests)
