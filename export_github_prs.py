@@ -24,6 +24,9 @@ from pathlib import Path
 from sqlalchemy import create_engine, text, Table, Column, Integer, String, DateTime, MetaData, Float, Date, Numeric
 from sqlalchemy.exc import SQLAlchemyError
 
+# Configuration constants
+DELTA_SYNC_OVERLAP_DAYS = 2  # Days to overlap when doing delta sync (to catch late-merged PRs)
+
 # Load environment variables
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
@@ -517,14 +520,32 @@ class GitHubPRExtractor:
         elif not self.db:
             self.db = PRMetricsDatabase()
         
-        # Determine date range based on initial_sync flag
+        # Determine date range based on initial_sync flag or last sync time
         if initial_sync:
             since_date = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
             until_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
             print(f"------>Initial sync: fetching PR metrics from last 90 days")
         else:
-            since_date = None  # Uses default in fetch_all_metrics (30 days)
-            until_date = None
+            # Smart sync: only fetch PRs since last sync (with 7-day overlap for safety)
+            # Get the last date we have data for
+            with self.db.engine.connect() as conn:
+                result = conn.execute(text("""
+                    SELECT MAX(metric_date) 
+                    FROM pr_metrics_daily
+                    WHERE organization = :org
+                """), {'org': self.organization})
+                last_date = result.scalar()
+            
+            if last_date:
+                # Fetch from N days before last sync to catch any late-merged PRs
+                since_date = (last_date - timedelta(days=DELTA_SYNC_OVERLAP_DAYS)).strftime('%Y-%m-%d')
+                until_date = datetime.now().strftime('%Y-%m-%d')
+                print(f"------>Delta sync: fetching PRs from {since_date} ({DELTA_SYNC_OVERLAP_DAYS}-day overlap)")
+            else:
+                # No previous data, fetch last 30 days
+                since_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+                until_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+                print(f"------>No previous data: fetching last 30 days")
         
         processed = self.fetch_all_metrics(since_date=since_date, until_date=until_date)
         

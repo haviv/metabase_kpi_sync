@@ -2492,6 +2492,7 @@ def main():
                 processed_capacities = extractor.update_sprint_capacities(current_sprint_only=True)
 
             # Update GitHub Copilot metrics (if configured)
+            # Copilot metrics sync runs DAILY (API provides daily data)
             processed_copilot = 0
             if COPILOT_AVAILABLE:
                 github_org = os.getenv('GITHUB_ORG')
@@ -2499,20 +2500,29 @@ def main():
                 github_team_sizes = os.getenv('GITHUB_TEAM_SIZES')
                 
                 if github_org and os.getenv('GITHUB_TOKEN'):
-                    print("------>Syncing GitHub Copilot metrics")
-                    try:
-                        copilot_extractor = GitHubCopilotExtractor(
-                            organization=github_org,
-                            teams=github_teams,
-                            team_sizes=github_team_sizes
-                        )
-                        processed_copilot = copilot_extractor.sync_to_database(db)
-                    except Exception as e:
-                        print(f"------>Error syncing Copilot metrics: {str(e)}")
+                    # Check if Copilot metrics already synced today
+                    last_copilot_sync = db.get_last_sync_time('copilot_metrics')
+                    today = datetime.now().date()
+                    last_sync_date = last_copilot_sync.date() if last_copilot_sync and last_copilot_sync != datetime(2025, 3, 1) else None
+                    
+                    if last_sync_date == today:
+                        print("------>Skipping Copilot metrics (already synced today)")
+                    else:
+                        print("------>Syncing GitHub Copilot metrics (daily sync)")
+                        try:
+                            copilot_extractor = GitHubCopilotExtractor(
+                                organization=github_org,
+                                teams=github_teams,
+                                team_sizes=github_team_sizes
+                            )
+                            processed_copilot = copilot_extractor.sync_to_database(db)
+                        except Exception as e:
+                            print(f"------>Error syncing Copilot metrics: {str(e)}")
                 else:
                     print("------>Skipping Copilot metrics (GITHUB_ORG or GITHUB_TOKEN not configured)")
 
             # Update GitHub PR metrics (if configured)
+            # PR metrics sync runs DAILY to avoid excessive API calls
             processed_prs = 0
             if PR_METRICS_AVAILABLE:
                 github_org = os.getenv('GITHUB_ORG')
@@ -2520,24 +2530,30 @@ def main():
                 github_teams = os.getenv('GITHUB_TEAMS')
                 
                 if github_org and github_pr_repos and os.getenv('GITHUB_TOKEN'):
-                    print("------>Syncing GitHub PR metrics")
-                    try:
-                        pr_extractor = GitHubPRExtractor(
-                            organization=github_org,
-                            repositories=github_pr_repos,  # Now supports multiple repos
-                            teams=github_teams
-                        )
-                        
-                        # Check if this is the first PR metrics sync
-                        last_pr_sync = db.get_last_sync_time('pr_metrics')
-                        # get_last_sync_time returns default date (2025-03-01) if no sync found
-                        if last_pr_sync == datetime(2025, 3, 1):
-                            print("------>First PR metrics sync - fetching last 90 days")
-                            processed_prs = pr_extractor.sync_to_database(db, initial_sync=True)
-                        else:
-                            processed_prs = pr_extractor.sync_to_database(db)
-                    except Exception as e:
-                        print(f"------>Error syncing PR metrics: {str(e)}")
+                    # Check if PR metrics already synced today
+                    last_pr_sync = db.get_last_sync_time('pr_metrics')
+                    today = datetime.now().date()
+                    last_sync_date = last_pr_sync.date() if last_pr_sync and last_pr_sync != datetime(2025, 3, 1) else None
+                    
+                    if last_sync_date == today:
+                        print("------>Skipping PR metrics (already synced today)")
+                    else:
+                        print("------>Syncing GitHub PR metrics (daily sync)")
+                        try:
+                            pr_extractor = GitHubPRExtractor(
+                                organization=github_org,
+                                repositories=github_pr_repos,  # Now supports multiple repos
+                                teams=github_teams
+                            )
+                            
+                            # Check if this is the first PR metrics sync
+                            if last_pr_sync == datetime(2025, 3, 1):
+                                print("------>First PR metrics sync - fetching last 90 days")
+                                processed_prs = pr_extractor.sync_to_database(db, initial_sync=True)
+                            else:
+                                processed_prs = pr_extractor.sync_to_database(db)
+                        except Exception as e:
+                            print(f"------>Error syncing PR metrics: {str(e)}")
                 else:
                     print("------>Skipping PR metrics (GITHUB_ORG, GITHUB_PR_REPOS or GITHUB_TOKEN not configured)")
 
