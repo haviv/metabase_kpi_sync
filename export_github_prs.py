@@ -63,6 +63,19 @@ class PRMetricsDatabase:
             Column('created_date', DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP')),
         )
         
+        # Table for per-member daily PR metrics
+        self.pr_metrics_member_daily = Table(
+            'pr_metrics_member_daily', self.metadata,
+            Column('id', Integer, primary_key=True, autoincrement=True),
+            Column('metric_date', Date, nullable=False),
+            Column('organization', String(200), nullable=False),
+            Column('repository', String(200), nullable=False),
+            Column('member_login', String(200), nullable=False),
+            Column('team_slug', String(200), nullable=False),
+            Column('merged_prs_count', Integer, nullable=False, server_default=text('0')),
+            Column('created_date', DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP')),
+        )
+        
         self.metadata.create_all(self.engine, checkfirst=True)
         
         # Create indexes and unique constraint
@@ -83,6 +96,23 @@ class PRMetricsDatabase:
                 connection.execute(text("""
                     CREATE INDEX IF NOT EXISTS idx_pr_daily_repo 
                     ON pr_metrics_daily(repository)
+                """))
+                # Indexes for pr_metrics_member_daily
+                connection.execute(text("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_member_daily_unique 
+                    ON pr_metrics_member_daily(metric_date, organization, repository, member_login, team_slug)
+                """))
+                connection.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_pr_member_daily_date 
+                    ON pr_metrics_member_daily(metric_date)
+                """))
+                connection.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_pr_member_daily_member 
+                    ON pr_metrics_member_daily(member_login)
+                """))
+                connection.execute(text("""
+                    CREATE INDEX IF NOT EXISTS idx_pr_member_daily_team 
+                    ON pr_metrics_member_daily(team_slug)
                 """))
                 connection.commit()
             except SQLAlchemyError as e:
@@ -112,6 +142,36 @@ class PRMetricsDatabase:
                     
                 except SQLAlchemyError as e:
                     print(f"Error upserting metric {record.get('metric_name', 'unknown')}: {str(e)}")
+                    connection.rollback()
+                    continue
+            
+            connection.commit()
+        
+        return processed_count
+    
+    def upsert_member_daily_metrics(self, member_records):
+        """Insert or update daily PR metrics per member"""
+        processed_count = 0
+        
+        with self.engine.connect() as connection:
+            for record in member_records:
+                try:
+                    connection.execute(
+                        text("""
+                            INSERT INTO pr_metrics_member_daily (
+                                metric_date, organization, repository, member_login, team_slug, merged_prs_count
+                            ) VALUES (
+                                :metric_date, :organization, :repository, :member_login, :team_slug, :merged_prs_count
+                            )
+                            ON CONFLICT (metric_date, organization, repository, member_login, team_slug) 
+                            DO UPDATE SET merged_prs_count = :merged_prs_count
+                        """),
+                        record
+                    )
+                    processed_count += 1
+                    
+                except SQLAlchemyError as e:
+                    print(f"Error upserting member metric for {record.get('member_login', 'unknown')}: {str(e)}")
                     connection.rollback()
                     continue
             
@@ -436,6 +496,43 @@ class GitHubPRExtractor:
         
         return records
     
+    def aggregate_member_metrics(self, pr_metrics_list):
+        """Aggregate PR metrics per member per day.
+        
+        Counts each PR once per member (no duplication from multi-team membership).
+        Stores with team_slug='all-teams' and both per-repo and repository='all' rows.
+        """
+        # {date: {member: {repo: count}}}
+        daily_member_counts = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        
+        for pm in pr_metrics_list:
+            author = pm['author']
+            teams = self.get_user_teams(author)
+            date = pm['merged_date']
+            repo = pm['repository']
+            
+            if not teams:
+                continue
+            
+            daily_member_counts[date][author][repo] += 1
+            daily_member_counts[date][author]['all'] += 1
+        
+        # Convert to database records
+        records = []
+        for date, member_data in daily_member_counts.items():
+            for member, repo_data in member_data.items():
+                for repo, count in repo_data.items():
+                    records.append({
+                        'metric_date': date,
+                        'organization': self.organization,
+                        'repository': repo,
+                        'member_login': member,
+                        'team_slug': 'all-teams',
+                        'merged_prs_count': count
+                    })
+        
+        return records
+    
     def fetch_all_metrics(self, since_date=None, until_date=None):
         """Fetch PR metrics for all configured teams and store in database
         
@@ -494,15 +591,28 @@ class GitHubPRExtractor:
         print(f"------>Aggregating metrics by team (across all repos)...")
         daily_records = self.aggregate_team_metrics(pr_metrics_list)
         
+        # Step 5: Aggregate per-member metrics (daily PR counts per member per team)
+        print(f"------>Aggregating metrics per team member...")
+        member_records = self.aggregate_member_metrics(pr_metrics_list)
+        
         # Store in database
-        if daily_records and self.db:
-            processed = self.db.upsert_daily_metrics(daily_records)
-            print(f"------>Stored {processed} daily metric records")
+        processed = 0
+        if self.db:
+            if daily_records:
+                processed = self.db.upsert_daily_metrics(daily_records)
+                print(f"------>Stored {processed} daily team metric records")
+            
+            if member_records:
+                member_processed = self.db.upsert_member_daily_metrics(member_records)
+                processed += member_processed
+                members_with_data = set(r['member_login'] for r in member_records if r['repository'] == 'all')
+                print(f"------>Stored {member_processed} daily member metric records ({len(members_with_data)} members)")
             
             # Show summary
-            aggregated = [r for r in daily_records if r['repository'] == 'all']
-            teams_with_data = set(r['team_slug'] for r in aggregated)
-            print(f"------>Teams with PR activity: {len(teams_with_data)}")
+            if daily_records:
+                aggregated = [r for r in daily_records if r['repository'] == 'all']
+                teams_with_data = set(r['team_slug'] for r in aggregated)
+                print(f"------>Teams with PR activity: {len(teams_with_data)}")
             
             return processed
         
