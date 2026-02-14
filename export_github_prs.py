@@ -77,6 +77,7 @@ class PRMetricsDatabase:
         )
         
         self.metadata.create_all(self.engine, checkfirst=True)
+        print("------>PR metrics tables ensured (pr_metrics_daily, pr_metrics_member_daily)")
         
         # Create indexes and unique constraint
         with self.engine.connect() as connection:
