@@ -486,6 +486,96 @@ class ExtentExcelParser:
         return 0
 
 
+class JUnitXMLParser:
+    """Parser for JUnit XML test reports (Vitest, Jest, pytest, etc.)."""
+    
+    @staticmethod
+    def parse(content: str) -> dict:
+        """Parse JUnit XML content and extract test results."""
+        try:
+            if content.startswith('\ufeff'):
+                content = content[1:]
+            
+            root = ET.fromstring(content)
+            
+            result = {
+                'run_info': {
+                    'id': '',
+                    'name': root.get('name', 'JUnit Test Report'),
+                    'total_duration_seconds': float(root.get('time', 0)),
+                },
+                'summary': {
+                    'total': 0,
+                    'passed': 0,
+                    'failed': 0,
+                    'not_executed': 0,
+                },
+                'tests': []
+            }
+            
+            # Handle both <testsuites> (root with children) and single <testsuite>
+            if root.tag == 'testsuites':
+                suites = root.findall('testsuite')
+            elif root.tag == 'testsuite':
+                suites = [root]
+            else:
+                return None
+            
+            for suite in suites:
+                suite_name = suite.get('name', '')
+                
+                for tc in suite.findall('testcase'):
+                    test_name = tc.get('name', '')
+                    classname = tc.get('classname', suite_name)
+                    duration_s = float(tc.get('time', 0))
+                    
+                    # Determine outcome
+                    failure = tc.find('failure')
+                    error = tc.find('error')
+                    skipped = tc.find('skipped')
+                    
+                    if failure is not None:
+                        outcome = 'Failed'
+                        error_msg = failure.get('message', '') or (failure.text or '')[:2000]
+                    elif error is not None:
+                        outcome = 'Failed'
+                        error_msg = error.get('message', '') or (error.text or '')[:2000]
+                    elif skipped is not None:
+                        outcome = 'NotExecuted'
+                        error_msg = None
+                    else:
+                        outcome = 'Passed'
+                        error_msg = None
+                    
+                    test_data = {
+                        'test_id': '',
+                        'execution_id': '',
+                        'test_name': test_name[:1000],
+                        'test_class': classname[:1000] if classname else None,
+                        'computer_name': suite.get('hostname'),
+                        'outcome': outcome,
+                        'duration_ms': duration_s * 1000,
+                        'start_time': None,
+                        'end_time': None,
+                        'error_message': error_msg,
+                        'stack_trace': None,
+                        'stdout': None,
+                    }
+                    
+                    result['tests'].append(test_data)
+            
+            result['summary']['total'] = len(result['tests'])
+            result['summary']['passed'] = sum(1 for t in result['tests'] if t['outcome'] == 'Passed')
+            result['summary']['failed'] = sum(1 for t in result['tests'] if t['outcome'] == 'Failed')
+            result['summary']['not_executed'] = sum(1 for t in result['tests'] if t['outcome'] == 'NotExecuted')
+            
+            return result
+            
+        except ET.ParseError as e:
+            print(f"Error parsing JUnit XML: {e}")
+            return None
+
+
 class PostmanExcelParser:
     """Parser for Newman (Postman) Excel reports."""
     
@@ -845,20 +935,31 @@ class GitHubTestsExtractor:
         workflows = config.get('workflows', [])
         
         all_runs = []
+
+        # Build workflow ID map by searching recent runs
+        # This is simpler and works for workflows on any branch (not just default branch)
+        print(f"        Finding workflows by searching recent runs...")
+        runs_url = f'{self.base_url}/repos/{owner}/{repo}/actions/runs'
+        runs_params = {'per_page': 100}
+        if branch:
+            runs_params['branch'] = branch
         
-        # First, get workflow IDs for our target workflows
-        workflows_url = f'{self.base_url}/repos/{owner}/{repo}/actions/workflows'
-        response = requests.get(workflows_url, headers=self.headers)
+        initial_runs_resp = requests.get(runs_url, headers=self.headers, params=runs_params)
         
-        if response.status_code != 200:
-            print(f"Error fetching workflows for {owner}/{repo}: {response.status_code} - {response.text}")
+        if initial_runs_resp.status_code != 200:
+            print(f"Error fetching runs for {owner}/{repo}: {initial_runs_resp.status_code}")
             return []
         
         workflow_map = {}
-        for wf in response.json().get('workflows', []):
-            if wf['name'] in workflows:
-                workflow_map[wf['name']] = wf['id']
+        for run in initial_runs_resp.json().get('workflow_runs', []):
+            if run['name'] in workflows and run['name'] not in workflow_map:
+                workflow_map[run['name']] = run['workflow_id']
+                print(f"        Found workflow: '{run['name']}' (ID: {run['workflow_id']})")
         
+        if len(workflow_map) < len(workflows):
+            missing = [w for w in workflows if w not in workflow_map]
+            print(f"        Warning: Could not find workflows: {', '.join(missing)}")
+
         # Fetch runs for each workflow separately
         for workflow_name, workflow_id in workflow_map.items():
             workflow_runs = []
@@ -981,9 +1082,10 @@ class GitHubTestsExtractor:
         return response.content
     
     def _parse_trx_artifact(self, zip_content: bytes) -> dict:
-        """Extract and parse TRX files from a ZIP archive."""
+        """Extract and parse TRX or JUnit XML files from a ZIP archive."""
         try:
             with zipfile.ZipFile(io.BytesIO(zip_content), 'r') as zf:
+                # Try TRX files first
                 for filename in zf.namelist():
                     if filename.endswith('.trx'):
                         content = zf.read(filename).decode('utf-8')
@@ -991,8 +1093,17 @@ class GitHubTestsExtractor:
                         if result:
                             result['_source_file'] = filename
                             return result
+                
+                # Fall back to JUnit XML files (.xml)
+                for filename in zf.namelist():
+                    if filename.endswith('.xml'):
+                        content = zf.read(filename).decode('utf-8')
+                        result = JUnitXMLParser.parse(content)
+                        if result:
+                            result['_source_file'] = filename
+                            return result
         except zipfile.BadZipFile as e:
-            print(f"Error extracting TRX ZIP: {e}")
+            print(f"Error extracting ZIP: {e}")
         return None
     
     def _parse_extent_artifact(self, zip_content: bytes) -> dict:
