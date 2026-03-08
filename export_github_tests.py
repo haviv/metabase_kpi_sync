@@ -1226,37 +1226,8 @@ class GitHubTestsExtractor:
                     'team': team
                 })
                 
-                # Delete existing test results for this run (in case of re-sync)
-                connection.execute(text("""
-                    DELETE FROM github_test_results WHERE run_id = :run_id
-                """), {'run_id': run_data['id']})
-                
-                # Insert individual test results (only for formats that provide them)
-                for test in parsed_result.get('tests', []):
-                    connection.execute(text("""
-                        INSERT INTO github_test_results (
-                            run_id, test_id, execution_id, test_name, test_class,
-                            outcome, duration_ms, start_time, end_time,
-                            error_message, stack_trace, stdout
-                        ) VALUES (
-                            :run_id, :test_id, :execution_id, :test_name, :test_class,
-                            :outcome, :duration_ms, :start_time, :end_time,
-                            :error_message, :stack_trace, :stdout
-                        )
-                    """), {
-                        'run_id': run_data['id'],
-                        'test_id': test.get('test_id', '')[:100],
-                        'execution_id': test.get('execution_id', '')[:100],
-                        'test_name': test.get('test_name', '')[:1000],
-                        'test_class': test.get('test_class', '')[:1000] if test.get('test_class') else None,
-                        'outcome': test.get('outcome', ''),
-                        'duration_ms': test.get('duration_ms'),
-                        'start_time': test.get('start_time'),
-                        'end_time': test.get('end_time'),
-                        'error_message': test.get('error_message'),
-                        'stack_trace': test.get('stack_trace'),
-                        'stdout': test.get('stdout')
-                    })
+                # Skip individual test results to avoid massive data volume
+                # All summary data (total, passed, failed, skipped) is already in github_test_runs
                 
                 connection.commit()
                 return True
