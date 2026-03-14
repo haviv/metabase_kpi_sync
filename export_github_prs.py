@@ -26,6 +26,16 @@ from sqlalchemy.exc import SQLAlchemyError
 
 # Configuration constants
 DELTA_SYNC_OVERLAP_DAYS = 2  # Days to overlap when doing delta sync (to catch late-merged PRs)
+# Attribution policy for PRs where author is not in any tracked team.
+# Supported values:
+# - author_only: Keep current behavior (ignore PR if author is not mapped to a team)
+# - author_then_merged_by: Fallback to merged_by when author is unmapped
+# - author_then_reviewer_then_merged_by: Fallback to first mapped approver/reviewer, then merged_by
+DEFAULT_ATTRIBUTION_MODE = "author_then_merged_by"
+
+# Default base branches to count for PR metrics.
+# You can override with env var GITHUB_PR_ALLOWED_BASE_BRANCHES (comma-separated).
+DEFAULT_ALLOWED_BASE_BRANCHES = ("cloud/dev", "pframe/dev", "main", "master", "stage", "dev")
 
 # Load environment variables
 env_path = Path(__file__).parent / '.env'
@@ -209,6 +219,14 @@ class GitHubPRExtractor:
         self._team_members = {}
         self._user_to_teams = {}  # user -> [team1, team2] (can be in multiple teams)
         self._team_sizes = {}  # team -> size (for metrics)
+        self._attribution_mode = os.getenv("GITHUB_PR_ATTRIBUTION_MODE", DEFAULT_ATTRIBUTION_MODE).strip().lower()
+        configured_branches = os.getenv("GITHUB_PR_ALLOWED_BASE_BRANCHES", "")
+        if configured_branches.strip():
+            self._allowed_base_branches = {
+                b.strip().lower() for b in configured_branches.split(',') if b.strip()
+            }
+        else:
+            self._allowed_base_branches = {b.lower() for b in DEFAULT_ALLOWED_BASE_BRANCHES}
     
     def _api_request(self, endpoint, params=None):
         """Make a request to the GitHub API"""
@@ -301,10 +319,60 @@ class GitHubPRExtractor:
     def get_user_teams(self, username):
         """Get all teams for a username (returns list)"""
         return self._user_to_teams.get(username.lower(), [])
+
+    def _is_bot_like_login(self, login):
+        """Best-effort detection for bot/service identities."""
+        if not login:
+            return False
+
+        normalized = login.lower()
+        return normalized.endswith("[bot]") or "copilot" in normalized or "bot" in normalized
+
+    def resolve_pr_owner(self, pr_metrics):
+        """Resolve which user should own a PR for team attribution.
+
+        Returns:
+            (owner_login, source) where source is one of:
+            - author
+            - merged_by
+            - unassigned
+        """
+        author = pr_metrics.get('author')
+        if author and self.get_user_teams(author):
+            return author, 'author'
+
+        if self._attribution_mode == 'author_then_reviewer_then_merged_by':
+            approvers = pr_metrics.get('approver_logins', [])
+            for approver in approvers:
+                if self._is_bot_like_login(approver):
+                    continue
+                if self.get_user_teams(approver):
+                    return approver, 'review_approver'
+
+            reviewers = pr_metrics.get('reviewer_logins', [])
+            for reviewer in reviewers:
+                if self._is_bot_like_login(reviewer):
+                    continue
+                if self.get_user_teams(reviewer):
+                    return reviewer, 'reviewer'
+
+            merged_by = pr_metrics.get('merged_by')
+            if merged_by and self.get_user_teams(merged_by):
+                return merged_by, 'merged_by'
+
+        if self._attribution_mode == 'author_then_merged_by':
+            merged_by = pr_metrics.get('merged_by')
+            # Prefer merger fallback mainly for bot/service-authored PRs, but also
+            # allow it if author is simply unmapped and merger is mapped.
+            if merged_by and self.get_user_teams(merged_by):
+                return merged_by, 'merged_by'
+
+        return None, 'unassigned'
     
     def fetch_merged_prs_from_repos(self, since_date, until_date):
         """Fetch all merged PRs from all configured repositories"""
         print(f"------>Fetching merged PRs from {len(self.repositories)} repos ({since_date} to {until_date})...")
+        print(f"------>Allowed base branches: {', '.join(sorted(self._allowed_base_branches))}")
         
         since_dt = datetime.strptime(since_date, '%Y-%m-%d').date()
         until_dt = datetime.strptime(until_date, '%Y-%m-%d').date()
@@ -314,6 +382,7 @@ class GitHubPRExtractor:
         for repo in self.repositories:
             print(f"        Fetching from {repo}...")
             repo_prs = []
+            skipped_by_branch = 0
             page = 1
             max_pages = 20
             
@@ -339,6 +408,11 @@ class GitHubPRExtractor:
                 for pr in prs:
                     if not pr.get('merged_at'):
                         continue
+
+                    base_ref = (pr.get('base') or {}).get('ref', '')
+                    if not base_ref or base_ref.lower() not in self._allowed_base_branches:
+                        skipped_by_branch += 1
+                        continue
                     
                     merged_at = datetime.fromisoformat(pr['merged_at'].replace('Z', '+00:00'))
                     merged_date = merged_at.date()
@@ -353,7 +427,7 @@ class GitHubPRExtractor:
                 
                 page += 1
             
-            print(f"          Found {len(repo_prs)} merged PRs")
+            print(f"          Found {len(repo_prs)} merged PRs (skipped by base branch: {skipped_by_branch})")
             # Store as (repo, pr) tuples
             all_prs.extend([(repo, pr) for pr in repo_prs])
         
@@ -387,6 +461,28 @@ class GitHubPRExtractor:
                 [r for r in reviews if r.get('submitted_at')],
                 key=lambda r: r['submitted_at']
             )
+
+            reviewer_logins = []
+            approver_logins = []
+            seen_reviewers = set()
+            seen_approvers = set()
+
+            for review in sorted_reviews:
+                review_user = (review.get('user') or {}).get('login')
+                if not review_user:
+                    continue
+
+                review_login = review_user.lower()
+                if review_login not in seen_reviewers:
+                    reviewer_logins.append(review_login)
+                    seen_reviewers.add(review_login)
+
+                if review.get('state') == 'APPROVED' and review_login not in seen_approvers:
+                    approver_logins.append(review_login)
+                    seen_approvers.add(review_login)
+
+            metrics['reviewer_logins'] = reviewer_logins
+            metrics['approver_logins'] = approver_logins
             
             if sorted_reviews:
                 first_review_at = datetime.fromisoformat(
@@ -394,9 +490,13 @@ class GitHubPRExtractor:
                 )
                 first_review_time = (first_review_at - created_at).total_seconds() / 3600
                 metrics['time_to_first_review_hours'] = round(first_review_time, 2)
+        else:
+            metrics['reviewer_logins'] = []
+            metrics['approver_logins'] = []
         
         # PR author
         metrics['author'] = pr['user']['login'].lower()
+        metrics['merged_by'] = pr['merged_by']['login'].lower() if pr.get('merged_by') and pr['merged_by'].get('login') else None
         metrics['merged_date'] = merged_at.date().isoformat()
         metrics['pr_number'] = pr['number']
         
@@ -412,8 +512,8 @@ class GitHubPRExtractor:
         daily_team_repo_metrics = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(list))))
         
         for pm in pr_metrics_list:
-            author = pm['author']
-            teams = self.get_user_teams(author)
+            owner = pm.get('attributed_owner')
+            teams = self.get_user_teams(owner) if owner else []
             date = pm['merged_date']
             repo = pm['repository']
             
@@ -507,16 +607,16 @@ class GitHubPRExtractor:
         daily_member_counts = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
         
         for pm in pr_metrics_list:
-            author = pm['author']
-            teams = self.get_user_teams(author)
+            owner = pm.get('attributed_owner')
+            teams = self.get_user_teams(owner) if owner else []
             date = pm['merged_date']
             repo = pm['repository']
             
             if not teams:
                 continue
             
-            daily_member_counts[date][author][repo] += 1
-            daily_member_counts[date][author]['all'] += 1
+            daily_member_counts[date][owner][repo] += 1
+            daily_member_counts[date][owner]['all'] += 1
         
         # Convert to database records
         records = []
@@ -587,6 +687,23 @@ class GitHubPRExtractor:
             metrics = self.calculate_pr_metrics(pr, reviews)
             metrics['repository'] = repo  # Add repo to metrics
             pr_metrics_list.append(metrics)
+
+        # Step 3.5: Resolve attribution owner (author or fallback, depending on policy)
+        attribution_counts = defaultdict(int)
+        for metrics in pr_metrics_list:
+            owner, source = self.resolve_pr_owner(metrics)
+            metrics['attributed_owner'] = owner
+            metrics['attribution_source'] = source
+            attribution_counts[source] += 1
+
+        print(
+            f"------>PR attribution mode: {self._attribution_mode} "
+            f"(author={attribution_counts['author']}, "
+            f"review_approver={attribution_counts['review_approver']}, "
+            f"reviewer={attribution_counts['reviewer']}, "
+            f"merged_by={attribution_counts['merged_by']}, "
+            f"unassigned={attribution_counts['unassigned']})"
+        )
         
         # Step 4: Aggregate by team and date (PRs attributed to all teams user belongs to)
         print(f"------>Aggregating metrics by team (across all repos)...")
