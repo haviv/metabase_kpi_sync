@@ -220,8 +220,10 @@ class GitHubPRExtractor:
         self._user_to_teams = {}  # user -> [team1, team2] (can be in multiple teams)
         self._team_sizes = {}  # team -> size (for metrics)
         self._attribution_mode = os.getenv("GITHUB_PR_ATTRIBUTION_MODE", DEFAULT_ATTRIBUTION_MODE).strip().lower()
-        configured_branches = os.getenv("GITHUB_PR_ALLOWED_BASE_BRANCHES", "")
-        if configured_branches.strip():
+        configured_branches = os.getenv("GITHUB_PR_ALLOWED_BASE_BRANCHES", "").strip()
+        if configured_branches == '*':
+            self._allowed_base_branches = None  # None = accept all branches
+        elif configured_branches:
             self._allowed_base_branches = {
                 b.strip().lower() for b in configured_branches.split(',') if b.strip()
             }
@@ -372,7 +374,7 @@ class GitHubPRExtractor:
     def fetch_merged_prs_from_repos(self, since_date, until_date):
         """Fetch all merged PRs from all configured repositories"""
         print(f"------>Fetching merged PRs from {len(self.repositories)} repos ({since_date} to {until_date})...")
-        print(f"------>Allowed base branches: {', '.join(sorted(self._allowed_base_branches))}")
+        print(f"------>Allowed base branches: {'ALL' if self._allowed_base_branches is None else ', '.join(sorted(self._allowed_base_branches))}")
         
         since_dt = datetime.strptime(since_date, '%Y-%m-%d').date()
         until_dt = datetime.strptime(until_date, '%Y-%m-%d').date()
@@ -409,10 +411,11 @@ class GitHubPRExtractor:
                     if not pr.get('merged_at'):
                         continue
 
-                    base_ref = (pr.get('base') or {}).get('ref', '')
-                    if not base_ref or base_ref.lower() not in self._allowed_base_branches:
-                        skipped_by_branch += 1
-                        continue
+                    if self._allowed_base_branches is not None:
+                        base_ref = (pr.get('base') or {}).get('ref', '')
+                        if not base_ref or base_ref.lower() not in self._allowed_base_branches:
+                            skipped_by_branch += 1
+                            continue
                     
                     merged_at = datetime.fromisoformat(pr['merged_at'].replace('Z', '+00:00'))
                     merged_date = merged_at.date()
