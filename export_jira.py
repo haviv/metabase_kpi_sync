@@ -391,6 +391,13 @@ class JIRADatabaseConnection:
                     self._create_index(connection, "idx_work_items_changed_date", "work_items", "changed_date")
                     self._create_index(connection, "idx_work_items_type", "work_items", "work_item_type")
                     self._create_index(connection, "idx_sprints_name", "sprints", "name")
+
+                    # Add indexes for change_history table to optimize report queries (#1)
+                    self._create_index(connection, "idx_change_history_query_opt", "change_history", "table_name, field_changed, new_value, changed_date")
+                    self._create_index(connection, "idx_change_history_changed_date", "change_history", "changed_date")
+                    self._create_index(connection, "idx_change_history_record_id", "change_history", "record_id, table_name")
+                    self._create_index(connection, "idx_change_history_field_changed", "change_history", "field_changed, table_name")
+
                     connection.commit()
                 except SQLAlchemyError as e:
                     print(f"Error creating indexes: {str(e)}")
