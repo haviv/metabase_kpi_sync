@@ -1,19 +1,38 @@
 #!/usr/bin/env python3
 """
-GitHub Copilot Usage Metrics by Team - Comprehensive Analysis
+GitHub Copilot metrics per team (usage reports API)
 ============================================================================
-Fetches Copilot usage statistics for all teams in an organization
-and stores daily metrics in the database.
+Primary path: org user usage reports per day
+  GET /orgs/{org}/copilot/metrics/reports/users-1-day?day=YYYY-MM-DD
+  then GET each `download_links` URL (see GitHub Copilot usage metrics REST docs).
+
+User rows are attributed to teams via org team membership (`login` in team).
+Rows are rolled up into the same legacy day shape `extract_day_metrics` expects,
+so `copilot_metrics_daily` / `metric_name` stay unchanged.
+
+Optional: set GITHUB_COPILOT_USE_TEAM_METRICS_API=1 to try the direct team
+`/team/{slug}/copilot/metrics` endpoint first (when GitHub still serves it).
+
+Docs: https://docs.github.com/en/rest/copilot/copilot-usage-metrics
 
 Can be run standalone or integrated with export_ado.py
 
 Usage (standalone):
-    python export_github_copilot.py --org Pathlock --teams "team1,team2" --team-sizes "7,12"
+    python export_github_copilot.py --org Pathlock --last-days 7
+    python export_github_copilot.py --org Pathlock --since 2026-01-01 --until 2026-01-31 --verbose
+
+Env: GITHUB_COPILOT_VERBOSE=1 mirrors --verbose when not using the CLI.
+
+Scheduled sync (e.g. export_ado.py):
+  GITHUB_COPILOT_DAILY_SYNC_DAYS   — days ending yesterday to re-pull each run (default 3; catches late report fixes)
+  GITHUB_COPILOT_INITIAL_SYNC_DAYS — first-run backfill window (default 30)
 """
 
 import requests
 import os
+import json
 import argparse
+from typing import Optional
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
@@ -24,6 +43,160 @@ from sqlalchemy.exc import SQLAlchemyError
 # Load environment variables
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
+
+# Per GitHub REST docs (Copilot metrics + Copilot usage metrics reports)
+COPILOT_METRICS_API_VERSION = "2026-03-10"
+
+
+def _env_positive_int(var_name: str, default: int, maximum: Optional[int] = None) -> int:
+    raw = os.getenv(var_name, "").strip()
+    if not raw:
+        n = default
+    else:
+        try:
+            n = int(raw)
+        except ValueError:
+            n = default
+    if n < 1:
+        n = default
+    if maximum is not None and n > maximum:
+        n = maximum
+    return n
+
+
+def _parse_copilot_report_body(text: str, context: str, verbose: bool = False):
+    """GitHub may return one JSON value or newline-delimited JSON (NDJSON)."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    rows = []
+    for line_num, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            if verbose:
+                print(f"------>Skipping bad report line {line_num} ({context}): {e}")
+    return rows if rows else None
+
+
+def _flatten_user_report_payload(payload):
+    """Normalize downloaded user usage JSON into a list of per-user row dicts."""
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        users = payload.get("users")
+        if isinstance(users, list):
+            return [x for x in users if isinstance(x, dict)]
+        if "user_login" in payload or "user_id" in payload:
+            return [payload]
+    return []
+
+
+def _user_row_login(user_row):
+    v = user_row.get("user_login") or user_row.get("login") or ""
+    return (v or "").strip().lower()
+
+
+def _aggregate_user_rows_to_legacy_day(date_str, user_rows):
+    """Roll up user-level usage rows into one legacy copilot/metrics day object."""
+    if not user_rows:
+        return None
+    day_key = (date_str or "")[:10]
+    gen = sum(int(u.get("code_generation_activity_count") or 0) for u in user_rows)
+    acc = sum(int(u.get("code_acceptance_activity_count") or 0) for u in user_rows)
+    loc_sug = sum(
+        int(u.get("loc_suggested_to_add_sum") or 0) + int(u.get("loc_suggested_to_delete_sum") or 0)
+        for u in user_rows
+    )
+    loc_acc = sum(int(u.get("loc_added_sum") or 0) for u in user_rows)
+    n = len(user_rows)
+    engaged = sum(1 for u in user_rows if int(u.get("code_acceptance_activity_count") or 0) > 0)
+    cc_engaged = sum(1 for u in user_rows if int(u.get("code_generation_activity_count") or 0) > 0)
+    ide_chats = sum(int(u.get("user_initiated_interaction_count") or 0) for u in user_rows)
+    ide_engaged = sum(1 for u in user_rows if int(u.get("user_initiated_interaction_count") or 0) > 0)
+
+    dotcom_chats = 0
+    dotcom_engaged = 0
+    for u in user_rows:
+        user_dot = False
+        for row in u.get("totals_by_feature") or []:
+            if not isinstance(row, dict):
+                continue
+            feat = (row.get("feature") or "").lower()
+            if "dotcom" in feat or "github.com" in feat:
+                c = int(row.get("code_generation_activity_count") or 0)
+                dotcom_chats += c
+                if c > 0:
+                    user_dot = True
+        if user_dot:
+            dotcom_engaged += 1
+
+    pr_summaries = 0
+    for u in user_rows:
+        pr = u.get("pull_requests")
+        if isinstance(pr, dict):
+            pr_summaries += int(
+                pr.get("total_reviewed_by_copilot")
+                or pr.get("total_copilot_applied_suggestions")
+                or pr.get("total_applied_suggestions")
+                or 0
+            )
+
+    return {
+        "date": day_key,
+        "total_active_users": n,
+        "total_engaged_users": engaged,
+        "copilot_ide_code_completions": {
+            "total_engaged_users": cc_engaged,
+            "editors": [
+                {
+                    "models": [
+                        {
+                            "languages": [
+                                {
+                                    "total_code_suggestions": gen,
+                                    "total_code_acceptances": acc,
+                                    "total_code_lines_suggested": loc_sug,
+                                    "total_code_lines_accepted": loc_acc,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ],
+        },
+        "copilot_ide_chat": {
+            "total_engaged_users": ide_engaged,
+            "editors": [
+                {
+                    "models": [
+                        {
+                            "total_chats": ide_chats,
+                            "total_chat_insertion_events": 0,
+                            "total_chat_copy_events": 0,
+                        }
+                    ]
+                }
+            ],
+        },
+        "copilot_dotcom_chat": {
+            "total_engaged_users": dotcom_engaged,
+            "models": ([{"total_chats": dotcom_chats}] if dotcom_chats else []),
+        },
+        "copilot_dotcom_pull_requests": {
+            "total_engaged_users": 0,
+            "repositories": [{"models": [{"total_pr_summaries_created": pr_summaries}]}],
+        },
+    }
 
 
 class CopilotMetricsDatabase:
@@ -122,11 +295,14 @@ class CopilotMetricsDatabase:
 class GitHubCopilotExtractor:
     """Extract GitHub Copilot metrics from the API"""
     
-    def __init__(self, organization, token=None, teams=None, team_sizes=None, db_engine=None):
+    def __init__(self, organization, token=None, teams=None, team_sizes=None, db_engine=None, verbose=False):
         self.organization = organization
         self.token = token or os.getenv('GITHUB_TOKEN')
+        self.verbose = verbose or os.getenv('GITHUB_COPILOT_VERBOSE', '').strip().lower() in ('1', 'true', 'yes')
         self.teams = teams.split(',') if teams else []
         self.team_sizes = {}
+        # Reset at start of each fetch_all_metrics; used to shorten repeated identical Copilot API errors
+        self._last_copilot_api_error_fingerprint = None
         
         if team_sizes and teams:
             sizes = team_sizes.split(',')
@@ -138,24 +314,75 @@ class GitHubCopilotExtractor:
                         pass
         
         self.base_url = "https://api.github.com"
-        self.api_version = "2022-11-28"
+        self.api_version = COPILOT_METRICS_API_VERSION
         self.headers = {
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {self.token}",
-            "X-GitHub-Api-Version": self.api_version
+            "X-GitHub-Api-Version": self.api_version,
         }
         
         self.db = CopilotMetricsDatabase(engine=db_engine) if db_engine else None
     
-    def _api_request(self, endpoint):
-        """Make a request to the GitHub API"""
+    def _api_request(self, endpoint, context=None):
+        """Make a request to the GitHub API. On failure, prints status, URL, and body (see context label)."""
         url = f"{self.base_url}{endpoint}"
-        response = requests.get(url, headers=self.headers)
-        
-        if response.status_code != 200:
+        label = context or endpoint
+        if self.verbose:
+            print(f"------>GET {url}")
+        try:
+            response = requests.get(url, headers=self.headers, timeout=120)
+        except requests.RequestException as e:
+            print(f"------>GitHub API request failed ({label}): {type(e).__name__}: {e}")
             return None
         
-        return response.json()
+        if response.status_code == 200:
+            try:
+                return response.json()
+            except ValueError as e:
+                print(f"------>GitHub API invalid JSON ({label}): {e}")
+                print(f"         URL: {url}")
+                snippet = (response.text or "")[:800]
+                print(f"         body (first 800 chars): {snippet!r}")
+                return None
+        
+        msg = ""
+        docs = ""
+        try:
+            j = response.json()
+            if isinstance(j, dict):
+                msg = j.get("message") or ""
+                docs = j.get("documentation_url") or ""
+        except ValueError:
+            pass
+        
+        body_snippet = (response.text or "")[:800]
+        rl_rem = response.headers.get("X-RateLimit-Remaining")
+        rl_reset = response.headers.get("X-RateLimit-Reset")
+        is_copilot_metrics = context and "Copilot metrics" in context
+        fingerprint = (response.status_code, msg or body_snippet[:240])
+        if (
+            is_copilot_metrics
+            and not self.verbose
+            and self._last_copilot_api_error_fingerprint == fingerprint
+        ):
+            print(
+                f"------>GitHub API HTTP {response.status_code} ({label}) — "
+                f"same error as previous team (omit body; see first occurrence above)"
+            )
+            return None
+        if is_copilot_metrics:
+            self._last_copilot_api_error_fingerprint = fingerprint
+        
+        print(f"------>GitHub API HTTP {response.status_code} ({label})")
+        print(f"         URL: {url}")
+        if msg:
+            print(f"         message: {msg}")
+        if docs:
+            print(f"         documentation_url: {docs}")
+        if rl_rem is not None:
+            print(f"         X-RateLimit-Remaining: {rl_rem}  X-RateLimit-Reset: {rl_reset}")
+        print(f"         body (first 800 chars): {body_snippet!r}")
+        return None
     
     def _safe_div(self, num, den, default=0):
         """Safe division with default value"""
@@ -168,7 +395,10 @@ class GitHubCopilotExtractor:
         if self.teams:
             return [t.strip() for t in self.teams]
         
-        teams_data = self._api_request(f"/orgs/{self.organization}/teams?per_page=100")
+        teams_data = self._api_request(
+            f"/orgs/{self.organization}/teams?per_page=100",
+            context="List organization teams",
+        )
         if not teams_data or 'message' in teams_data:
             print(f"Error fetching teams: {teams_data.get('message', 'Unknown error') if teams_data else 'No response'}")
             return []
@@ -180,20 +410,160 @@ class GitHubCopilotExtractor:
         if team_slug in self.team_sizes:
             return self.team_sizes[team_slug]
         
-        members = self._api_request(f"/orgs/{self.organization}/teams/{team_slug}/members?per_page=100")
+        members = self._api_request(
+            f"/orgs/{self.organization}/teams/{team_slug}/members?per_page=100",
+            context=f"Team members / {team_slug}",
+        )
         if members and 'message' not in members:
             return len(members)
         
         return 0
     
-    def fetch_team_metrics(self, team_slug, since_date, until_date):
-        """Fetch Copilot metrics for a specific team"""
+    def get_team_member_logins(self, team_slug):
+        """All member logins for a team (lowercased), with pagination."""
+        logins = set()
+        page = 1
+        while True:
+            data = self._api_request(
+                f"/orgs/{self.organization}/teams/{team_slug}/members?per_page=100&page={page}",
+                context=f"Team members page {page} / {team_slug}",
+            )
+            if data is None:
+                break
+            if isinstance(data, dict) and data.get("message"):
+                break
+            if not isinstance(data, list):
+                break
+            for m in data:
+                if isinstance(m, dict) and m.get("login"):
+                    logins.add(m["login"].strip().lower())
+            if len(data) < 100:
+                break
+            page += 1
+        return logins
+    
+    def _get_org_users_one_day_descriptor(self, day: str):
+        """users-1-day report: JSON with download_links, or None if 204/missing."""
+        endpoint = (
+            f"/orgs/{self.organization}/copilot/metrics/reports/users-1-day?day={day}"
+        )
+        url = f"{self.base_url}{endpoint}"
+        label = f"Copilot usage users-1-day / {day}"
+        if self.verbose:
+            print(f"------>GET {url}")
+        try:
+            response = requests.get(url, headers=self.headers, timeout=120)
+        except requests.RequestException as e:
+            print(f"------>GitHub API request failed ({label}): {type(e).__name__}: {e}")
+            return None
+        if response.status_code == 204:
+            if self.verbose:
+                print(f"------>HTTP 204 ({label}) — no report for this day")
+            return None
+        if response.status_code == 200:
+            try:
+                return response.json()
+            except ValueError as e:
+                print(f"------>GitHub API invalid JSON ({label}): {e}")
+                return None
+        msg = ""
+        try:
+            j = response.json()
+            if isinstance(j, dict):
+                msg = j.get("message") or ""
+        except ValueError:
+            pass
+        print(f"------>GitHub API HTTP {response.status_code} ({label})")
+        print(f"         URL: {url}")
+        if msg:
+            print(f"         message: {msg}")
+        print(f"         body (first 800 chars): {(response.text or '')[:800]!r}")
+        return None
+    
+    def _download_signed_report_json(self, link: str, context: str):
+        try:
+            response = requests.get(
+                link,
+                timeout=300,
+                headers={"Accept": "application/json, */*"},
+            )
+        except requests.RequestException as e:
+            print(f"------>Report download failed ({context}): {type(e).__name__}: {e}")
+            return None
+        if response.status_code != 200:
+            print(
+                f"------>Report download HTTP {response.status_code} ({context}) "
+                f"body: {(response.text or '')[:400]!r}"
+            )
+            return None
+        parsed = _parse_copilot_report_body(
+            response.text, context=context, verbose=self.verbose
+        )
+        if parsed is None:
+            print(f"------>Report empty or unparseable ({context})")
+            return None
+        return parsed
+    
+    def fetch_user_rows_for_day(self, day: str):
+        """Download org user usage rows for a single calendar day."""
+        meta = self._get_org_users_one_day_descriptor(day)
+        if not meta or not isinstance(meta, dict):
+            return []
+        links = meta.get("download_links") or []
+        if not links:
+            return []
+        combined = []
+        for i, link in enumerate(links):
+            payload = self._download_signed_report_json(link, context=f"{day} file {i + 1}")
+            combined.extend(_flatten_user_report_payload(payload))
+        out = []
+        for row in combined:
+            if not isinstance(row, dict):
+                continue
+            rd = (row.get("day") or row.get("day_partition") or "")[:10]
+            if rd == day or not rd:
+                out.append(row)
+        return out
+    
+    def fetch_user_rows_by_day_range(self, since_date: str, until_date: str):
+        """Map YYYY-MM-DD -> list of user usage rows for that day."""
+        d0 = datetime.strptime(since_date, "%Y-%m-%d").date()
+        d1 = datetime.strptime(until_date, "%Y-%m-%d").date()
+        if d1 < d0:
+            return {}
+        by_day = {}
+        n = (d1 - d0).days + 1
+        print(f"------>Loading org user usage reports ({n} day(s))…")
+        for i in range(n):
+            day = (d0 + timedelta(days=i)).strftime("%Y-%m-%d")
+            rows = self.fetch_user_rows_for_day(day)
+            by_day[day] = rows
+            if self.verbose or rows:
+                print(f"         {day}: {len(rows)} user row(s)")
+        return by_day
+    
+    def team_raw_data_from_user_reports(self, team_logins, by_day, since_date, until_date):
+        """Build legacy-shaped day list for one team from cached user rows."""
+        d0 = datetime.strptime(since_date, "%Y-%m-%d").date()
+        d1 = datetime.strptime(until_date, "%Y-%m-%d").date()
+        raw = []
+        n = (d1 - d0).days + 1
+        for i in range(n):
+            day = (d0 + timedelta(days=i)).strftime("%Y-%m-%d")
+            rows = by_day.get(day) or []
+            team_rows = [r for r in rows if _user_row_login(r) in team_logins]
+            legacy = _aggregate_user_rows_to_legacy_day(day, team_rows)
+            if legacy:
+                raw.append(legacy)
+        return raw
+    
+    def fetch_team_copilot_metrics(self, team_slug, since_date, until_date):
+        """Fetch Copilot metrics for one team (JSON array of daily objects)."""
         endpoint = (
             f"/orgs/{self.organization}/team/{team_slug}/copilot/metrics"
             f"?since={since_date}T00:00:00Z&until={until_date}T23:59:59Z&per_page=100"
         )
-        
-        return self._api_request(endpoint)
+        return self._api_request(endpoint, context=f"Copilot metrics / {team_slug}")
     
     def extract_day_metrics(self, day_data):
         """Extract all metrics from a single day's API response
@@ -391,6 +761,95 @@ class GitHubCopilotExtractor:
             'total_chats': total_chats,
         }
     
+    def _fetch_all_metrics_team_api(self, since_date, until_date):
+        """Legacy path: GET /orgs/.../team/.../copilot/metrics (when available)."""
+        total_records = 0
+        all_summaries = []
+        teams = self.get_teams()
+        if not teams:
+            print("------>No teams found or configured")
+            return 0
+        print(f"------>Processing {len(teams)} teams (team metrics API)")
+        for team_slug in teams:
+            print(f"------>Analyzing: {team_slug}...")
+            team_size = self.get_team_size(team_slug)
+            print(f"        Team size: {team_size}")
+            raw_data = self.fetch_team_copilot_metrics(team_slug, since_date, until_date)
+            if raw_data is None:
+                print("        Skipped: Copilot metrics request failed (details above)")
+                continue
+            if isinstance(raw_data, dict) and "message" in raw_data:
+                print(f"        Skipped: {raw_data['message']}")
+                continue
+            if not raw_data:
+                print("        No data (empty series or below GitHub threshold)")
+                continue
+            daily_records = self.process_daily_metrics(raw_data, team_slug, team_size)
+            if daily_records and self.db:
+                processed = self.db.upsert_daily_metrics(daily_records)
+                total_records += processed
+                print(f"        ✓ Stored {processed} daily metric records ({len(raw_data)} days)")
+            summary = self.calculate_period_summary(raw_data, team_slug, team_size)
+            if summary:
+                all_summaries.append(summary)
+                print(
+                    f"        Avg Engaged: {summary['avg_engaged_per_day']}/day, "
+                    f"Accept Rate: {summary['acceptance_rate_pct']}%"
+                )
+        self._summaries = all_summaries
+        return total_records
+    
+    def _fetch_all_metrics_user_reports(self, since_date, until_date):
+        """Default: org users-1-day reports + team membership attribution."""
+        teams = self.get_teams()
+        if not teams:
+            print("------>No teams found or configured")
+            return 0
+        
+        by_day = self.fetch_user_rows_by_day_range(since_date, until_date)
+        total_user_rows = sum(len(v) for v in by_day.values())
+        if total_user_rows == 0:
+            print(
+                "------>No user usage rows in range "
+                "(policy, 204, download errors, or empty reports). "
+                "See https://docs.github.com/en/rest/copilot/copilot-usage-metrics"
+            )
+            return 0
+        
+        print(f"------>Attributing {total_user_rows} user-day row(s) across {len(teams)} teams")
+        total_records = 0
+        all_summaries = []
+        
+        for team_slug in teams:
+            print(f"------>Analyzing: {team_slug}…")
+            logins = self.get_team_member_logins(team_slug)
+            team_size = self.team_sizes.get(team_slug, len(logins))
+            print(f"        Team size: {team_size} ({len(logins)} member login(s) from API)")
+            
+            raw_data = self.team_raw_data_from_user_reports(
+                logins, by_day, since_date, until_date
+            )
+            if not raw_data:
+                print("        No data (no org users matched this team for any day)")
+                continue
+            
+            daily_records = self.process_daily_metrics(raw_data, team_slug, team_size)
+            if daily_records and self.db:
+                processed = self.db.upsert_daily_metrics(daily_records)
+                total_records += processed
+                print(f"        ✓ Stored {processed} daily metric records ({len(raw_data)} days)")
+            
+            summary = self.calculate_period_summary(raw_data, team_slug, team_size)
+            if summary:
+                all_summaries.append(summary)
+                print(
+                    f"        Avg Engaged: {summary['avg_engaged_per_day']}/day, "
+                    f"Accept Rate: {summary['acceptance_rate_pct']}%"
+                )
+        
+        self._summaries = all_summaries
+        return total_records
+    
     def fetch_all_metrics(self, since_date=None, until_date=None):
         """Fetch metrics for all configured teams and store in database
         
@@ -401,74 +860,51 @@ class GitHubCopilotExtractor:
         if not until_date:
             until_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
         
+        self._last_copilot_api_error_fingerprint = None
+        use_team_api = os.getenv("GITHUB_COPILOT_USE_TEAM_METRICS_API", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         print(f"------>Fetching GitHub Copilot metrics for org: {self.organization}")
         print(f"------>Date range: {since_date} to {until_date}")
-        
-        teams = self.get_teams()
-        if not teams:
-            print("------>No teams found or configured")
-            return 0
-        
-        print(f"------>Processing {len(teams)} teams")
-        
-        total_records = 0
-        all_summaries = []
-        
-        for team_slug in teams:
-            print(f"------>Analyzing: {team_slug}...")
-            
-            team_size = self.get_team_size(team_slug)
-            print(f"        Team size: {team_size}")
-            
-            raw_data = self.fetch_team_metrics(team_slug, since_date, until_date)
-            
-            if raw_data is None:
-                print(f"        Skipped: API error or no access")
-                continue
-            
-            if isinstance(raw_data, dict) and 'message' in raw_data:
-                print(f"        Skipped: {raw_data['message']}")
-                continue
-            
-            if raw_data == [] or not raw_data:
-                print(f"        No data (< 5 active users required)")
-                continue
-            
-            # Process daily metrics for database storage
-            daily_records = self.process_daily_metrics(raw_data, team_slug, team_size)
-            
-            if daily_records and self.db:
-                processed = self.db.upsert_daily_metrics(daily_records)
-                total_records += processed
-                print(f"        ✓ Stored {processed} daily metric records ({len(raw_data)} days)")
-            
-            # Calculate summary for display
-            summary = self.calculate_period_summary(raw_data, team_slug, team_size)
-            if summary:
-                all_summaries.append(summary)
-                print(f"        Avg Engaged: {summary['avg_engaged_per_day']}/day, Accept Rate: {summary['acceptance_rate_pct']}%")
-        
-        # Store summaries for reporting
-        self._summaries = all_summaries
-        
-        return total_records
+        if use_team_api:
+            print("------>Mode: team metrics API (GITHUB_COPILOT_USE_TEAM_METRICS_API)")
+            return self._fetch_all_metrics_team_api(since_date, until_date)
+        print("------>Mode: org users-1-day usage reports + team membership")
+        return self._fetch_all_metrics_user_reports(since_date, until_date)
     
-    def sync_to_database(self, db_connection=None):
-        """Fetch metrics and store in database"""
+    def sync_to_database(self, db_connection=None, initial_sync=False):
+        """Fetch metrics and store in database.
+
+        Uses a sliding date window ending yesterday so scheduled runs stay fast:
+        - Daily: GITHUB_COPILOT_DAILY_SYNC_DAYS (default 3)
+        - First run: GITHUB_COPILOT_INITIAL_SYNC_DAYS (default 30, max 100)
+        """
         if db_connection:
             self.db = CopilotMetricsDatabase(engine=db_connection.engine)
         elif not self.db:
             self.db = CopilotMetricsDatabase()
         
-        # fetch_all_metrics now handles storage internally and returns record count
-        processed = self.fetch_all_metrics()
+        until_d = datetime.now().date() - timedelta(days=1)
+        if initial_sync:
+            days = _env_positive_int("GITHUB_COPILOT_INITIAL_SYNC_DAYS", 30, maximum=100)
+            print(f"------>Copilot sync: initial backfill, last {days} day(s)")
+        else:
+            days = _env_positive_int("GITHUB_COPILOT_DAILY_SYNC_DAYS", 3, maximum=100)
+            print(f"------>Copilot sync: incremental, last {days} day(s)")
+        
+        since_d = until_d - timedelta(days=days - 1)
+        since = since_d.strftime("%Y-%m-%d")
+        until = until_d.strftime("%Y-%m-%d")
+        
+        processed = self.fetch_all_metrics(since_date=since, until_date=until)
         
         if processed > 0:
             print(f"------>Processed {processed} Copilot daily metrics records")
             return processed
-        else:
-            print("------>No Copilot metrics to process")
-            return 0
+        print("------>No Copilot metrics to process")
+        return 0
     
     def print_report(self, summaries=None):
         """Print a formatted report of the metrics"""
@@ -544,7 +980,19 @@ def main():
     parser.add_argument('--team-sizes', help='Comma-separated list of team sizes (same order as --teams)')
     parser.add_argument('--since', help='Start date (YYYY-MM-DD), default: 30 days ago')
     parser.add_argument('--until', help='End date (YYYY-MM-DD), default: yesterday')
+    parser.add_argument(
+        '--last-days',
+        type=int,
+        metavar='N',
+        help='Last N calendar days ending yesterday (overrides --since and --until)',
+    )
     parser.add_argument('--no-db', action='store_true', help='Skip database storage')
+    parser.add_argument(
+        '--verbose',
+        '-v',
+        action='store_true',
+        help='Log each API URL before the request; show every Copilot error in full (no deduplication)',
+    )
     
     args = parser.parse_args()
     
@@ -566,12 +1014,22 @@ def main():
         token=token,
         teams=args.teams,
         team_sizes=args.team_sizes,
-        db_engine=db_engine
+        db_engine=db_engine,
+        verbose=args.verbose,
     )
     
     # Set dates
-    since = args.since or (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-    until = args.until or (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    if args.last_days is not None:
+        if args.last_days < 1:
+            print('Error: --last-days must be >= 1')
+            return 1
+        until_d = datetime.now().date() - timedelta(days=1)
+        since_d = until_d - timedelta(days=args.last_days - 1)
+        since = since_d.strftime('%Y-%m-%d')
+        until = until_d.strftime('%Y-%m-%d')
+    else:
+        since = args.since or (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+        until = args.until or (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     
     # Fetch metrics (stores to DB internally if db_engine provided)
     processed = extractor.fetch_all_metrics(since_date=since, until_date=until)

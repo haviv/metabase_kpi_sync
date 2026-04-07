@@ -2492,7 +2492,8 @@ def main():
                 processed_capacities = extractor.update_sprint_capacities(current_sprint_only=True)
 
             # Update GitHub Copilot metrics (if configured)
-            # Copilot metrics sync runs DAILY (API provides daily data)
+            # Uses org users-1-day usage reports + team membership (export_github_copilot).
+            # Runs at most once per calendar day; daily window is a few days ending yesterday.
             processed_copilot = 0
             if COPILOT_AVAILABLE:
                 github_org = os.getenv('GITHUB_ORG')
@@ -2500,7 +2501,6 @@ def main():
                 github_team_sizes = os.getenv('GITHUB_TEAM_SIZES')
                 
                 if github_org and os.getenv('GITHUB_TOKEN'):
-                    # Check if Copilot metrics already synced today
                     last_copilot_sync = db.get_last_sync_time('copilot_metrics')
                     today = datetime.now().date()
                     last_sync_date = last_copilot_sync.date() if last_copilot_sync and last_copilot_sync != datetime(2025, 3, 1) else None
@@ -2508,14 +2508,18 @@ def main():
                     if last_sync_date == today:
                         print("------>Skipping Copilot metrics (already synced today)")
                     else:
-                        print("------>Syncing GitHub Copilot metrics (daily sync)")
+                        print("------>Syncing GitHub Copilot metrics")
                         try:
                             copilot_extractor = GitHubCopilotExtractor(
                                 organization=github_org,
                                 teams=github_teams,
                                 team_sizes=github_team_sizes
                             )
-                            processed_copilot = copilot_extractor.sync_to_database(db)
+                            if last_copilot_sync == datetime(2025, 3, 1):
+                                print("------>First Copilot sync — backfill (GITHUB_COPILOT_INITIAL_SYNC_DAYS)")
+                                processed_copilot = copilot_extractor.sync_to_database(db, initial_sync=True)
+                            else:
+                                processed_copilot = copilot_extractor.sync_to_database(db)
                         except Exception as e:
                             print(f"------>Error syncing Copilot metrics: {str(e)}")
                 else:
