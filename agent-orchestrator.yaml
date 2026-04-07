@@ -1,0 +1,34 @@
+dataDir: ~/.agent-orchestrator
+worktreeDir: ~/.worktrees
+port: 3000
+defaults:
+  runtime: tmux
+  agent: claude-code
+  workspace: worktree
+  notifiers:
+    - desktop
+projects:
+  metabase_kpi_sync:
+    name: metabase_kpi_sync
+    sessionPrefix: mks
+    repo: haviv/metabase_kpi_sync
+    path: /Users/havivrosh/work/metabase_kpi_sync
+    defaultBranch: main
+    agentRules: |-
+      Always run tests before pushing.
+      Use conventional commits (feat:, fix:, chore:, docs:, refactor:, test:).
+      Link issue numbers in commit messages.
+      Write clear commit messages that explain WHY, not just WHAT.
+
+      Follow Python best practices:
+
+      - Use type hints for function parameters and return values
+      - Follow PEP 8 style guide
+      - Use f-strings for string formatting
+      - Use context managers (with statements) for resource management
+      - Write docstrings for classes and functions
+      - Prefer composition over inheritance
+
+      Before pushing, run these commands:
+      - black . (format code)
+      - mypy . (type checking)
