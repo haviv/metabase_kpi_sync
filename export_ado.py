@@ -2581,7 +2581,8 @@ def main():
                             print("------>First GitHub tests sync - fetching last 60 days")
                             processed_tests = tests_extractor.sync_test_runs(initial_sync=True)
                         else:
-                            processed_tests = tests_extractor.sync_test_runs(days_back=1)
+                            # Watermark from MAX(run_started_at), not a 1-day window (misses weekly CI)
+                            processed_tests = tests_extractor.sync_test_runs()
                     except Exception as e:
                         print(f"------>Error syncing GitHub tests: {str(e)}")
                 else:

@@ -10,6 +10,11 @@ User rows are attributed to teams via org team membership (`login` in team).
 Rows are rolled up into the same legacy day shape `extract_day_metrics` expects,
 so `copilot_metrics_daily` / `metric_name` stay unchanged.
 
+Team totals from this path are sums of per-user org report rows for members of each
+GitHub team. They can differ from the older `/team/.../copilot/metrics` series
+(attribution, deduplication, and how agent/CLI vs IDE fields are rolled up).
+See https://docs.github.com/en/copilot/reference/copilot-usage-metrics/reconciling-usage-metrics
+
 Optional: set GITHUB_COPILOT_USE_TEAM_METRICS_API=1 to try the direct team
 `/team/{slug}/copilot/metrics` endpoint first (when GitHub still serves it).
 
@@ -102,8 +107,106 @@ def _flatten_user_report_payload(payload):
 
 
 def _user_row_login(user_row):
-    v = user_row.get("user_login") or user_row.get("login") or ""
+    v = (
+        user_row.get("user_login")
+        or user_row.get("login")
+        or user_row.get("username")
+        or user_row.get("github_username")
+        or ""
+    )
+    if not v and isinstance(user_row.get("user"), dict):
+        v = user_row["user"].get("login") or user_row["user"].get("user_login") or ""
     return (v or "").strip().lower()
+
+
+def _row_report_day_key(row: dict, requested_day: str) -> str:
+    """Normalize `day` / `day_partition` from usage reports for comparison with YYYY-MM-DD."""
+    raw = (row.get("day") or row.get("day_partition") or "").strip()
+    if not raw:
+        return requested_day
+    if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+        return raw[:10]
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) >= 8:
+        d = digits[:8]
+        return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+    return raw[:10]
+
+
+def _sum_totals_by_feature_int(user_row: dict, field: str) -> int:
+    n = 0
+    for row in user_row.get("totals_by_feature") or []:
+        if isinstance(row, dict):
+            n += int(row.get(field) or 0)
+    return n
+
+
+def _usage_int(user_row: dict, field: str) -> int:
+    """Prefer top-level counts; if zero, sum the same field across totals_by_feature (agent/chat breakdown)."""
+    top = int(user_row.get(field) or 0)
+    if top > 0:
+        return top
+    return _sum_totals_by_feature_int(user_row, field)
+
+
+_MERGE_SUM_FIELDS = (
+    "code_generation_activity_count",
+    "code_acceptance_activity_count",
+    "loc_suggested_to_add_sum",
+    "loc_suggested_to_delete_sum",
+    "loc_added_sum",
+    "loc_deleted_sum",
+    "user_initiated_interaction_count",
+)
+
+
+def _merge_user_rows_for_same_day(rows: list, verbose: bool = False) -> list:
+    """Combine multiple rows for the same user_login (e.g. report shards) by summing numeric fields."""
+    by_login: dict = {}
+    no_login: list = []
+    dupes = 0
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        lg = _user_row_login(r)
+        if not lg:
+            no_login.append(r)
+            continue
+        if lg not in by_login:
+            by_login[lg] = {k: int(r.get(k) or 0) for k in _MERGE_SUM_FIELDS}
+            by_login[lg]["_totals_by_feature"] = []
+            for row in r.get("totals_by_feature") or []:
+                if isinstance(row, dict):
+                    by_login[lg]["_totals_by_feature"].append(dict(row))
+            pr = r.get("pull_requests")
+            by_login[lg]["_pull_requests"] = dict(pr) if isinstance(pr, dict) else {}
+            continue
+        dupes += 1
+        acc = by_login[lg]
+        for k in _MERGE_SUM_FIELDS:
+            acc[k] += int(r.get(k) or 0)
+        for row in r.get("totals_by_feature") or []:
+            if isinstance(row, dict):
+                acc["_totals_by_feature"].append(dict(row))
+        pr = r.get("pull_requests")
+        if isinstance(pr, dict):
+            target = acc["_pull_requests"]
+            for pk, pv in pr.items():
+                if isinstance(pv, (int, float)) and str(pk).startswith("total_"):
+                    target[pk] = int(target.get(pk) or 0) + int(pv or 0)
+                elif pk not in target:
+                    target[pk] = pv
+    if verbose and dupes:
+        print(f"------>Merged {dupes} duplicate user row(s) (same login, same day)")
+    out = []
+    for lg, acc in by_login.items():
+        merged = {k: acc[k] for k in _MERGE_SUM_FIELDS}
+        merged["user_login"] = lg
+        merged["totals_by_feature"] = acc["_totals_by_feature"]
+        if acc["_pull_requests"]:
+            merged["pull_requests"] = acc["_pull_requests"]
+        out.append(merged)
+    return out + no_login
 
 
 def _aggregate_user_rows_to_legacy_day(date_str, user_rows):
@@ -111,18 +214,18 @@ def _aggregate_user_rows_to_legacy_day(date_str, user_rows):
     if not user_rows:
         return None
     day_key = (date_str or "")[:10]
-    gen = sum(int(u.get("code_generation_activity_count") or 0) for u in user_rows)
-    acc = sum(int(u.get("code_acceptance_activity_count") or 0) for u in user_rows)
+    gen = sum(_usage_int(u, "code_generation_activity_count") for u in user_rows)
+    acc = sum(_usage_int(u, "code_acceptance_activity_count") for u in user_rows)
     loc_sug = sum(
-        int(u.get("loc_suggested_to_add_sum") or 0) + int(u.get("loc_suggested_to_delete_sum") or 0)
+        _usage_int(u, "loc_suggested_to_add_sum") + _usage_int(u, "loc_suggested_to_delete_sum")
         for u in user_rows
     )
-    loc_acc = sum(int(u.get("loc_added_sum") or 0) for u in user_rows)
+    loc_acc = sum(_usage_int(u, "loc_added_sum") for u in user_rows)
     n = len(user_rows)
-    engaged = sum(1 for u in user_rows if int(u.get("code_acceptance_activity_count") or 0) > 0)
-    cc_engaged = sum(1 for u in user_rows if int(u.get("code_generation_activity_count") or 0) > 0)
-    ide_chats = sum(int(u.get("user_initiated_interaction_count") or 0) for u in user_rows)
-    ide_engaged = sum(1 for u in user_rows if int(u.get("user_initiated_interaction_count") or 0) > 0)
+    engaged = sum(1 for u in user_rows if _usage_int(u, "code_acceptance_activity_count") > 0)
+    cc_engaged = sum(1 for u in user_rows if _usage_int(u, "code_generation_activity_count") > 0)
+    ide_chats = sum(_usage_int(u, "user_initiated_interaction_count") for u in user_rows)
+    ide_engaged = sum(1 for u in user_rows if _usage_int(u, "user_initiated_interaction_count") > 0)
 
     dotcom_chats = 0
     dotcom_engaged = 0
@@ -134,9 +237,15 @@ def _aggregate_user_rows_to_legacy_day(date_str, user_rows):
             feat = (row.get("feature") or "").lower()
             if "dotcom" in feat or "github.com" in feat:
                 c = int(row.get("code_generation_activity_count") or 0)
+            elif feat in ("github_com_chat", "github_com", "dotcom_chat"):
+                c = int(row.get("user_initiated_interaction_count") or 0) or int(
+                    row.get("code_generation_activity_count") or 0
+                )
+            else:
+                c = 0
+            if c:
                 dotcom_chats += c
-                if c > 0:
-                    user_dot = True
+                user_dot = True
         if user_dot:
             dotcom_engaged += 1
 
@@ -394,30 +503,37 @@ class GitHubCopilotExtractor:
         """Fetch teams from the organization or use provided list"""
         if self.teams:
             return [t.strip() for t in self.teams]
-        
-        teams_data = self._api_request(
-            f"/orgs/{self.organization}/teams?per_page=100",
-            context="List organization teams",
-        )
-        if not teams_data or 'message' in teams_data:
-            print(f"Error fetching teams: {teams_data.get('message', 'Unknown error') if teams_data else 'No response'}")
-            return []
-        
-        return [team['slug'] for team in teams_data]
+
+        slugs = []
+        page = 1
+        while True:
+            teams_data = self._api_request(
+                f"/orgs/{self.organization}/teams?per_page=100&page={page}",
+                context=f"List organization teams (page {page})",
+            )
+            if not teams_data:
+                if page == 1:
+                    print("Error fetching teams: No response")
+                break
+            if isinstance(teams_data, dict) and teams_data.get("message"):
+                if page == 1:
+                    print(f"Error fetching teams: {teams_data.get('message', 'Unknown error')}")
+                break
+            if not isinstance(teams_data, list):
+                break
+            slugs.extend(
+                t["slug"] for t in teams_data if isinstance(t, dict) and t.get("slug")
+            )
+            if len(teams_data) < 100:
+                break
+            page += 1
+        return slugs
     
     def get_team_size(self, team_slug):
         """Get team size from manual input or API"""
         if team_slug in self.team_sizes:
             return self.team_sizes[team_slug]
-        
-        members = self._api_request(
-            f"/orgs/{self.organization}/teams/{team_slug}/members?per_page=100",
-            context=f"Team members / {team_slug}",
-        )
-        if members and 'message' not in members:
-            return len(members)
-        
-        return 0
+        return len(self.get_team_member_logins(team_slug))
     
     def get_team_member_logins(self, team_slug):
         """All member logins for a team (lowercased), with pagination."""
@@ -425,7 +541,7 @@ class GitHubCopilotExtractor:
         page = 1
         while True:
             data = self._api_request(
-                f"/orgs/{self.organization}/teams/{team_slug}/members?per_page=100&page={page}",
+                f"/orgs/{self.organization}/teams/{team_slug}/members?per_page=100&page={page}&role=all",
                 context=f"Team members page {page} / {team_slug}",
             )
             if data is None:
@@ -520,10 +636,10 @@ class GitHubCopilotExtractor:
         for row in combined:
             if not isinstance(row, dict):
                 continue
-            rd = (row.get("day") or row.get("day_partition") or "")[:10]
-            if rd == day or not rd:
-                out.append(row)
-        return out
+            if _row_report_day_key(row, day) != day:
+                continue
+            out.append(row)
+        return _merge_user_rows_for_same_day(out, verbose=self.verbose)
     
     def fetch_user_rows_by_day_range(self, since_date: str, until_date: str):
         """Map YYYY-MM-DD -> list of user usage rows for that day."""

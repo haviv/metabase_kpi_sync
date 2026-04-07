@@ -13,6 +13,9 @@ Supports multiple repositories and report formats:
 Configuration (via .env):
     GITHUB_TOKEN: GitHub Personal Access Token with 'actions:read' permission
     GITHUB_TEST_CONFIGS: JSON array of repository configurations
+    GITHUB_TEST_INCREMENTAL_FALLBACK_DAYS: when the DB has no rows yet, incremental sync
+        looks back this many days (default 7). Normally sync uses MAX(run_started_at) so
+        weekly/monthly workflows are not missed (unlike a fixed 1-day window).
     
     Each config object:
     {
@@ -916,6 +919,35 @@ class GitHubTestsExtractor:
                 return result is not None
         except SQLAlchemyError:
             return False
+
+    def _incremental_since_date(self) -> datetime:
+        """Start after the latest imported run (minus overlap), so infrequent CI is not skipped.
+
+        A fixed 1-day window misses workflows that run weekly or less often; the table then
+        never advances past the last successful import.
+        """
+        overlap = timedelta(days=1)
+        max_lookback = timedelta(days=60)
+        now = datetime.now()
+        floor = now - max_lookback
+        fallback_days = 7
+        raw_fb = os.getenv("GITHUB_TEST_INCREMENTAL_FALLBACK_DAYS", "").strip()
+        if raw_fb.isdigit():
+            fallback_days = max(1, min(int(raw_fb), 60))
+        try:
+            with self.db.engine.connect() as connection:
+                latest = connection.execute(
+                    text("SELECT MAX(run_started_at) FROM github_test_runs")
+                ).scalar()
+        except SQLAlchemyError:
+            latest = None
+        if latest is not None:
+            base = latest
+            if getattr(base, "tzinfo", None) is not None:
+                base = base.replace(tzinfo=None)
+            since = base - overlap
+            return max(since, floor)
+        return max(now - timedelta(days=fallback_days), floor)
     
     def fetch_workflow_runs(self, config: dict, since_date: datetime = None, limit: int = 100) -> list:
         """
@@ -1241,7 +1273,8 @@ class GitHubTestsExtractor:
         Sync test runs from GitHub Actions for all configured repositories.
         
         Args:
-            days_back: Number of days to look back (default: 1 for daily, 60 for initial)
+            days_back: If not None, fetch runs from the last N days only. If None, use
+                MAX(run_started_at) from github_test_runs (recommended for scheduled sync).
             initial_sync: If True, fetch last 2 months of data
             
         Returns:
@@ -1258,15 +1291,19 @@ class GitHubTestsExtractor:
         if initial_sync:
             since_date = datetime.now() - timedelta(days=60)  # 2 months
             print(f"------>Initial sync: fetching test runs from last 60 days")
-        elif days_back:
+        elif days_back is not None:
             since_date = datetime.now() - timedelta(days=days_back)
             print(f"------>Fetching test runs from last {days_back} day(s)")
         else:
-            # Default: 1 day for daily sync
-            since_date = datetime.now() - timedelta(days=1)
-            print(f"------>Fetching test runs from last 1 day")
+            since_date = self._incremental_since_date()
+            print(
+                f"------>Incremental sync: runs with created_at >= {since_date.strftime('%Y-%m-%d %H:%M')} "
+                f"(from latest row in github_test_runs, or fallback window)"
+            )
         
         total_processed = 0
+        days_span = max((datetime.now() - since_date).days, 0)
+        run_limit = 200 if (initial_sync or days_span > 7) else 50
         
         # Process each repository configuration
         for config in self.configs:
@@ -1281,8 +1318,7 @@ class GitHubTestsExtractor:
             print(f"        Report format: {report_format}")
             
             # Fetch workflow runs for this config
-            runs = self.fetch_workflow_runs(config, since_date=since_date, 
-                                           limit=200 if initial_sync else 50)
+            runs = self.fetch_workflow_runs(config, since_date=since_date, limit=run_limit)
             print(f"        Found {len(runs)} workflow runs to process")
             
             for run in runs:
