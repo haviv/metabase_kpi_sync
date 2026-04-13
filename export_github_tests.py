@@ -321,6 +321,19 @@ class ExtentSummaryParser:
             print(f"Error parsing Extent summary: {e}")
             return None
 
+    @staticmethod
+    def _parse_duration(duration_str: str) -> float:
+        """Parse duration string (HH:MM:SS) to seconds."""
+        try:
+            parts = duration_str.strip().split(':')
+            if len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            elif len(parts) == 2:
+                return int(parts[0]) * 60 + int(parts[1])
+        except (ValueError, IndexError):
+            pass
+        return 0.0
+
 
 class ExtentExcelParser:
     """Parser for Extent Reports Excel files (Phase 1/2 connector tests)."""
@@ -920,11 +933,14 @@ class GitHubTestsExtractor:
         except SQLAlchemyError:
             return False
 
-    def _incremental_since_date(self) -> datetime:
-        """Start after the latest imported run (minus overlap), so infrequent CI is not skipped.
+    def _incremental_since_date(self, repository: str = None, team: str = None,
+                                branch: str = None) -> datetime:
+        """Start after the latest imported run for this config (minus overlap).
 
-        A fixed 1-day window misses workflows that run weekly or less often; the table then
-        never advances past the last successful import.
+        Scoped by (team + branch) when both are provided, so two configs that share the same
+        team but track different branches (e.g. nexus on cloud/dev vs pframe/dev) each maintain
+        an independent cursor. Falls back progressively to team-only, then global MAX, so a new
+        config starts from a reasonable window rather than the dawn of time.
         """
         overlap = timedelta(days=1)
         max_lookback = timedelta(days=60)
@@ -936,9 +952,31 @@ class GitHubTestsExtractor:
             fallback_days = max(1, min(int(raw_fb), 60))
         try:
             with self.db.engine.connect() as connection:
-                latest = connection.execute(
-                    text("SELECT MAX(run_started_at) FROM github_test_runs")
-                ).scalar()
+                latest = None
+                # Most specific: team + branch
+                if team and branch:
+                    latest = connection.execute(
+                        text("SELECT MAX(run_started_at) FROM github_test_runs "
+                             "WHERE team = :team AND branch = :branch"),
+                        {"team": team, "branch": branch}
+                    ).scalar()
+                # Fallback: team only
+                if latest is None and team:
+                    latest = connection.execute(
+                        text("SELECT MAX(run_started_at) FROM github_test_runs WHERE team = :team"),
+                        {"team": team}
+                    ).scalar()
+                # Fallback: repository only
+                if latest is None and repository:
+                    latest = connection.execute(
+                        text("SELECT MAX(run_started_at) FROM github_test_runs WHERE repository = :repo"),
+                        {"repo": repository}
+                    ).scalar()
+                # Last resort: global max (first-ever sync)
+                if latest is None:
+                    latest = connection.execute(
+                        text("SELECT MAX(run_started_at) FROM github_test_runs")
+                    ).scalar()
         except SQLAlchemyError:
             latest = None
         if latest is not None:
@@ -1312,18 +1350,33 @@ class GitHubTestsExtractor:
             team = config.get('team', 'default')
             report_format = config.get('report_format', 'trx')
             workflows = config.get('workflows', [])
-            
-            print(f"\n------>Processing {owner}/{repo} (team: {team})")
+            repository = f"{owner}/{repo}"
+
+            # For incremental sync use per-(team+branch) cursor so configs sharing the same
+            # team but on different branches (e.g. nexus cloud/dev vs pframe/dev) each keep
+            # an independent watermark and don't skip each other's runs.
+            if days_back is None and not initial_sync:
+                config_branch = config.get('branch')
+                config_since_date = self._incremental_since_date(
+                    repository=repository, team=team, branch=config_branch
+                )
+                branch_label = config_branch or 'all branches'
+                print(f"\n------>Processing {owner}/{repo} (team: {team}, branch: {branch_label})")
+                print(f"        Per-config incremental since: {config_since_date.strftime('%Y-%m-%d %H:%M')}")
+            else:
+                config_since_date = since_date
+                branch_label = config.get('branch') or 'all branches'
+                print(f"\n------>Processing {owner}/{repo} (team: {team}, branch: {branch_label})")
+
             print(f"        Workflows: {', '.join(workflows)}")
             print(f"        Report format: {report_format}")
             
             # Fetch workflow runs for this config
-            runs = self.fetch_workflow_runs(config, since_date=since_date, limit=run_limit)
+            runs = self.fetch_workflow_runs(config, since_date=config_since_date, limit=run_limit)
             print(f"        Found {len(runs)} workflow runs to process")
             
             for run in runs:
                 run_id = run['id']
-                repository = f"{owner}/{repo}"
                 
                 # Skip if already synced
                 if self.is_run_synced(run_id, repository):
