@@ -502,6 +502,100 @@ class ExtentExcelParser:
         return 0
 
 
+class NexusTestExcelParser:
+    """Parser for Nexus Connectors test Excel reports from thanos-plc-automation.
+
+    Column layout (no duration column):
+        Test Case Description | Owner | Tags | Test Class Name | Test Method Name | Execution Status | Failed Reason
+    """
+
+    @staticmethod
+    def parse(excel_content: bytes) -> dict:
+        try:
+            from openpyxl import load_workbook
+
+            result = {
+                'run_info': {
+                    'id': '',
+                    'name': 'Nexus Connectors Test Report',
+                    'total_duration_seconds': 0,
+                },
+                'summary': {
+                    'total': 0,
+                    'passed': 0,
+                    'failed': 0,
+                    'not_executed': 0,
+                },
+                'tests': []
+            }
+
+            wb = load_workbook(filename=io.BytesIO(excel_content), read_only=True)
+            ws = wb.active
+
+            headers = [str(cell.value or '').lower().strip()
+                       for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+
+            col_map = {}
+            for i, h in enumerate(headers):
+                if 'test case description' in h or h == 'test case':
+                    col_map['description'] = i
+                elif 'test class name' in h:
+                    col_map['test_class'] = i
+                elif 'test method name' in h:
+                    col_map['method'] = i
+                elif 'execution status' in h or h == 'status':
+                    col_map['status'] = i
+                elif 'failed reason' in h or 'failure' in h:
+                    col_map['error'] = i
+                elif 'tags' in h:
+                    col_map['tags'] = i
+
+            for row in ws.iter_rows(min_row=2):
+                row_values = [cell.value for cell in row]
+                if not any(row_values):
+                    continue
+
+                description = str(row_values[col_map.get('description', 0)] or '')
+                test_class = str(row_values[col_map.get('test_class', 3)] or '') if col_map.get('test_class') is not None else ''
+                method = str(row_values[col_map.get('method', 4)] or '') if col_map.get('method') is not None else ''
+                status = str(row_values[col_map.get('status', 5)] or '').strip().upper() if col_map.get('status') is not None else ''
+                error = row_values[col_map.get('error', 6)] if col_map.get('error') is not None else None
+
+                outcome = 'Passed' if status == 'PASSED' else 'Failed'
+
+                test_data = {
+                    'test_id': method[:100] if method else '',
+                    'execution_id': '',
+                    'test_name': description[:1000] if description else method[:1000],
+                    'test_class': test_class[:1000] if test_class else None,
+                    'computer_name': None,
+                    'outcome': outcome,
+                    'duration_ms': 0,
+                    'start_time': None,
+                    'end_time': None,
+                    'error_message': str(error)[:2000] if error else None,
+                    'stack_trace': None,
+                    'stdout': None,
+                }
+
+                result['tests'].append(test_data)
+                result['summary']['total'] += 1
+                if outcome == 'Passed':
+                    result['summary']['passed'] += 1
+                else:
+                    result['summary']['failed'] += 1
+
+            wb.close()
+            return result
+
+        except ImportError:
+            print("Error: openpyxl not installed. Run: pip install openpyxl")
+            return None
+        except Exception as e:
+            print(f"Error parsing Nexus test Excel: {e}")
+            return None
+
+
 class JUnitXMLParser:
     """Parser for JUnit XML test reports (Vitest, Jest, pytest, etc.)."""
     
@@ -764,6 +858,7 @@ class GitHubTestsExtractor:
             'trx': self._parse_trx_artifact,
             'extent_summary': self._parse_extent_artifact,
             'postman_html': self._parse_postman_artifact,
+            'nexus_excel': self._parse_nexus_artifact,
         }
     
     def _load_configs_from_env(self) -> list:
@@ -1236,6 +1331,21 @@ class GitHubTestsExtractor:
             print(f"Error extracting Postman ZIP: {e}")
         return None
     
+    def _parse_nexus_artifact(self, zip_content: bytes) -> dict:
+        """Extract and parse Nexus Connectors Excel report from a ZIP archive."""
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_content), 'r') as zf:
+                for filename in zf.namelist():
+                    if filename.endswith('.xlsx'):
+                        content = zf.read(filename)
+                        result = NexusTestExcelParser.parse(content)
+                        if result:
+                            result['_source_file'] = filename
+                            return result
+        except zipfile.BadZipFile as e:
+            print(f"Error extracting Nexus ZIP: {e}")
+        return None
+
     def store_test_run(self, run_data: dict, parsed_result: dict, artifact_name: str, 
                       config: dict) -> bool:
         """Store a test run and its results in the database."""
