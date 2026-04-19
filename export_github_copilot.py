@@ -209,6 +209,32 @@ def _merge_user_rows_for_same_day(rows: list, verbose: bool = False) -> list:
     return out + no_login
 
 
+_PR_ENGAGEMENT_FIELDS = (
+    "total_reviewed_by_copilot",
+    "total_copilot_applied_suggestions",
+    "total_applied_suggestions",
+)
+
+
+def _user_has_any_engagement(u: dict, dotcom_user: bool) -> bool:
+    """Matches GitHub's team-metrics `total_engaged_users` semantics:
+    any non-zero Copilot activity in any feature (completions, chat, dotcom, PR)."""
+    if _usage_int(u, "code_generation_activity_count") > 0:
+        return True
+    if _usage_int(u, "code_acceptance_activity_count") > 0:
+        return True
+    if _usage_int(u, "user_initiated_interaction_count") > 0:
+        return True
+    if dotcom_user:
+        return True
+    pr = u.get("pull_requests")
+    if isinstance(pr, dict):
+        for k in _PR_ENGAGEMENT_FIELDS:
+            if int(pr.get(k) or 0) > 0:
+                return True
+    return False
+
+
 def _aggregate_user_rows_to_legacy_day(date_str, user_rows):
     """Roll up user-level usage rows into one legacy copilot/metrics day object."""
     if not user_rows:
@@ -222,13 +248,13 @@ def _aggregate_user_rows_to_legacy_day(date_str, user_rows):
     )
     loc_acc = sum(_usage_int(u, "loc_added_sum") for u in user_rows)
     n = len(user_rows)
-    engaged = sum(1 for u in user_rows if _usage_int(u, "code_acceptance_activity_count") > 0)
     cc_engaged = sum(1 for u in user_rows if _usage_int(u, "code_generation_activity_count") > 0)
     ide_chats = sum(_usage_int(u, "user_initiated_interaction_count") for u in user_rows)
     ide_engaged = sum(1 for u in user_rows if _usage_int(u, "user_initiated_interaction_count") > 0)
 
     dotcom_chats = 0
     dotcom_engaged = 0
+    dotcom_user_flags = []
     for u in user_rows:
         user_dot = False
         for row in u.get("totals_by_feature") or []:
@@ -246,8 +272,18 @@ def _aggregate_user_rows_to_legacy_day(date_str, user_rows):
             if c:
                 dotcom_chats += c
                 user_dot = True
+        dotcom_user_flags.append(user_dot)
         if user_dot:
             dotcom_engaged += 1
+
+    # Engaged = any Copilot feature activity that day (matches GitHub's team-metrics
+    # definition). Previously this only counted acceptances, which under-reported
+    # engagement and made sub-feature engaged counts exceed the overall total.
+    engaged = sum(
+        1
+        for u, dot in zip(user_rows, dotcom_user_flags)
+        if _user_has_any_engagement(u, dot)
+    )
 
     pr_summaries = 0
     for u in user_rows:
