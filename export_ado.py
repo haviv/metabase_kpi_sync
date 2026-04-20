@@ -389,7 +389,14 @@ class DatabaseConnection:
                     self._drop_index(connection, "idx_sprint_capacity_sprint_id", "sprint_capacity")
                     self._drop_index(connection, "idx_sprint_capacity_team_member", "sprint_capacity")
                     self._drop_index(connection, "idx_sprint_capacity_composite", "sprint_capacity")
-                
+
+                # Drop existing change_history indexes if table exists (will be recreated below)
+                if 'change_history' in existing_tables:
+                    self._drop_index(connection, "idx_change_history_query_opt", "change_history")
+                    self._drop_index(connection, "idx_change_history_changed_date", "change_history")
+                    self._drop_index(connection, "idx_change_history_record_id", "change_history")
+                    self._drop_index(connection, "idx_change_history_field_changed", "change_history")
+
                 # Alter history_snapshots.number column to FLOAT if the table exists
                 if 'history_snapshots' in existing_tables:
                     connection.execute(text("""
@@ -433,7 +440,13 @@ class DatabaseConnection:
                     self._create_index(connection, "idx_sprint_capacity_sprint_id", "sprint_capacity", "sprint_id")
                     self._create_index(connection, "idx_sprint_capacity_team_member", "sprint_capacity", "team_member_id")
                     self._create_index(connection, "idx_sprint_capacity_composite", "sprint_capacity", "sprint_id, team_member_id, activity")
-                    
+
+                    # Add indexes for change_history table to optimize Metabase report queries (#1)
+                    self._create_index(connection, "idx_change_history_query_opt", "change_history", "table_name, field_changed, new_value, changed_date")
+                    self._create_index(connection, "idx_change_history_changed_date", "change_history", "changed_date")
+                    self._create_index(connection, "idx_change_history_record_id", "change_history", "record_id, table_name")
+                    self._create_index(connection, "idx_change_history_field_changed", "change_history", "field_changed, table_name")
+
                     connection.commit()
                 except SQLAlchemyError as e:
                     print(f"Error creating indexes: {str(e)}")
