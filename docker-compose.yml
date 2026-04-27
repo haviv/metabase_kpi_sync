@@ -40,6 +40,40 @@ services:
       timeout: 10s
       retries: 3
 
+  chatbot:
+    build: .
+    command: ["uvicorn", "chatbot_app:app", "--host", "0.0.0.0", "--port", "8787"]
+    env_file:
+      - .env
+    environment:
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_DATABASE=${PG_DATABASE}
+      - PG_USERNAME=${PG_USERNAME}
+      - PG_PASSWORD=${PG_PASSWORD}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-5.4-2026-03-05}
+      - CHATBOT_PORT=8787
+      - CHATBOT_BASE_PATH=/chatbot
+      - CHATBOT_REQUIRE_METABASE_AUTH=true
+      - METABASE_INTERNAL_URL=http://metabase:3000
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./.env:/app/.env
+      - ./reports:/app/reports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      metabase:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8787/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
   ado-exporter:
     build: .
     environment:

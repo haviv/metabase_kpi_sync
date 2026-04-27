@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RC1 Bug Metrics Report</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#0f1115; --panel:#161a22; --ink:#e7ecf3; --muted:#9aa5b5;
+    --accent:#6aa9ff; --bad:#ff6b6b; --ok:#53c18d; --warn:#f0b429;
+    --border:#232a36; }
+  html,body { background:var(--bg); color:var(--ink); margin:0;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  .wrap { max-width:1200px; margin:0 auto; padding:24px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  h2 { font-size:15px; margin:28px 0 10px; color:var(--muted);
+    text-transform:uppercase; letter-spacing:.06em; font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:18px; }
+  .grid { display:grid; gap:16px; }
+  .k4 { grid-template-columns:repeat(4,1fr); }
+  .card { background:var(--panel); border:1px solid var(--border);
+    border-radius:10px; padding:18px 20px; }
+  .metric { font-size:34px; font-weight:700; line-height:1.1; }
+  .metric small { display:block; color:var(--muted); font-weight:400;
+    font-size:12px; margin-top:6px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 10px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-size:11px; text-transform:uppercase;
+    letter-spacing:.06em; font-weight:600; }
+  td.n,th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  tr:hover td { background:#1c2230; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px;
+    background:#1c2230; padding:1px 6px; border-radius:4px; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  p { line-height:1.5; }
+</style>
+</head>
+<body><div class="wrap">
+<h1>RC1 Bug Metrics Report</h1>
+<div class="sub"><p>Bugs created in the last 30 days whose title contains 'RC1' (current status as of 2026-04-22).</p></div>
+<div class='card'><ul>
+<li><b>187 RC1 bugs</b> were opened in the last 30 days; <b>97 are still open</b> and <b>90 are currently in a terminal state</b>, for a <b>48.1% closure rate</b> in-window.</li>
+<li>Volume is highly concentrated in <b>PathlockGRC\\Application Access Governance\\Connector Framework</b>: <b>88 bugs (47.1%)</b>, with <b>54 still open</b>. That single area has more open RC1 bugs than all other area paths individually.</li>
+<li>Among larger queues, <b>Access Risk Analysis</b> is the healthiest: <b>23 of 24</b> RC1 bugs are closed, versus Connector Framework's <b>34 of 88</b>.</li>
+<li>For RC1 bugs that are currently in a terminal state, the <b>median time to close is 163.4 hours</b> (~6.8 days). Connector Framework closes materially slower than the overall mix at <b>232.5 hours average</b>.</li>
+<li>RC1 inflow spiked on <b>2026-04-21 with 21 bugs</b>, the highest single day in the 30-day window.</li>
+<li>Of the <b>90 closed RC1 bugs</b>, <b>70 (77.8%)</b> landed in <b>QA Completed</b>; only <b>7</b> are currently <b>Done</b>. This suggests the RC1 flow is heavily concentrated around QA handoff/completion rather than final done-state resolution.</li>
+</ul>
+
+<p>_Time-to-close is measured as the time from bug creation to the first transition into a terminal state (<code>Removed</code>, <code>Not reproduced</code>, <code>QA Completed</code>, <code>Done</code>) for bugs that are currently in a terminal state._</p></div>
+<div class='card'><div class='metric'>Total RC1 bugs<small></small></div></div>
+<div class='card'><div class='metric'>Closure rate %<small></small></div></div>
+<div class='card'><div class='metric'>Median hours to close<small></small></div></div>
+<h2>Open vs closed RC1 bugs</h2>
+<div class='card'><canvas id='chart_1' height='220'></canvas></div>
+<h2>Daily RC1 bug inflow</h2>
+<div class='card'><canvas id='chart_2' height='220'></canvas></div>
+<h2>Top area paths by RC1 bug volume</h2>
+<div class='card'><canvas id='chart_3' height='220'></canvas></div>
+<h2>Area-path breakdown</h2>
+<div class='card'><table><thead><tr><th>area_path</th><th>total_bugs</th><th>closed_bugs</th><th>open_bugs</th><th>pct_of_total</th><th>avg_hours_to_close_closed</th></tr></thead><tbody><tr><td>PathlockGRC\Application Access Governance\Connector Framework</td><td>88</td><td>34</td><td>54</td><td>47.1</td><td>232.5</td></tr><tr><td>PathlockGRC\Application Access Governance\Access Risk Analysis</td><td>24</td><td>23</td><td>1</td><td>12.8</td><td>138.0</td></tr><tr><td>PathlockGRC\Application Access Governance\Compliant Provisioning</td><td>16</td><td>6</td><td>10</td><td>8.6</td><td>173.0</td></tr><tr><td>PathlockGRC\Continuous Controls Monitoring</td><td>15</td><td>7</td><td>8</td><td>8.0</td><td>135.3</td></tr><tr><td>PathlockGRC\Platform\Nexus</td><td>10</td><td>9</td><td>1</td><td>5.3</td><td>119.8</td></tr><tr><td>PathlockGRC\Application Access Governance\Certifications</td><td>8</td><td>4</td><td>4</td><td>4.3</td><td>127.5</td></tr><tr><td>Flex Connectors\Connectors CSharp</td><td>6</td><td>1</td><td>5</td><td>3.2</td><td>77.1</td></tr><tr><td>PathlockGRC\Application Access Governance\Access Risk Analysis\General code - not ARA related</td><td>6</td><td>2</td><td>4</td><td>3.2</td><td>201.8</td></tr><tr><td>Flex Connectors\Connectors Fusion</td><td>3</td><td>0</td><td>3</td><td>1.6</td><td></td></tr><tr><td>Flex Connectors\Integrations</td><td>3</td><td>3</td><td>0</td><td>1.6</td><td>128.5</td></tr><tr><td>Flex Connectors\Connector Database</td><td>2</td><td>0</td><td>2</td><td>1.1</td><td></td></tr><tr><td>PathlockGRC\Application Access Governance\Elevated Access Management</td><td>2</td><td>1</td><td>1</td><td>1.1</td><td>25.9</td></tr></tbody></table></div>
+</div>
+<script>
+Chart.defaults.color = "#9aa5b5"; Chart.defaults.borderColor = "#232a36";
+new Chart(document.getElementById('chart_1'), {type:'doughnut', data:{labels:["Open", "Closed"],datasets:[{data:[97, 90],backgroundColor:['#6aa9ff','#ff6b6b','#f0b429','#53c18d','#b28dff','#72c0ff','#ffb4a2']}]},options:{plugins:{legend:{position:'bottom'}}}});
+new Chart(document.getElementById('chart_2'), {type:'line', data:{labels:["2026-03-25", "2026-03-26", "2026-03-27", "2026-03-30", "2026-04-01", "2026-04-02", "2026-04-03", "2026-04-05", "2026-04-06", "2026-04-07", "2026-04-08", "2026-04-09", "2026-04-10", "2026-04-11", "2026-04-12", "2026-04-13", "2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17", "2026-04-18", "2026-04-19", "2026-04-20", "2026-04-21", "2026-04-22"],datasets:[{label:"y",data:[1, 2, 2, 6, 1, 9, 4, 1, 9, 13, 16, 17, 15, 14, 1, 7, 5, 6, 9, 14, 1, 2, 9, 21, 2], backgroundColor:'#6aa9ff',borderColor:'#6aa9ff', tension:.25}]},options:{scales:{x:{stacked:false},y:{stacked:false}}}});
+new Chart(document.getElementById('chart_3'), {type:'bar', data:{labels:["PathlockGRC\\Application Access Governance\\Connector Framework", "PathlockGRC\\Application Access Governance\\Access Risk Analysis", "PathlockGRC\\Application Access Governance\\Compliant Provisioning", "PathlockGRC\\Continuous Controls Monitoring", "PathlockGRC\\Platform\\Nexus", "PathlockGRC\\Application Access Governance\\Certifications", "Flex Connectors\\Connectors CSharp", "PathlockGRC\\Application Access Governance\\Access Risk Analysis\\General code - not ARA related", "Flex Connectors\\Connectors Fusion", "Flex Connectors\\Integrations"],datasets:[{label:"y",data:[88, 24, 16, 15, 10, 8, 6, 6, 3, 3], backgroundColor:'#6aa9ff',borderColor:'#6aa9ff', tension:.25}]},options:{scales:{x:{stacked:false},y:{stacked:false}}}});
+</script>
+</body></html>

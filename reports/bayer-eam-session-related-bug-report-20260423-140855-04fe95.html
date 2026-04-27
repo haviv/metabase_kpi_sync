@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bayer EAM Session-Related Bug Report</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#0f1115; --panel:#161a22; --ink:#e7ecf3; --muted:#9aa5b5;
+    --accent:#6aa9ff; --bad:#ff6b6b; --ok:#53c18d; --warn:#f0b429;
+    --border:#232a36; }
+  html,body { background:var(--bg); color:var(--ink); margin:0;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  .wrap { max-width:1200px; margin:0 auto; padding:24px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  h2 { font-size:15px; margin:28px 0 10px; color:var(--muted);
+    text-transform:uppercase; letter-spacing:.06em; font-weight:600; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:18px; }
+  .grid { display:grid; gap:16px; }
+  .k4 { grid-template-columns:repeat(4,1fr); }
+  .card { background:var(--panel); border:1px solid var(--border);
+    border-radius:10px; padding:18px 20px; }
+  .metric { font-size:34px; font-weight:700; line-height:1.1; }
+  .metric small { display:block; color:var(--muted); font-weight:400;
+    font-size:12px; margin-top:6px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:6px 10px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-size:11px; text-transform:uppercase;
+    letter-spacing:.06em; font-weight:600; }
+  td.n,th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  tr:hover td { background:#1c2230; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px;
+    background:#1c2230; padding:1px 6px; border-radius:4px; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  p { line-height:1.5; }
+</style>
+</head>
+<body><div class="wrap">
+<h1>Bayer EAM Session-Related Bug Report</h1>
+<div class="sub"><p>Generated 2026-04-23. Scope: Bayer customer bugs where title/description mentions session and title/description/area points to EAM. Includes all-time view plus last-30-day context.</p></div>
+<div class='grid' style='grid-template-columns:repeat(1,1fr)'></div>
+<div class='card'></div>
+<h2>Volume over time</h2>
+<div class='card'><canvas id='chart_1' height='220'></canvas></div>
+<h2>Which areas own these bugs?</h2>
+<div class='card'><canvas id='chart_2' height='220'></canvas></div>
+<h2>Current state mix</h2>
+<div class='card'><canvas id='chart_3' height='220'></canvas></div>
+<h2>Common themes</h2>
+<div class='card'><table><thead><tr><th>theme</th><th>bug_count</th><th>open_count</th><th>first_seen</th><th>latest_seen</th></tr></thead><tbody><tr><td>Session change capture / logs</td><td>5</td><td>1</td><td>2025-03-04</td><td>2026-03-30</td></tr><tr><td>Deprovision session access stuck</td><td>3</td><td>0</td><td>2026-03-30</td><td>2026-04-06</td></tr><tr><td>Session termination / timing</td><td>3</td><td>0</td><td>2025-06-01</td><td>2026-02-24</td></tr><tr><td>E-signature session conflicts</td><td>2</td><td>0</td><td>2026-02-10</td><td>2026-02-24</td></tr><tr><td>Monitoring / log generation</td><td>2</td><td>1</td><td>2025-08-19</td><td>2025-08-26</td></tr><tr><td>Other EAM session issues</td><td>2</td><td>0</td><td>2025-02-26</td><td>2025-06-19</td></tr><tr><td>Session review UI</td><td>1</td><td>0</td><td>2026-01-27</td><td>2026-01-27</td></tr></tbody></table></div>
+<h2>Repeated title families</h2>
+<div class='card'><table><thead><tr><th>normalized_title</th><th>bug_count</th><th>bug_ids</th><th>first_seen</th><th>latest_seen</th></tr></thead><tbody><tr><td>Workflow Stuck at “Deprovision PAM Session Access”</td><td>3</td><td>61196, 61195, 60555</td><td>2026-03-30</td><td>2026-04-06</td></tr><tr><td>EAM request executes actions on multiple systems and mainly fails to process session change logs</td><td>2</td><td>60500, 59219</td><td>2026-03-17</td><td>2026-03-30</td></tr><tr><td>Electronic Signature Approval Fails for Consecutive Requests When an Approver Opens Another Request Before the Previous E-Signature Session Completes</td><td>2</td><td>57442, 55969</td><td>2026-02-10</td><td>2026-02-24</td></tr></tbody></table></div>
+<h2>Open bugs right now</h2>
+<div class='card'><table><thead><tr><th>id</th><th>title</th><th>state</th><th>severity</th><th>area_path</th><th>created_date</th></tr></thead><tbody><tr><td>60500</td><td>[HF 2025.4.0] EAM request executes actions on multiple systems and mainly fails to process session change logs</td><td>Ready for QA</td><td>1</td><td>PathlockGRC\Application Access Governance\Elevated Access Management</td><td>2026-03-30</td></tr><tr><td>41631</td><td>[CON] SAP ERP - Bayer - EAM Logs Not Generated for Password Reset and Profile Deletion/Addition</td><td>New</td><td>1</td><td>Flex Connectors\Connectors Fusion</td><td>2025-08-19</td></tr></tbody></table></div>
+</div>
+<script>
+Chart.defaults.color = "#9aa5b5"; Chart.defaults.borderColor = "#232a36";
+new Chart(document.getElementById('chart_1'), {type:'line', data:{labels:["2025-02-01", "2025-03-01", "2025-06-01", "2025-08-01", "2025-12-01", "2026-01-01", "2026-02-01", "2026-03-01", "2026-04-01"],datasets:[{label:"bug_count",data:[1, 1, 2, 2, 1, 1, 5, 3, 2], backgroundColor:'#6aa9ff',borderColor:'#6aa9ff', tension:.25}]},options:{scales:{x:{stacked:false},y:{stacked:false}}}});
+new Chart(document.getElementById('chart_2'), {type:'bar', data:{labels:["PathlockGRC\\Application Access Governance\\Elevated Access Management", "Flex Connectors\\Connectors CSharp", "Flex Connectors\\Connectors Fusion", "PathlockGRC\\Application Access Governance\\Connector Framework"],datasets:[{label:"bug_count",data:[14, 2, 1, 1], backgroundColor:'#6aa9ff',borderColor:'#6aa9ff', tension:.25}]},options:{scales:{x:{stacked:false},y:{stacked:false}}}});
+new Chart(document.getElementById('chart_3'), {type:'doughnut', data:{labels:["QA Completed", "Removed", "Done", "New", "Ready for QA"],datasets:[{data:[11, 3, 2, 1, 1],backgroundColor:['#6aa9ff','#ff6b6b','#f0b429','#53c18d','#b28dff','#72c0ff','#ffb4a2']}]},options:{plugins:{legend:{position:'bottom'}}}});
+</script>
+</body></html>
