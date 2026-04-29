@@ -1125,54 +1125,100 @@ class GitHubTestsExtractor:
             missing = [w for w in workflows if w not in workflow_map]
             print(f"        Warning: Could not find workflows: {', '.join(missing)}")
 
-        # Fetch runs for each workflow separately
+        # Fetch runs for each workflow separately.
+        #
+        # GitHub's Actions API caps results at ~1000 per workflow query regardless
+        # of pagination, so a single open-ended fetch silently truncates for any
+        # high-volume workflow (e.g. Backend Tests at ~100 runs/day = ~10 days
+        # before truncation). To get full coverage we iterate the requested window
+        # in week-sized date chunks via ?created=YYYY-MM-DD..YYYY-MM-DD; each
+        # chunk has well under 1000 runs so pagination is honest.
+        chunk_size_days = 7
+        end_dt = datetime.now()
+        start_dt = since_date if since_date else (end_dt - timedelta(days=90))
+        
         for workflow_name, workflow_id in workflow_map.items():
             workflow_runs = []
-            page = 1
+            # Two-level dedup, both relying on GitHub returning runs newest-first:
+            #   * seen_shas: skip reruns of the same commit (different attempts of
+            #     the same code state should count once).
+            #   * seen_dates: skip subsequent runs on a day we already have a row
+            #     for. We keep one representative run per (workflow, day) — the
+            #     latest one of that day — which is what the dashboard wants:
+            #     "size of the test suite as exercised on cloud/dev that day",
+            #     not "number of times the suite executed".
+            seen_shas = set()
+            seen_dates = set()
+            cur_end = end_dt
+            stopped = False
             
-            while len(workflow_runs) < limit:
-                params = {
-                    'status': 'completed',
-                    'per_page': min(limit - len(workflow_runs), 100),
-                    'page': page
-                }
+            while cur_end > start_dt and len(workflow_runs) < limit and not stopped:
+                cur_start = max(cur_end - timedelta(days=chunk_size_days), start_dt)
+                created_param = f"{cur_start.date().isoformat()}..{cur_end.date().isoformat()}"
+                page = 1
                 
-                # Only filter by branch if specified
-                if branch:
-                    params['branch'] = branch
-                
-                url = f'{self.base_url}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs'
-                response = requests.get(url, headers=self.headers, params=params)
-                
-                if response.status_code != 200:
-                    print(f"Error fetching runs for {workflow_name}: {response.status_code}")
-                    break
-                
-                runs = response.json().get('workflow_runs', [])
-                if not runs:
-                    break  # No more runs
-                
-                for run in runs:
-                    # Filter by date if specified
-                    if since_date:
-                        run_date = datetime.fromisoformat(run['created_at'].replace('Z', '+00:00'))
-                        if run_date.replace(tzinfo=None) < since_date:
-                            # Runs are returned in reverse chronological order
-                            # If we hit a run before since_date, stop pagination
-                            break
+                while len(workflow_runs) < limit:
+                    params = {
+                        'status': 'completed',
+                        'per_page': min(limit - len(workflow_runs), 100),
+                        'page': page,
+                        'created': created_param,
+                    }
+                    if branch:
+                        params['branch'] = branch
                     
-                    # Add config reference to run for later use
-                    run['_config'] = config
-                    workflow_runs.append(run)
+                    url = f'{self.base_url}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs'
+                    response = requests.get(url, headers=self.headers, params=params)
                     
-                    if len(workflow_runs) >= limit:
+                    if response.status_code != 200:
+                        print(f"Error fetching runs for {workflow_name} "
+                              f"(chunk {created_param}, page {page}): {response.status_code}")
+                        stopped = True
                         break
-                else:
-                    # Continue pagination if we didn't break
-                    page += 1
-                    continue
-                break  # Break outer loop if inner loop broke
+                    
+                    runs = response.json().get('workflow_runs', [])
+                    if not runs:
+                        break  # End of this chunk
+                    
+                    for run in runs:
+                        # Safety net: still respect since_date even with chunk filter.
+                        if since_date:
+                            run_date = datetime.fromisoformat(run['created_at'].replace('Z', '+00:00'))
+                            if run_date.replace(tzinfo=None) < since_date:
+                                stopped = True
+                                break
+                        
+                        sha = (run.get('head_sha') or '')[:40]
+                        if sha and sha in seen_shas:
+                            continue
+                        
+                        run_day = (run.get('run_started_at') or run.get('created_at') or '')[:10]
+                        if run_day and run_day in seen_dates:
+                            continue
+                        
+                        if sha:
+                            seen_shas.add(sha)
+                        if run_day:
+                            seen_dates.add(run_day)
+                        
+                        run['_config'] = config
+                        workflow_runs.append(run)
+                        
+                        if len(workflow_runs) >= limit:
+                            stopped = True
+                            break
+                    else:
+                        page += 1
+                        continue
+                    break  # Inner for broke; stop paginating this chunk
+                
+                # Move to the previous chunk (older). Subtract one second so we
+                # don't double-fetch the boundary date in both chunks.
+                cur_end = cur_start - timedelta(seconds=1)
             
+            if seen_dates:
+                print(f"        {workflow_name}: kept {len(workflow_runs)} representative "
+                      f"run(s) across {len(seen_dates)} day(s) after dedup")
             all_runs.extend(workflow_runs)
         
         # Sort all runs by date (newest first)
@@ -1451,7 +1497,17 @@ class GitHubTestsExtractor:
         
         total_processed = 0
         days_span = max((datetime.now() - since_date).days, 0)
-        run_limit = 200 if (initial_sync or days_span > 7) else 50
+        # Scale per-workflow fetch cap with the requested window. Long backfills on
+        # high-volume workflows (e.g. PR-gating Backend Tests with ~50 commits/day)
+        # need a larger ceiling than the original 200 so the window isn't truncated
+        # to just a few days. The dedup-by-(workflow, commit_sha) inside
+        # fetch_workflow_runs keeps storage bounded at "unique tested commits".
+        if initial_sync or days_span > 30:
+            run_limit = 5000
+        elif days_span > 7:
+            run_limit = 1000
+        else:
+            run_limit = 50
         
         # Process each repository configuration
         for config in self.configs:
