@@ -25,7 +25,9 @@ Configuration (via .env):
         "workflows": ["Workflow Name 1", "Workflow Name 2"],
         "artifact_patterns": ["test-results", "nightly-test-results"],
         "report_format": "trx",  # trx, extent_summary, or postman_html
-        "team": "Platform"
+        "team": "Platform",
+        "dedupe_per_day": true,  # optional, set false for per-build workflows
+        "dedupe_by_sha": true  # optional, set false when reruns on the same commit matter
     }
 """
 
@@ -1098,6 +1100,8 @@ class GitHubTestsExtractor:
         repo = config['repo']
         branch = config.get('branch')
         workflows = config.get('workflows', [])
+        dedupe_per_day = config.get('dedupe_per_day', True)
+        dedupe_by_sha = config.get('dedupe_by_sha', True)
         
         all_runs = []
 
@@ -1125,6 +1129,28 @@ class GitHubTestsExtractor:
             missing = [w for w in workflows if w not in workflow_map]
             print(f"        Warning: Could not find workflows: {', '.join(missing)}")
 
+            workflows_resp = requests.get(
+                f'{self.base_url}/repos/{owner}/{repo}/actions/workflows',
+                headers=self.headers,
+                params={'per_page': 100}
+            )
+            if workflows_resp.status_code == 200:
+                for workflow in workflows_resp.json().get('workflows', []):
+                    workflow_name = workflow.get('name')
+                    workflow_file = (workflow.get('path') or '').split('/')[-1]
+                    for requested in missing:
+                        if requested in workflow_map:
+                            continue
+                        if requested in {workflow_name, workflow_file}:
+                            workflow_map[requested] = workflow['id']
+                            print(f"        Found workflow from workflow list: '{requested}' (ID: {workflow['id']})")
+            else:
+                print(f"        Warning: Could not list workflows: {workflows_resp.status_code}")
+
+            missing = [w for w in workflows if w not in workflow_map]
+            if missing:
+                print(f"        Warning: Still could not find workflows: {', '.join(missing)}")
+
         # Fetch runs for each workflow separately.
         #
         # GitHub's Actions API caps results at ~1000 per workflow query regardless
@@ -1139,14 +1165,11 @@ class GitHubTestsExtractor:
         
         for workflow_name, workflow_id in workflow_map.items():
             workflow_runs = []
-            # Two-level dedup, both relying on GitHub returning runs newest-first:
-            #   * seen_shas: skip reruns of the same commit (different attempts of
-            #     the same code state should count once).
-            #   * seen_dates: skip subsequent runs on a day we already have a row
-            #     for. We keep one representative run per (workflow, day) — the
-            #     latest one of that day — which is what the dashboard wants:
-            #     "size of the test suite as exercised on cloud/dev that day",
-            #     not "number of times the suite executed".
+            # Optional dedup, relying on GitHub returning runs newest-first:
+            #   * seen_shas: skip reruns of the same commit when the same code
+            #     state should count once.
+            #   * seen_dates: keep one representative run per (workflow, day)
+            #     when dashboards care about daily suite size, not execution count.
             seen_shas = set()
             seen_dates = set()
             cur_end = end_dt
@@ -1189,16 +1212,16 @@ class GitHubTestsExtractor:
                                 break
                         
                         sha = (run.get('head_sha') or '')[:40]
-                        if sha and sha in seen_shas:
+                        if dedupe_by_sha and sha and sha in seen_shas:
                             continue
                         
                         run_day = (run.get('run_started_at') or run.get('created_at') or '')[:10]
-                        if run_day and run_day in seen_dates:
+                        if dedupe_per_day and run_day and run_day in seen_dates:
                             continue
                         
-                        if sha:
+                        if dedupe_by_sha and sha:
                             seen_shas.add(sha)
-                        if run_day:
+                        if dedupe_per_day and run_day:
                             seen_dates.add(run_day)
                         
                         run['_config'] = config
