@@ -170,7 +170,8 @@ class DatabaseConnection:
                 'connector': 'VARCHAR(1000)',
                 'created_by': 'VARCHAR(200)',
                 'blocker': 'VARCHAR(200)',
-                'business_value': 'INTEGER'
+                'business_value': 'INTEGER',
+                'business_outcome': 'VARCHAR(200)'
             }
             for col_name, col_type in work_item_columns.items():
                 if col_name not in existing_columns:
@@ -295,7 +296,8 @@ class DatabaseConnection:
                 Column('connector', String(1000), nullable=True),
                 Column('created_by', String(200), nullable=True),
                 Column('blocker', String(200), nullable=True),
-                Column('business_value', Integer, nullable=True)
+                Column('business_value', Integer, nullable=True),
+                Column('business_outcome', String(200), nullable=True)
             )
 
             # History snapshots table
@@ -640,7 +642,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             update_stmt += ", parent_issue = :parent_issue"
                         elif item_type == 'work_item':
-                            update_stmt += ", work_item_type = :work_item_type, effort = :effort, effort_dev_estimate = :effort_dev_estimate, effort_dev_actual = :effort_dev_actual, qa_effort_estimation = :qa_effort_estimation, qa_effort_actual = :qa_effort_actual, tshirt_estimation = :tshirt_estimation, parent_work_item = :parent_work_item, ticket_type = :ticket_type, freshdesk_ticket = :freshdesk_ticket, target_version = :target_version, tags = :tags, connector = :connector, created_by = :created_by, blocker = :blocker, business_value = :business_value"
+                            update_stmt += ", work_item_type = :work_item_type, effort = :effort, effort_dev_estimate = :effort_dev_estimate, effort_dev_actual = :effort_dev_actual, qa_effort_estimation = :qa_effort_estimation, qa_effort_actual = :qa_effort_actual, tshirt_estimation = :tshirt_estimation, parent_work_item = :parent_work_item, ticket_type = :ticket_type, freshdesk_ticket = :freshdesk_ticket, target_version = :target_version, tags = :tags, connector = :connector, created_by = :created_by, blocker = :blocker, business_value = :business_value, business_outcome = :business_outcome"
                         
                         update_stmt += " WHERE id = :id"
 
@@ -681,6 +683,7 @@ class DatabaseConnection:
                             params["created_by"] = item.get('CreatedBy', '')
                             params["blocker"] = item.get('Blocker', '')
                             params["business_value"] = item.get('BusinessValue')
+                            params["business_outcome"] = item.get('BusinessOutcome', '')
 
                         connection.execute(text(update_stmt), params)
                     else:
@@ -698,7 +701,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             insert_stmt += ", parent_issue"
                         elif item_type == 'work_item':
-                            insert_stmt += ", work_item_type, effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type, freshdesk_ticket, target_version, tags, connector, created_by, blocker, business_value"
+                            insert_stmt += ", work_item_type, effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type, freshdesk_ticket, target_version, tags, connector, created_by, blocker, business_value, business_outcome"
                         
                         insert_stmt += """
                         )
@@ -711,7 +714,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             insert_stmt += ", :parent_issue"
                         elif item_type == 'work_item':
-                            insert_stmt += ", :work_item_type, :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type, :freshdesk_ticket, :target_version, :tags, :connector, :created_by, :blocker, :business_value"
+                            insert_stmt += ", :work_item_type, :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type, :freshdesk_ticket, :target_version, :tags, :connector, :created_by, :blocker, :business_value, :business_outcome"
                         
                         insert_stmt += ")"
 
@@ -752,6 +755,7 @@ class DatabaseConnection:
                             params["created_by"] = item.get('CreatedBy', '')
                             params["blocker"] = item.get('Blocker', '')
                             params["business_value"] = item.get('BusinessValue')
+                            params["business_outcome"] = item.get('BusinessOutcome', '')
 
                         connection.execute(text(insert_stmt), params)
                         
@@ -1592,6 +1596,7 @@ class ADOExtractor:
                        [Custom.Connector],
                        [System.CreatedBy],
                        [Custom.Blocker],
+                       [Custom.BusinessOutcome],
                        [Microsoft.VSTS.Common.BusinessValue]
                 FROM WorkItems
                 WHERE [System.ChangedDate] >= '{last_update_str}'
@@ -1739,6 +1744,7 @@ class ADOExtractor:
                     'Connector': (fields.get('Custom.Connector', '') or '')[:1000],
                     'CreatedBy': created_by,
                     'Blocker': fields.get('Custom.Blocker', ''),
+                    'BusinessOutcome': fields.get('Custom.BusinessOutcome', ''),
                     'BusinessValue': business_value
                 }
 
@@ -1890,13 +1896,13 @@ class ADOExtractor:
                                         state, customer_name, area_path, created_date, changed_date,
                                         iteration_path, hotfix_delivered_version, work_item_type, target_date, hf_status, hf_requested_versions,
                                         effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type,
-                                        freshdesk_ticket, target_version, tags, connector, created_by, blocker, business_value
+                                        freshdesk_ticket, target_version, tags, connector, created_by, blocker, business_value, business_outcome
                                     ) VALUES (
                                         :id, :title, :description, :assigned_to, :severity,
                                         :state, :customer_name, :area_path, :created_date, :changed_date,
                                         :iteration_path, :hotfix_delivered_version, :work_item_type, :target_date, :hf_status, :hf_requested_versions,
                                         :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type,
-                                        :freshdesk_ticket, :target_version, :tags, :connector, :created_by, :blocker, :business_value
+                                        :freshdesk_ticket, :target_version, :tags, :connector, :created_by, :blocker, :business_value, :business_outcome
                                     )
                                 """),
                                 {
@@ -1930,7 +1936,8 @@ class ADOExtractor:
                                     "connector": (fields.get('Custom.Connector', '') or '')[:1000],
                                     "created_by": created_by_field,
                                     "blocker": fields.get('Custom.Blocker', ''),
-                                    "business_value": business_value
+                                    "business_value": business_value,
+                                    "business_outcome": fields.get('Custom.BusinessOutcome', '')
                                 }
                             )
                             print(f"Inserted missing work item {work_item_id} of type {work_item_type}")
