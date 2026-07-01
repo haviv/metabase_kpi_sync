@@ -537,7 +537,7 @@ class ADOExtractor:
             "Authorization": f"Basic {auth_token}"
         }
 
-    def get_work_items(self, work_item_type, last_update):
+    def get_    (self, work_item_type, last_update):
         """Query work items based on type and last update time"""
         query_url = f"https://dev.azure.com/{self.organization}/{self.project}/_apis/wit/wiql?api-version=7.1-preview.2"
         

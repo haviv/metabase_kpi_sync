@@ -10,6 +10,8 @@ from sqlalchemy import create_engine, text, Table, Column, Integer, String, Date
 from sqlalchemy.dialects.postgresql import TEXT as PG_TEXT
 from sqlalchemy.exc import SQLAlchemyError
 import json
+import re
+import sys
 from abc import ABC, abstractmethod
 
 # Import GitHub Copilot metrics extractor
@@ -141,6 +143,8 @@ class DatabaseConnection:
         existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
         
         new_columns = {
+            'jira_id': 'VARCHAR(50)',
+            'source': "VARCHAR(20) NOT NULL DEFAULT 'ADO'",
             'iteration_path': 'VARCHAR(500)',
             'hotfix_delivered_version': 'VARCHAR(200)',
 
@@ -199,6 +203,27 @@ class DatabaseConnection:
             self._create_index(connection, "idx_work_items_changed_date", "work_items", "changed_date")
             self._create_index(connection, "idx_work_items_type", "work_items", "work_item_type")
 
+    def _ensure_jira_metadata_columns(self, connection, table_name):
+        """Ensure public tables can store Jira identity without changing numeric ids."""
+        connection.execute(text(f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = '{table_name}' AND column_name = 'jira_id'
+                ) THEN
+                    ALTER TABLE {table_name} ADD COLUMN jira_id VARCHAR(50);
+                END IF;
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = '{table_name}' AND column_name = 'source'
+                ) THEN
+                    ALTER TABLE {table_name} ADD COLUMN source VARCHAR(20) NOT NULL DEFAULT 'ADO';
+                END IF;
+            END $$;
+        """))
+
     def setup_tables(self):
         """Create tables if they don't exist and add new columns if needed"""
         try:
@@ -208,6 +233,8 @@ class DatabaseConnection:
             self.issues = Table(
                 'issues', self.metadata,
                 Column('id', Integer, primary_key=True),
+                Column('jira_id', String(50), nullable=True),
+                Column('source', String(20), nullable=False, server_default=text("'ADO'")),
                 Column('title', String(500), nullable=False),
                 Column('description', text_type, nullable=True),
                 Column('assigned_to', String(200), nullable=True),
@@ -236,6 +263,8 @@ class DatabaseConnection:
             self.bugs = Table(
                 'bugs', self.metadata,
                 Column('id', Integer, primary_key=True),
+                Column('jira_id', String(50), nullable=True),
+                Column('source', String(20), nullable=False, server_default=text("'ADO'")),
                 Column('parent_issue', Integer, nullable=True),
                 Column('title', String(500), nullable=False),
                 Column('description', text_type, nullable=True),
@@ -267,6 +296,8 @@ class DatabaseConnection:
             self.work_items = Table(
                 'work_items', self.metadata,
                 Column('id', Integer, primary_key=True),
+                Column('jira_id', String(50), nullable=True),
+                Column('source', String(20), nullable=False, server_default=text("'ADO'")),
                 Column('title', String(500), nullable=False),
                 Column('description', text_type, nullable=True),
                 Column('assigned_to', String(200), nullable=True),
@@ -313,6 +344,8 @@ class DatabaseConnection:
                 'change_history', self.metadata,
                 Column('id', Integer, primary_key=True),
                 Column('record_id', Integer, nullable=False),
+                Column('jira_id', String(50), nullable=True),
+                Column('source', String(20), nullable=False, server_default=text("'ADO'")),
                 Column('table_name', String(50), nullable=False),
                 Column('field_changed', String(100), nullable=False),
                 Column('old_value', String(500), nullable=True),
@@ -364,12 +397,18 @@ class DatabaseConnection:
                 # Add new columns if tables exist
                 if 'issues' in existing_tables:
                     self._add_new_columns(connection, 'issues')
+                    self._ensure_jira_metadata_columns(connection, 'issues')
                 
                 if 'bugs' in existing_tables:
                     self._add_new_columns(connection, 'bugs')
+                    self._ensure_jira_metadata_columns(connection, 'bugs')
                 
                 if 'work_items' in existing_tables:
                     self._add_new_columns(connection, 'work_items')
+                    self._ensure_jira_metadata_columns(connection, 'work_items')
+
+                if 'change_history' in existing_tables:
+                    self._ensure_jira_metadata_columns(connection, 'change_history')
                 
                 # Drop existing indexes if tables exist
                 if 'issues' in existing_tables:
@@ -414,9 +453,11 @@ class DatabaseConnection:
                 try:
                     # Create indexes with database-specific syntax
                     self._create_index(connection, "idx_issues_changed_date", "issues", "changed_date")
+                    self._create_index(connection, "idx_issues_jira_id", "issues", "jira_id")
                     
                     self._create_index(connection, "idx_bugs_changed_date", "bugs", "changed_date")
                     self._create_index(connection, "idx_bugs_parent_issue", "bugs", "parent_issue")
+                    self._create_index(connection, "idx_bugs_jira_id", "bugs", "jira_id")
                     
                     self._create_index(connection, "idx_sync_status_entity_type", "sync_status", "entity_type, last_sync_time DESC")
                     
@@ -425,6 +466,7 @@ class DatabaseConnection:
                     # Add indexes for work_items table
                     self._create_index(connection, "idx_work_items_changed_date", "work_items", "changed_date")
                     self._create_index(connection, "idx_work_items_type", "work_items", "work_item_type")
+                    self._create_index(connection, "idx_work_items_jira_id", "work_items", "jira_id")
                     
                     # Add indexes for sprints table
                     self._create_index(connection, "idx_sprints_name", "sprints", "name")
@@ -602,28 +644,42 @@ class DatabaseConnection:
                     # Convert dates from string to datetime
                     for date_field in ['CreatedDate', 'ChangedDate']:
                         if item[date_field]:
-                            try:
-                                # Try parsing with milliseconds
-                                item[date_field] = datetime.strptime(item[date_field], "%Y-%m-%dT%H:%M:%S.%fZ")
-                            except ValueError:
+                            if isinstance(item[date_field], datetime):
+                                continue
+                            parsed_date = None
+                            for date_format in (
+                                "%Y-%m-%dT%H:%M:%S.%fZ",
+                                "%Y-%m-%dT%H:%M:%SZ",
+                                "%Y-%m-%dT%H:%M:%S.%f%z",
+                                "%Y-%m-%dT%H:%M:%S%z",
+                            ):
                                 try:
-                                    # Try parsing without milliseconds
-                                    item[date_field] = datetime.strptime(item[date_field], "%Y-%m-%dT%H:%M:%SZ")
-                                except ValueError as e:
-                                    print(f"Error parsing date {item[date_field]}: {str(e)}")
-                                    raise
+                                    parsed_date = datetime.strptime(item[date_field], date_format)
+                                    break
+                                except ValueError:
+                                    continue
+                            if parsed_date is None:
+                                raise ValueError(f"Unsupported date format for {date_field}: {item[date_field]}")
+                            item[date_field] = parsed_date
 
                     # Check if item exists
                     result = connection.execute(
-                        text(f"SELECT 1 FROM {table.name} WHERE id = :id"),
+                        text(f"SELECT jira_id, source FROM {table.name} WHERE id = :id"),
                         {"id": item['ID']}
                     ).first()
 
                     if result:
+                        if item.get('Source', 'ADO') != 'JIRA' and result[0]:
+                            print(f"Skipping ADO update for {table.name} {item['ID']} because it is owned by Jira ({result[0]})")
+                            processed_count += 1
+                            continue
+
                         # Update existing item
                         update_stmt = f"""
                         UPDATE {table.name}
-                        SET title = :title,
+                        SET jira_id = :jira_id,
+                            source = :source,
+                            title = :title,
                             description = :description,
                             assigned_to = :assigned_to,
                             severity = :severity,
@@ -648,6 +704,8 @@ class DatabaseConnection:
 
                         params = {
                             "id": item['ID'],
+                            "jira_id": item.get('JiraID'),
+                            "source": item.get('Source', 'ADO'),
                             "title": item['Title'],
                             "description": item['Description'],
                             "assigned_to": item['AssignedTo'],
@@ -693,7 +751,7 @@ class DatabaseConnection:
                         # Insert new item
                         insert_stmt = f"""
                         INSERT INTO {table.name} (
-                            id, title, description, assigned_to, severity,
+                            id, jira_id, source, title, description, assigned_to, severity,
                             state, customer_name, area_path, created_date, changed_date,
                             iteration_path, hotfix_delivered_version, target_date, hf_status, hf_requested_versions
                         """
@@ -706,7 +764,7 @@ class DatabaseConnection:
                         insert_stmt += """
                         )
                         VALUES (
-                            :id, :title, :description, :assigned_to, :severity,
+                            :id, :jira_id, :source, :title, :description, :assigned_to, :severity,
                             :state, :customer_name, :area_path, :created_date, :changed_date,
                             :iteration_path, :hotfix_delivered_version, :target_date, :hf_status, :hf_requested_versions
                         """
@@ -720,6 +778,8 @@ class DatabaseConnection:
 
                         params = {
                             "id": item['ID'],
+                            "jira_id": item.get('JiraID'),
+                            "source": item.get('Source', 'ADO'),
                             "title": item['Title'],
                             "description": item['Description'],
                             "assigned_to": item['AssignedTo'],
@@ -1138,6 +1198,21 @@ class ADOExtractor:
             writer.writeheader()
             writer.writerows(work_items)
 
+    def _is_jira_owned_record(self, db_connection, table_name, record_id):
+        """Return True when a record has moved to Jira and ADO should stop owning history."""
+        if not db_connection:
+            return False
+        try:
+            with db_connection.engine.connect() as connection:
+                result = connection.execute(
+                    text(f"SELECT jira_id FROM {table_name} WHERE id = :id"),
+                    {"id": record_id}
+                ).first()
+                return bool(result and result[0])
+        except SQLAlchemyError as e:
+            print(f"Warning: could not check Jira ownership for {table_name} {record_id}: {str(e)}")
+            return False
+
     def handle_bug_changes(self, bugs, db_connection=None):
         """
         Get and store the change history for a list of bugs (State, HF Status, HF Target Date)
@@ -1155,6 +1230,10 @@ class ADOExtractor:
         all_state_changes = {}
 
         for bug_id in bug_ids:
+            if self._is_jira_owned_record(db_connection, 'bugs', bug_id):
+                print(f"Skipping ADO bug history for {bug_id}; Jira is the source of truth")
+                continue
+
             updates_url = f"https://dev.azure.com/{self.organization}/{self.project}/_apis/wit/workitems/{bug_id}/updates?api-version=7.0"
             response = requests.get(updates_url, headers=self.headers)
             
@@ -1773,6 +1852,10 @@ class ADOExtractor:
         all_state_changes = {}
 
         for work_item_id in work_item_ids:
+            if self._is_jira_owned_record(db_connection, 'work_items', work_item_id):
+                print(f"Skipping ADO work item history for {work_item_id}; Jira is the source of truth")
+                continue
+
             # First get the work item details to ensure we have the type
             details_url = f"https://dev.azure.com/{self.organization}/_apis/wit/workitems/{work_item_id}?api-version=7.0"
             details_response = requests.get(details_url, headers=self.headers)
@@ -2374,6 +2457,611 @@ class ADOExtractor:
             print("------>No database connection available for sprint capacities update")
             return 0
 
+class JIRAExtractor:
+    """Jira implementation that emits ADO-compatible item dictionaries."""
+
+    def __init__(self, jira_url, project_key, email, api_token, board_id=None):
+        self.jira_url = jira_url.rstrip('/')
+        self.project_key = project_key
+        self.board_id = board_id
+        auth_string = f"{email}:{api_token}"
+        auth_b64 = base64.b64encode(auth_string.encode('ascii')).decode('ascii')
+        self.headers = {
+            "Accept": "application/json",
+            "Authorization": f"Basic {auth_b64}"
+        }
+
+        self.sprint_field = os.getenv('JIRA_SPRINT_FIELD_ID', 'customfield_10020')
+        self.customer_name_fields = [
+            os.getenv('JIRA_NEXUS_CUSTOMER_NAME_FIELD_ID', 'customfield_12470'),
+            os.getenv('JIRA_CUSTOMER_NAME_FIELD_ID', 'customfield_10360'),
+        ]
+        self.hotfix_delivered_version_field = os.getenv('JIRA_HOTFIX_DELIVERED_VERSION_FIELD_ID', 'customfield_12480')
+        self.target_date_field = os.getenv('JIRA_TARGET_DATE_FIELD_ID', 'customfield_12496')
+        self.hf_status_field = os.getenv('JIRA_HF_STATUS_FIELD_ID', 'customfield_12479')
+        self.hf_requested_versions_field = os.getenv('JIRA_HF_REQUESTED_VERSIONS_FIELD_ID', 'customfield_12478')
+        self.effort_field = os.getenv('JIRA_EFFORT_FIELD_ID', 'customfield_10619')
+        self.effort_dev_estimate_field = os.getenv('JIRA_EFFORT_DEV_ESTIMATE_FIELD_ID', 'customfield_10623')
+        self.effort_dev_actual_field = os.getenv('JIRA_EFFORT_DEV_ACTUAL_FIELD_ID', 'customfield_10624')
+        self.qa_effort_estimation_field = os.getenv('JIRA_QA_EFFORT_ESTIMATION_FIELD_ID', 'customfield_12484')
+        self.qa_effort_actual_field = os.getenv('JIRA_QA_EFFORT_ACTUAL_FIELD_ID', 'customfield_12483')
+        self.tshirt_estimation_field = os.getenv('JIRA_TSHIRT_ESTIMATION_FIELD_ID', 'customfield_12489')
+        self.ticket_type_field = os.getenv('JIRA_TICKET_TYPE_FIELD_ID', 'customfield_12467')
+        self.freshdesk_ticket_field = os.getenv('JIRA_FRESHDESK_TICKET_FIELD_ID', 'customfield_12476')
+        self.target_version_fields = [
+            os.getenv('JIRA_TARGET_VERSION_FIELD_ID', 'customfield_12490'),
+            os.getenv('JIRA_VERSION_FIELD_ID', 'customfield_12493'),
+        ]
+        self.connector_fields = [
+            os.getenv('JIRA_NEXUS_CONNECTOR_FIELD_ID', 'customfield_12509'),
+            os.getenv('JIRA_CONNECTOR_FIELD_ID', 'customfield_11384'),
+        ]
+        self.blocker_field = os.getenv('JIRA_BLOCKER_FIELD_ID', 'customfield_12466')
+        self.business_value_field = os.getenv('JIRA_BUSINESS_VALUE_FIELD_ID', 'customfield_10620')
+        self.business_outcome_field = os.getenv('JIRA_BUSINESS_OUTCOME_FIELD_ID', 'customfield_12468')
+
+    def _request_json(self, path, params=None):
+        response = requests.get(f"{self.jira_url}{path}", headers=self.headers, params=params, timeout=60)
+        if response.status_code != 200:
+            print(f"Error fetching Jira data from {path}: {response.status_code} - {response.text}")
+            return None
+        return response.json()
+
+    def _adf_to_text(self, adf_value):
+        if not adf_value:
+            return ""
+        if isinstance(adf_value, str):
+            return adf_value
+
+        parts = []
+
+        def walk(node):
+            if isinstance(node, list):
+                for child in node:
+                    walk(child)
+                return
+            if not isinstance(node, dict):
+                return
+            if node.get('type') == 'text':
+                parts.append(node.get('text', ''))
+                return
+            for child in node.get('content', []) or []:
+                walk(child)
+            if node.get('type') in ['paragraph', 'heading', 'blockquote', 'listItem']:
+                parts.append('\n')
+            if node.get('type') == 'hardBreak':
+                parts.append('\n')
+
+        walk(adf_value)
+        return '\n'.join([line.rstrip() for line in ''.join(parts).splitlines()]).strip()
+
+    def _extract_value(self, fields, field_id, field_type='string'):
+        raw_value = fields.get(field_id)
+        if raw_value in (None, '', [], {}):
+            return None
+        if field_type == 'number':
+            try:
+                return float(raw_value) if raw_value is not None else None
+            except (ValueError, TypeError):
+                return None
+        if field_type == 'user':
+            if isinstance(raw_value, dict):
+                return raw_value.get('displayName', '')
+            if isinstance(raw_value, list) and raw_value and isinstance(raw_value[0], dict):
+                return raw_value[0].get('displayName', '')
+            return str(raw_value)
+        if isinstance(raw_value, list):
+            values = []
+            for item in raw_value:
+                if isinstance(item, dict):
+                    values.append(item.get('value') or item.get('name') or item.get('displayName') or item.get('key') or str(item))
+                else:
+                    values.append(str(item))
+            return ', '.join([value for value in values if value])
+        if isinstance(raw_value, dict):
+            return raw_value.get('value') or raw_value.get('name') or raw_value.get('displayName') or raw_value.get('key') or str(raw_value)
+        return str(raw_value)
+
+    def _first_value(self, fields, field_ids, field_type='string'):
+        for field_id in field_ids:
+            value = self._extract_value(fields, field_id, field_type)
+            if value not in (None, ''):
+                return value
+        return ''
+
+    def _parse_jira_date(self, value):
+        if not value:
+            return None
+        for date_format in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value, date_format)
+            except ValueError:
+                continue
+        print(f"Warning: unsupported Jira date format: {value}")
+        return None
+
+    def _normalize_priority_to_ado_severity(self, priority_name):
+        """Translate Jira priorities into the numeric severity values existing dashboards use."""
+        if not priority_name:
+            return ''
+
+        priority_text = str(priority_name).strip()
+        leading_number = re.match(r'^\s*([1-5])\b', priority_text)
+        if leading_number:
+            return leading_number.group(1)
+
+        normalized = priority_text.lower()
+        if any(token in normalized for token in ('blocker', 'critical', 'highest')):
+            return '1'
+        if any(token in normalized for token in ('high', 'major')):
+            return '2'
+        if any(token in normalized for token in ('medium', 'normal')):
+            return '3'
+        if any(token in normalized for token in ('lowest', 'low', 'minor', 'trivial')):
+            return '4'
+
+        print(f"Warning: unknown Jira priority '{priority_name}', keeping original value")
+        return priority_text
+
+    def _normalize_jira_state_to_ado_state(self, state_name):
+        """Translate Jira workflow statuses into the closest existing ADO state values."""
+        if not state_name:
+            return ''
+
+        state_text = str(state_name).strip()
+        normalized = re.sub(r'\s+', ' ', state_text).lower()
+        jira_to_ado_states = {
+            'open': 'New',
+            'to do': 'New',
+            'blocked': 'Blocked',
+            'in progress': 'In Progress',
+            'code review': 'Waiting for PR',
+            'ready for qa': 'Ready for QA',
+            'in qa': 'In QA',
+            'done': 'Done',
+            'closed': 'Done',
+        }
+
+        mapped_state = jira_to_ado_states.get(normalized)
+        if mapped_state:
+            return mapped_state
+
+        print(f"Warning: unknown Jira state '{state_name}', keeping original value")
+        return state_text
+
+    def _get_comments_text(self, jira_key):
+        comments_data = self._request_json(f"/rest/api/3/issue/{jira_key}/comment", {"maxResults": 100}) or {}
+        comments = []
+        for comment in comments_data.get('comments', []):
+            comments.append(self._adf_to_text(comment.get('body')))
+        return comments
+
+    def _extract_migrated_ado_id(self, comments):
+        for comment in comments:
+            if 'ADO Work Item History' not in comment and 'Work Item:' not in comment:
+                continue
+            match = re.search(r'Work Item:\s*(\d+)', comment)
+            if match:
+                return int(match.group(1))
+        return None
+
+    def _compatibility_id(self, issue, comments, table_name):
+        jira_key = issue.get('key')
+        migrated_ado_id = self._extract_migrated_ado_id(comments)
+        if migrated_ado_id:
+            return migrated_ado_id
+
+        jira_internal_id = int(issue['id']) if str(issue.get('id', '')).isdigit() else None
+        if jira_internal_id is None:
+            raise ValueError(f"Jira issue {jira_key} does not have a numeric issue id")
+
+        # Avoid overwriting an unrelated ADO row if Jira's internal id collides.
+        if hasattr(self, 'db_connection') and self.db_connection:
+            with self.db_connection.engine.connect() as connection:
+                existing = connection.execute(
+                    text(f"SELECT jira_id, source FROM {table_name} WHERE id = :id"),
+                    {"id": jira_internal_id}
+                ).first()
+                if existing and not (existing[0] == jira_key or existing[1] == 'JIRA'):
+                    fallback_id = 1_000_000_000 + jira_internal_id
+                    print(
+                        f"Warning: Jira issue {jira_key} internal id {jira_internal_id} collides with "
+                        f"existing {table_name} row. Using compatibility id {fallback_id}."
+                    )
+                    return fallback_id
+        return jira_internal_id
+
+    def _sprint_names(self, fields):
+        sprint_val = fields.get(self.sprint_field) or fields.get('customfield_10020') or fields.get('sprint')
+        if isinstance(sprint_val, dict):
+            return sprint_val.get('name', '')
+        if isinstance(sprint_val, list):
+            names = []
+            for sprint in sprint_val:
+                if isinstance(sprint, dict):
+                    name = sprint.get('name')
+                    if name:
+                        names.append(name)
+                elif isinstance(sprint, str):
+                    match = re.search(r"name=([^,\]]+)", sprint)
+                    if match:
+                        names.append(match.group(1))
+            return ', '.join(names)
+        if isinstance(sprint_val, str):
+            return sprint_val
+        return ''
+
+    def _base_item_data(self, issue, table_name):
+        fields = issue["fields"]
+        comments = self._get_comments_text(issue["key"])
+        assignee = fields.get("assignee")
+        creator = fields.get("creator") or fields.get("reporter")
+        priority = fields.get("priority")
+        status = fields.get("status")
+        components = fields.get("components", [])
+        labels = fields.get("labels", [])
+        fix_versions = fields.get("fixVersions", [])
+        target_date = self._parse_jira_date(self._extract_value(fields, self.target_date_field) or fields.get('duedate'))
+
+        return {
+            'ID': self._compatibility_id(issue, comments, table_name),
+            'JiraID': issue["key"],
+            'Source': 'JIRA',
+            'Title': fields.get("summary", ""),
+            'Description': self._adf_to_text(fields.get("description")),
+            'AssignedTo': assignee.get("displayName", "") if assignee else "",
+            'Severity': self._normalize_priority_to_ado_severity(priority.get("name", "") if priority else ""),
+            'State': self._normalize_jira_state_to_ado_state(status.get("name", "") if status else ""),
+            'CustomerName': self._first_value(fields, self.customer_name_fields),
+            'AreaPath': ", ".join([component.get("name", "") for component in components if component.get("name")]),
+            'CreatedDate': fields.get("created", ""),
+            'ChangedDate': fields.get("updated", ""),
+            'IterationPath': self._sprint_names(fields),
+            'HotfixDeliveredVersion': self._extract_value(fields, self.hotfix_delivered_version_field) or '',
+            'TargetDate': target_date,
+            'HFStatus': self._extract_value(fields, self.hf_status_field) or '',
+            'HFRequestedVersions': self._extract_value(fields, self.hf_requested_versions_field) or '',
+            'Effort': self._extract_value(fields, self.effort_field, 'number'),
+            'EffortDevEstimate': self._extract_value(fields, self.effort_dev_estimate_field, 'number'),
+            'EffortDevActual': self._extract_value(fields, self.effort_dev_actual_field, 'number'),
+            'QAEffortEstimation': self._extract_value(fields, self.qa_effort_estimation_field, 'number'),
+            'QAEffortActual': self._extract_value(fields, self.qa_effort_actual_field, 'number'),
+            'TShirtEstimation': self._extract_value(fields, self.tshirt_estimation_field) or '',
+            'ParentWorkItem': None,
+            'TicketType': self._extract_value(fields, self.ticket_type_field) or '',
+            'FreshdeskTicket': self._extract_value(fields, self.freshdesk_ticket_field) or '',
+            'TargetVersion': self._first_value(fields, self.target_version_fields) or ", ".join(
+                [version.get("name", "") for version in fix_versions if version.get("name")]
+            ),
+            'Tags': ", ".join(labels)[:500] if labels else '',
+            'Connector': self._first_value(fields, self.connector_fields)[:1000],
+            'CreatedBy': creator.get("displayName", "") if creator else '',
+            'Blocker': self._extract_value(fields, self.blocker_field) or '',
+            'BusinessValue': self._extract_value(fields, self.business_value_field, 'number'),
+            'BusinessOutcome': self._extract_value(fields, self.business_outcome_field) or '',
+        }
+
+    def _search_issues(self, jql_query, fields_param):
+        issues = []
+        next_page_token = None
+        while True:
+            params = {
+                'jql': jql_query,
+                'maxResults': 100,
+                'fields': fields_param,
+                'expand': 'renderedFields'
+            }
+            if next_page_token:
+                params['nextPageToken'] = next_page_token
+            response = requests.get(f"{self.jira_url}/rest/api/3/search/jql", headers=self.headers, params=params, timeout=60)
+            if response.status_code != 200:
+                print(f"Error fetching Jira issues: {response.status_code} - {response.text}")
+                break
+            data = response.json()
+            issues.extend(data.get("issues", []))
+            if data.get("isLast", True) or not data.get("nextPageToken"):
+                break
+            next_page_token = data.get("nextPageToken")
+            time.sleep(0.5)
+        return issues
+
+    def _get_worklog_details(self, jira_key, worklog_id):
+        worklog_data = self._request_json(f"/rest/api/3/issue/{jira_key}/worklog") or {}
+        for worklog in worklog_data.get('worklogs', []):
+            if str(worklog.get('id')) == str(worklog_id):
+                return worklog
+        return None
+
+    def _jira_change_field_name(self, item):
+        field_name = item.get("field")
+        field_id = item.get("fieldId")
+        if field_name == "status":
+            return "System.State"
+        if field_name == "Sprint" or field_id in (self.sprint_field, "customfield_10020"):
+            return "System.IterationPath"
+        if field_name == "WorklogId":
+            return "Work Log Entry"
+        if field_id == self.hf_status_field:
+            return "Custom.HFstatus"
+        if field_id == self.target_date_field:
+            return "Microsoft.VSTS.Scheduling.TargetDate"
+        if field_id == self.hf_requested_versions_field:
+            return "Custom.HFrequestedversions"
+        return None
+
+    def _handle_jira_changes(self, items, table_name_getter, db_connection=None):
+        if not items:
+            return {}
+
+        all_state_changes = {}
+        for item_data in items:
+            if not isinstance(item_data, dict):
+                print(f"Skipping Jira change history for unsupported item reference: {item_data}")
+                continue
+
+            record_id = item_data['ID']
+            jira_key = item_data.get('JiraID')
+            if not jira_key:
+                print(f"Skipping Jira change history for {record_id}; missing jira_id")
+                continue
+
+            issue_data = self._request_json(f"/rest/api/3/issue/{jira_key}", {"expand": "changelog"})
+            if not issue_data:
+                continue
+
+            changelog = issue_data.get("changelog", {}).get("histories", [])
+            state_changes = []
+            table_name = table_name_getter(item_data)
+            tracked_fields = (
+                'System.State',
+                'System.IterationPath',
+                'Work Log Entry',
+                'Custom.HFstatus',
+                'Microsoft.VSTS.Scheduling.TargetDate',
+                'Custom.HFrequestedversions',
+            )
+
+            if db_connection:
+                with db_connection.engine.connect() as connection:
+                    try:
+                        connection.execute(
+                            text("""
+                                DELETE FROM change_history
+                                WHERE record_id = :record_id
+                                AND field_changed = ANY(:tracked_fields)
+                            """),
+                            {
+                                "record_id": record_id,
+                                "tracked_fields": list(tracked_fields),
+                            }
+                        )
+
+                        for history in changelog:
+                            changed_date_obj = self._parse_jira_date(history.get("created"))
+                            if not changed_date_obj:
+                                continue
+                            changed_by = history.get("author", {}).get("displayName", "")
+                            for history_item in history.get("items", []):
+                                field_changed = self._jira_change_field_name(history_item)
+                                if not field_changed:
+                                    continue
+                                old_value = history_item.get("fromString", "") or ""
+                                new_value = history_item.get("toString", "") or ""
+                                if field_changed == "System.State":
+                                    old_value = self._normalize_jira_state_to_ado_state(old_value)
+                                    new_value = self._normalize_jira_state_to_ado_state(new_value)
+
+                                if field_changed == "Work Log Entry" and new_value:
+                                    old_value = ""
+                                    worklog_details = self._get_worklog_details(jira_key, new_value)
+                                    if worklog_details:
+                                        new_value = str(
+                                            worklog_details.get('timeSpentSeconds')
+                                            or worklog_details.get('timeSpent')
+                                            or new_value
+                                        )
+
+                                connection.execute(
+                                    text("""
+                                        INSERT INTO change_history
+                                        (record_id, jira_id, source, table_name, field_changed, old_value, new_value, changed_by, changed_date)
+                                        VALUES
+                                        (:record_id, :jira_id, 'JIRA', :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
+                                    """),
+                                    {
+                                        "record_id": record_id,
+                                        "jira_id": jira_key,
+                                        "table_name": table_name,
+                                        "field_changed": field_changed,
+                                        "old_value": str(old_value)[:500] if old_value else "",
+                                        "new_value": str(new_value)[:500] if new_value else "",
+                                        "changed_by": changed_by,
+                                        "changed_date": changed_date_obj,
+                                    }
+                                )
+
+                                if field_changed == "System.State":
+                                    state_changes.append([history.get("created", ""), old_value, new_value])
+
+                        connection.commit()
+                    except SQLAlchemyError as e:
+                        print(f"Error processing Jira changes for {jira_key}: {str(e)}")
+                        connection.rollback()
+            else:
+                for history in changelog:
+                    for history_item in history.get("items", []):
+                        if self._jira_change_field_name(history_item) == "System.State":
+                            state_changes.append([
+                                history.get("created", ""),
+                                history_item.get("fromString", "") or "",
+                                history_item.get("toString", "") or "",
+                            ])
+
+            all_state_changes[record_id] = state_changes
+
+        return all_state_changes
+
+    def _fields_param(self):
+        fields = {
+            "summary", "description", "assignee", "priority", "status", "components",
+            "created", "updated", "parent", "creator", "reporter", "issuetype", "labels",
+            "fixVersions", "duedate", "timetracking", "worklog", "sprint", "customfield_10020",
+            *self.customer_name_fields, self.hotfix_delivered_version_field, self.target_date_field,
+            self.hf_status_field, self.hf_requested_versions_field, self.effort_field,
+            self.effort_dev_estimate_field, self.effort_dev_actual_field,
+            self.qa_effort_estimation_field, self.qa_effort_actual_field,
+            self.tshirt_estimation_field, self.ticket_type_field, self.freshdesk_ticket_field,
+            *self.target_version_fields, *self.connector_fields, self.blocker_field,
+            self.business_value_field, self.business_outcome_field
+        }
+        return ",".join(sorted([field for field in fields if field]))
+
+    def get_all_work_items(self, last_update):
+        print(f"------>Fetching Jira work items with updated >= {last_update}")
+        jql_query = (
+            f'project = {self.project_key} '
+            f'AND issuetype in (Story, Bug, Task, Epic, "Sub-task") '
+            f'AND updated >= "{last_update}" ORDER BY updated DESC'
+        )
+        issues = self._search_issues(jql_query, self._fields_param())
+        work_items = []
+        for issue in issues:
+            item_data = self._base_item_data(issue, 'work_items')
+            item_data['WorkItemType'] = self._extract_value(issue['fields'], 'issuetype') or 'Unknown'
+            work_items.append(item_data)
+        print(f"------>Total Jira work items fetched: {len(work_items)}")
+        return work_items
+
+    def get_work_items(self, work_item_type, last_update):
+        if work_item_type == 'Issue Report':
+            print("------>Skipping Jira Issue Report sync; NEXUS has no Issue Report issue type")
+            return []
+
+        print(f"------>Fetching Jira {work_item_type} items with updated >= {last_update}")
+        jql_query = (
+            f'project = {self.project_key} '
+            f'AND issuetype = "{work_item_type}" '
+            f'AND updated >= "{last_update}" ORDER BY updated DESC'
+        )
+        issues = self._search_issues(jql_query, self._fields_param())
+        items = []
+        for issue in issues:
+            item_data = self._base_item_data(issue, 'bugs' if work_item_type == 'Bug' else 'work_items')
+            item_data['WorkItemType'] = work_item_type
+            if work_item_type == 'Bug':
+                item_data['ParentID'] = None
+            items.append(item_data)
+        print(f"------>Total Jira {work_item_type} items fetched: {len(items)}")
+        return items
+
+    def handle_work_item_changes(self, work_items, db_connection=None):
+        return self._handle_jira_changes(
+            work_items,
+            lambda item: item.get('WorkItemType', 'work_items'),
+            db_connection
+        )
+
+    def handle_bug_changes(self, bugs, db_connection=None):
+        return self._handle_jira_changes(
+            bugs,
+            lambda item: 'bugs',
+            db_connection
+        )
+
+    def normalize_existing_jira_states(self, db_connection):
+        """Backfill existing Jira-owned rows that were synced before state normalization existed."""
+        if not db_connection:
+            return
+
+        state_mappings = {
+            'OPEN': 'New',
+            'TO DO': 'New',
+            'BLOCKED': 'Blocked',
+            'IN PROGRESS': 'In Progress',
+            'CODE REVIEW': 'Waiting for PR',
+            'READY FOR QA': 'Ready for QA',
+            'IN QA': 'In QA',
+            'DONE': 'Done',
+            'CLOSED': 'Done',
+        }
+
+        with db_connection.engine.connect() as connection:
+            try:
+                for raw_state, ado_state in state_mappings.items():
+                    for table_name in ('work_items', 'bugs'):
+                        connection.execute(
+                            text(f"""
+                                UPDATE {table_name}
+                                SET state = :ado_state
+                                WHERE source = 'JIRA'
+                                  AND UPPER(state) = :raw_state
+                                  AND state <> :ado_state
+                            """),
+                            {"raw_state": raw_state, "ado_state": ado_state}
+                        )
+
+                    connection.execute(
+                        text("""
+                            UPDATE change_history
+                            SET old_value = :ado_state
+                            WHERE source = 'JIRA'
+                              AND field_changed = 'System.State'
+                              AND UPPER(old_value) = :raw_state
+                              AND old_value <> :ado_state
+                        """),
+                        {"raw_state": raw_state, "ado_state": ado_state}
+                    )
+                    connection.execute(
+                        text("""
+                            UPDATE change_history
+                            SET new_value = :ado_state
+                            WHERE source = 'JIRA'
+                              AND field_changed = 'System.State'
+                              AND UPPER(new_value) = :raw_state
+                              AND new_value <> :ado_state
+                        """),
+                        {"raw_state": raw_state, "ado_state": ado_state}
+                    )
+                connection.commit()
+            except SQLAlchemyError as e:
+                print(f"Error normalizing existing Jira states: {str(e)}")
+                connection.rollback()
+
+    def update_sprints(self):
+        if not self.board_id:
+            print("------>Skipping Jira sprints sync; no board id configured")
+            return 0
+        print(f"------>Fetching Jira sprints for board {self.board_id}")
+        sprints = []
+        start_at = 0
+        while True:
+            data = self._request_json(
+                f"/rest/agile/1.0/board/{self.board_id}/sprint",
+                {"startAt": start_at, "maxResults": 50, "state": "active,future,closed"}
+            ) or {}
+            for sprint in data.get('values', []):
+                sprints.append({
+                    'id': str(sprint.get('id')),
+                    'name': sprint.get('name', ''),
+                    'path': f"JIRA/{self.project_key}/{sprint.get('name', '')}",
+                    'start_date': self._parse_jira_date(sprint.get('startDate')) if sprint.get('startDate') else None,
+                    'finish_date': self._parse_jira_date(sprint.get('endDate')) if sprint.get('endDate') else None,
+                    'state': sprint.get('state', '')
+                })
+            if data.get('isLast', True):
+                break
+            start_at += data.get('maxResults', 50)
+
+        if hasattr(self, 'db_connection') and self.db_connection:
+            processed_count = self.db_connection.upsert_sprints(sprints)
+            print(f"------>Processed {processed_count} Jira sprints")
+            return processed_count
+        return 0
+
+    def update_sprint_capacities(self, current_sprint_only=True):
+        print("------>Skipping Jira sprint capacity sync; Jira does not expose ADO-style team capacity")
+        return 0
+
 def main():
     # Load configuration from .env file
     organization = os.getenv('ADO_ORGANIZATION')
@@ -2394,6 +3082,23 @@ def main():
     # Set the database connection for the extractor
     extractor.db_connection = db
 
+    include_jira = os.getenv('INCLUDE_JIRA', 'false').lower() in ('1', 'true', 'yes') or '--include-jira' in sys.argv
+    run_once = os.getenv('RUN_ONCE', 'false').lower() in ('1', 'true', 'yes') or '--once' in sys.argv
+    skip_ado_history = os.getenv('SKIP_ADO_HISTORY', 'false').lower() in ('1', 'true', 'yes') or '--skip-ado-history' in sys.argv
+    skip_github_metrics = os.getenv('SKIP_GITHUB_METRICS', 'false').lower() in ('1', 'true', 'yes') or '--skip-github-metrics' in sys.argv
+    jira_extractor = None
+    if include_jira:
+        jira_url = os.getenv('JIRA_CLOUD_URL')
+        jira_project = os.getenv('JIRA_NEXUS_PROJECT_KEY') or os.getenv('JIRA_PROJECT_KEY')
+        jira_email = os.getenv('JIRA_USER_EMAIL')
+        jira_token = os.getenv('JIRA_API_TOKEN')
+        jira_board_id = os.getenv('JIRA_NEXUS_BOARD_ID', '1766')
+        if not all([jira_url, jira_project, jira_email, jira_token]):
+            raise ValueError("INCLUDE_JIRA is enabled, but JIRA_CLOUD_URL, JIRA_NEXUS_PROJECT_KEY/JIRA_PROJECT_KEY, JIRA_USER_EMAIL, or JIRA_API_TOKEN is missing")
+        jira_extractor = JIRAExtractor(jira_url, jira_project, jira_email, jira_token, jira_board_id)
+        jira_extractor.db_connection = db
+        print(f"------>Jira sync enabled for project {jira_project}, board {jira_board_id}")
+
     # Process bugs from CSV file
     # bugs_csv_file_path = '/Users/haviv_rosh/work/scripts_python/metabase/bugs_202503011913.csv'
     # print("\nProcessing bug customer names from CSV file...")
@@ -2406,9 +3111,15 @@ def main():
     # extractor.update_issues_customer_names_from_csv(issues_csv_file_path)
     # print("Issues CSV processing completed\n")
 
-    SLEEP_INTERVAL = 60 * 60  # 1 hour in seconds
+    SLEEP_INTERVAL = int(os.getenv('SYNC_INTERVAL_SECONDS', 60 * 60))  # 1 hour by default
     
     print(f"Starting continuous sync with {SLEEP_INTERVAL/60} minute intervals")
+    if run_once:
+        print("Running a single sync cycle (--once/RUN_ONCE enabled)")
+    if skip_ado_history:
+        print("Skipping ADO change-history refresh (--skip-ado-history/SKIP_ADO_HISTORY enabled)")
+    if skip_github_metrics:
+        print("Skipping GitHub metric refresh (--skip-github-metrics/SKIP_GITHUB_METRICS enabled)")
     print("Press Ctrl+C to stop the program")
     
     while True:
@@ -2460,9 +3171,12 @@ def main():
             print(f"------>Processed {processed_work_items} work items")
 
             # Process state changes for all work items
-            print("------>Processing work item state changes")
-            extractor.handle_work_item_changes(work_items, db)
-            print(f"------>Processed state changes for {len(work_items)} work items")
+            if skip_ado_history:
+                print("------>Skipping ADO work item state changes")
+            else:
+                print("------>Processing work item state changes")
+                extractor.handle_work_item_changes(work_items, db)
+                print(f"------>Processed state changes for {len(work_items)} work items")
             
             # Extract and store issues
             issues = extractor.get_work_items('Issue Report', issues_last_sync.strftime('%Y-%m-%d'))
@@ -2475,9 +3189,12 @@ def main():
             print(f"------>Processed {processed_bugs} bugs")
 
             # Process state changes for all bugs at once
-            print("------>Processing bug state changes")
-            extractor.handle_bug_changes(bugs, db)
-            print(f"------>Processed state changes for {len(bugs)} bugs")
+            if skip_ado_history:
+                print("------>Skipping ADO bug state changes")
+            else:
+                print("------>Processing bug state changes")
+                extractor.handle_bug_changes(bugs, db)
+                print(f"------>Processed state changes for {len(bugs)} bugs")
 
             # Clean up invalid parent issue references
             print("------>Cleaning up invalid parent issue references")
@@ -2498,11 +3215,57 @@ def main():
                 print("------>Daily sprint capacity sync - fetching current sprint only")
                 processed_capacities = extractor.update_sprint_capacities(current_sprint_only=True)
 
+            processed_jira_work_items = 0
+            processed_jira_issues = 0
+            processed_jira_bugs = 0
+            processed_jira_sprints = 0
+            processed_jira_capacities = 0
+
+            if include_jira and jira_extractor:
+                jira_work_items_last_sync = db.get_last_sync_time('jira_work_item')
+                jira_issues_last_sync = db.get_last_sync_time('jira_issue')
+                jira_bugs_last_sync = db.get_last_sync_time('jira_bug')
+
+                if should_run_full_sync:
+                    jira_work_items_last_sync = sync_date_override
+                    jira_issues_last_sync = sync_date_override
+                    jira_bugs_last_sync = sync_date_override
+
+                jira_work_items = jira_extractor.get_all_work_items(jira_work_items_last_sync.strftime('%Y-%m-%d'))
+                processed_jira_work_items = db.upsert_items(jira_work_items, db.work_items, 'work_item')
+                print(f"------>Processed {processed_jira_work_items} Jira work items")
+
+                print("------>Processing Jira work item state changes")
+                jira_extractor.handle_work_item_changes(jira_work_items, db)
+                print(f"------>Processed Jira state changes for {len(jira_work_items)} work items")
+
+                jira_issues = jira_extractor.get_work_items('Issue Report', jira_issues_last_sync.strftime('%Y-%m-%d'))
+                processed_jira_issues = db.upsert_items(jira_issues, db.issues, 'issue')
+                print(f"------>Processed {processed_jira_issues} Jira issues")
+
+                jira_bugs = jira_extractor.get_work_items('Bug', jira_bugs_last_sync.strftime('%Y-%m-%d'))
+                processed_jira_bugs = db.upsert_items(jira_bugs, db.bugs, 'bug')
+                print(f"------>Processed {processed_jira_bugs} Jira bugs")
+                processed_jira_bug_work_items = db.upsert_items(jira_bugs, db.work_items, 'work_item')
+                print(f"------>Refreshed {processed_jira_bug_work_items} Jira bugs in work_items")
+
+                print("------>Processing Jira bug state changes")
+                jira_extractor.handle_bug_changes(jira_bugs, db)
+                print(f"------>Processed Jira state changes for {len(jira_bugs)} bugs")
+
+                jira_extractor.normalize_existing_jira_states(db)
+                print("------>Normalized existing Jira states to ADO values")
+
+                processed_jira_sprints = jira_extractor.update_sprints()
+                processed_jira_capacities = jira_extractor.update_sprint_capacities(current_sprint_only=True)
+
             # Update GitHub Copilot metrics (if configured)
             # Uses org users-1-day usage reports + team membership (export_github_copilot).
             # Runs at most once per calendar day; daily window is a few days ending yesterday.
             processed_copilot = 0
-            if COPILOT_AVAILABLE:
+            if skip_github_metrics:
+                print("------>Skipping Copilot metrics")
+            elif COPILOT_AVAILABLE:
                 github_org = os.getenv('GITHUB_ORG')
                 github_teams = os.getenv('GITHUB_TEAMS')
                 github_team_sizes = os.getenv('GITHUB_TEAM_SIZES')
@@ -2535,7 +3298,9 @@ def main():
             # Update GitHub PR metrics (if configured)
             # PR metrics sync runs DAILY to avoid excessive API calls
             processed_prs = 0
-            if PR_METRICS_AVAILABLE:
+            if skip_github_metrics:
+                print("------>Skipping PR metrics")
+            elif PR_METRICS_AVAILABLE:
                 github_org = os.getenv('GITHUB_ORG')
                 github_pr_repos = os.getenv('GITHUB_PR_REPOS')  # Comma-separated list of repos
                 github_teams = os.getenv('GITHUB_TEAMS')
@@ -2570,7 +3335,9 @@ def main():
 
             # Update GitHub Actions test results (if configured)
             processed_tests = 0
-            if GITHUB_TESTS_AVAILABLE:
+            if skip_github_metrics:
+                print("------>Skipping GitHub tests")
+            elif GITHUB_TESTS_AVAILABLE:
                 # Support both new GITHUB_TEST_CONFIGS and legacy GITHUB_TEST_WORKFLOWS
                 github_test_configs = os.getenv('GITHUB_TEST_CONFIGS')
                 github_test_workflows = os.getenv('GITHUB_TEST_WORKFLOWS')
@@ -2615,6 +3382,21 @@ def main():
             if processed_capacities > 0:
                 db.update_sync_status('sprint_capacity', processed_capacities)
 
+            if processed_jira_issues > 0:
+                db.update_sync_status('jira_issue', processed_jira_issues)
+
+            if processed_jira_bugs > 0:
+                db.update_sync_status('jira_bug', processed_jira_bugs)
+
+            if processed_jira_work_items > 0:
+                db.update_sync_status('jira_work_item', processed_jira_work_items)
+
+            if processed_jira_sprints > 0:
+                db.update_sync_status('jira_sprint', processed_jira_sprints)
+
+            if processed_jira_capacities > 0:
+                db.update_sync_status('jira_sprint_capacity', processed_jira_capacities)
+
             if processed_copilot > 0:
                 db.update_sync_status('copilot_metrics', processed_copilot)
 
@@ -2631,6 +3413,9 @@ def main():
 
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"=== Sync cycle completed at {current_time} ===")
+            if run_once:
+                print("Single sync cycle completed; exiting")
+                break
             print(f"Sleeping for {SLEEP_INTERVAL/60} minutes...\n")
             
             time.sleep(SLEEP_INTERVAL)
