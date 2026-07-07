@@ -35,6 +35,13 @@ try:
 except ImportError:
     PR_METRICS_AVAILABLE = False
 
+# Import Azure cost metrics extractor
+try:
+    from export_azure_cost import AzureCostExtractor, should_sync_azure_cost
+    AZURE_COST_AVAILABLE = True
+except ImportError:
+    AZURE_COST_AVAILABLE = False
+
 # Load environment variables from .env file
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
@@ -501,6 +508,15 @@ class DatabaseConnection:
             
             # If no sync history, default to March 1st, 2025
             return datetime(2025, 3, 1)
+
+    def has_entity_sync_history(self, entity_type):
+        """Return True if at least one successful sync exists for the entity type."""
+        with self.engine.connect() as connection:
+            result = connection.execute(
+                text("SELECT 1 FROM sync_status WHERE entity_type = :entity_type LIMIT 1"),
+                {"entity_type": entity_type}
+            ).first()
+            return result is not None
 
     def get_last_full_sync_time(self):
         """Get the last full sync time (weekly full sync)"""
@@ -2460,10 +2476,12 @@ class ADOExtractor:
 class JIRAExtractor:
     """Jira implementation that emits ADO-compatible item dictionaries."""
 
-    def __init__(self, jira_url, project_key, email, api_token, board_id=None):
+    def __init__(self, jira_url, project_key, email, api_token, board_id=None, board_ids=None):
         self.jira_url = jira_url.rstrip('/')
         self.project_key = project_key
         self.board_id = board_id
+        self.board_ids = board_ids
+        self._boards_cache = None
         auth_string = f"{email}:{api_token}"
         auth_b64 = base64.b64encode(auth_string.encode('ascii')).decode('ascii')
         self.headers = {
@@ -2472,6 +2490,9 @@ class JIRAExtractor:
         }
 
         self.sprint_field = os.getenv('JIRA_SPRINT_FIELD_ID', 'customfield_10020')
+        self.story_points_field = os.getenv('JIRA_STORY_POINTS_FIELD_ID', 'customfield_10037')
+        self.ado_work_item_id_field = os.getenv('JIRA_ADO_WORK_ITEM_ID_FIELD_ID', 'customfield_12495')
+        self._done_statuses = {'done', 'closed'}
         self.customer_name_fields = [
             os.getenv('JIRA_NEXUS_CUSTOMER_NAME_FIELD_ID', 'customfield_12470'),
             os.getenv('JIRA_CUSTOMER_NAME_FIELD_ID', 'customfield_10360'),
@@ -2629,25 +2650,22 @@ class JIRAExtractor:
         print(f"Warning: unknown Jira state '{state_name}', keeping original value")
         return state_text
 
-    def _get_comments_text(self, jira_key):
-        comments_data = self._request_json(f"/rest/api/3/issue/{jira_key}/comment", {"maxResults": 100}) or {}
-        comments = []
-        for comment in comments_data.get('comments', []):
-            comments.append(self._adf_to_text(comment.get('body')))
-        return comments
+    def _extract_migrated_ado_id(self, fields):
+        raw_value = fields.get(self.ado_work_item_id_field)
+        if raw_value in (None, '', [], {}):
+            return None
+        try:
+            if isinstance(raw_value, str):
+                raw_value = raw_value.replace(',', '').strip()
+            return int(float(raw_value))
+        except (TypeError, ValueError):
+            print(f"Warning: could not parse ADO work item id from {self.ado_work_item_id_field}: {raw_value}")
+            return None
 
-    def _extract_migrated_ado_id(self, comments):
-        for comment in comments:
-            if 'ADO Work Item History' not in comment and 'Work Item:' not in comment:
-                continue
-            match = re.search(r'Work Item:\s*(\d+)', comment)
-            if match:
-                return int(match.group(1))
-        return None
-
-    def _compatibility_id(self, issue, comments, table_name):
+    def _compatibility_id(self, issue, table_name):
         jira_key = issue.get('key')
-        migrated_ado_id = self._extract_migrated_ado_id(comments)
+        fields = issue.get('fields', {})
+        migrated_ado_id = self._extract_migrated_ado_id(fields)
         if migrated_ado_id:
             return migrated_ado_id
 
@@ -2693,7 +2711,6 @@ class JIRAExtractor:
 
     def _base_item_data(self, issue, table_name):
         fields = issue["fields"]
-        comments = self._get_comments_text(issue["key"])
         assignee = fields.get("assignee")
         creator = fields.get("creator") or fields.get("reporter")
         priority = fields.get("priority")
@@ -2704,7 +2721,7 @@ class JIRAExtractor:
         target_date = self._parse_jira_date(self._extract_value(fields, self.target_date_field) or fields.get('duedate'))
 
         return {
-            'ID': self._compatibility_id(issue, comments, table_name),
+            'ID': self._compatibility_id(issue, table_name),
             'JiraID': issue["key"],
             'Source': 'JIRA',
             'Title': fields.get("summary", ""),
@@ -2911,6 +2928,7 @@ class JIRAExtractor:
             self.effort_dev_estimate_field, self.effort_dev_actual_field,
             self.qa_effort_estimation_field, self.qa_effort_actual_field,
             self.tshirt_estimation_field, self.ticket_type_field, self.freshdesk_ticket_field,
+            self.ado_work_item_id_field,
             *self.target_version_fields, *self.connector_fields, self.blocker_field,
             self.business_value_field, self.business_outcome_field
         }
@@ -3027,40 +3045,229 @@ class JIRAExtractor:
                 print(f"Error normalizing existing Jira states: {str(e)}")
                 connection.rollback()
 
-    def update_sprints(self):
-        if not self.board_id:
-            print("------>Skipping Jira sprints sync; no board id configured")
-            return 0
-        print(f"------>Fetching Jira sprints for board {self.board_id}")
+    def _resolve_boards(self):
+        """Resolve Jira boards to sync (explicit IDs, env list, or project auto-discovery)."""
+        if self._boards_cache is not None:
+            return self._boards_cache
+
+        boards = []
+        explicit_ids = self.board_ids
+        if not explicit_ids:
+            env_ids = os.getenv('JIRA_NEXUS_BOARD_IDS', '').strip()
+            if env_ids:
+                explicit_ids = [board_id.strip() for board_id in env_ids.split(',') if board_id.strip()]
+
+        if explicit_ids:
+            for board_id in explicit_ids:
+                board_data = self._request_json(f"/rest/agile/1.0/board/{board_id}") or {}
+                boards.append({
+                    'id': str(board_id),
+                    'name': board_data.get('name', f"Board {board_id}"),
+                })
+        else:
+            start_at = 0
+            while True:
+                data = self._request_json(
+                    "/rest/agile/1.0/board",
+                    {
+                        'projectKeyOrId': self.project_key,
+                        'startAt': start_at,
+                        'maxResults': 50,
+                    },
+                ) or {}
+                for board in data.get('values', []):
+                    boards.append({
+                        'id': str(board.get('id')),
+                        'name': board.get('name', f"Board {board.get('id')}"),
+                    })
+                if data.get('isLast', True):
+                    break
+                start_at += data.get('maxResults', 50)
+
+        if not boards and self.board_id:
+            board_data = self._request_json(f"/rest/agile/1.0/board/{self.board_id}") or {}
+            boards.append({
+                'id': str(self.board_id),
+                'name': board_data.get('name', f"Board {self.board_id}"),
+            })
+
+        self._boards_cache = boards
+        return boards
+
+    def _fetch_sprints_for_board(self, board_id, board_name):
+        """Fetch all sprints for a board via GET /rest/agile/1.0/board/{boardId}/sprint."""
         sprints = []
         start_at = 0
         while True:
             data = self._request_json(
-                f"/rest/agile/1.0/board/{self.board_id}/sprint",
-                {"startAt": start_at, "maxResults": 50, "state": "active,future,closed"}
+                f"/rest/agile/1.0/board/{board_id}/sprint",
+                {
+                    'startAt': start_at,
+                    'maxResults': 50,
+                    'state': 'active,future,closed',
+                },
             ) or {}
             for sprint in data.get('values', []):
+                sprint_name = sprint.get('name', '')
                 sprints.append({
                     'id': str(sprint.get('id')),
-                    'name': sprint.get('name', ''),
-                    'path': f"JIRA/{self.project_key}/{sprint.get('name', '')}",
+                    'name': sprint_name,
+                    'path': f"JIRA/{self.project_key}/{board_name}/{sprint_name}",
                     'start_date': self._parse_jira_date(sprint.get('startDate')) if sprint.get('startDate') else None,
                     'finish_date': self._parse_jira_date(sprint.get('endDate')) if sprint.get('endDate') else None,
-                    'state': sprint.get('state', '')
+                    'state': sprint.get('state', ''),
+                    'board_id': str(board_id),
+                    'board_name': board_name,
                 })
             if data.get('isLast', True):
                 break
             start_at += data.get('maxResults', 50)
+        return sprints
+
+    def _story_points(self, fields):
+        raw_value = fields.get(self.story_points_field)
+        if raw_value in (None, ''):
+            return 0.0
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fetch_sprint_issue_capacities(self, board, sprint_meta):
+        """Derive per-member sprint load from issues in the sprint (Jira has no ADO-style capacity API)."""
+        sprint_id = sprint_meta['id']
+        sprint_name = sprint_meta['name']
+        fields_param = f"assignee,status,{self.story_points_field}"
+        member_totals = {}
+        start_at = 0
+
+        while True:
+            data = self._request_json(
+                f"/rest/agile/1.0/sprint/{sprint_id}/issue",
+                {
+                    'startAt': start_at,
+                    'maxResults': 50,
+                    'fields': fields_param,
+                },
+            ) or {}
+            for issue in data.get('issues', []):
+                fields = issue.get('fields', {})
+                assignee = fields.get('assignee') or {}
+                member_id = assignee.get('accountId') or 'unassigned'
+                member_name = assignee.get('displayName') or 'Unassigned'
+                points = self._story_points(fields)
+                status_name = (fields.get('status') or {}).get('name', '')
+                is_done = status_name.strip().lower() in self._done_statuses
+
+                if member_id not in member_totals:
+                    member_totals[member_id] = {
+                        'name': member_name,
+                        'committed': 0.0,
+                        'completed': 0.0,
+                    }
+                member_totals[member_id]['committed'] += points
+                if is_done:
+                    member_totals[member_id]['completed'] += points
+
+            if data.get('isLast', True):
+                break
+            start_at += data.get('maxResults', 50)
+            time.sleep(0.2)
+
+        capacities = []
+        for member_id, totals in member_totals.items():
+            capacities.append({
+                'sprint_id': sprint_id,
+                'sprint_name': sprint_name,
+                'team_member_id': member_id,
+                'team_member_name': totals['name'],
+                'activity': 'Story Points (committed)',
+                'capacity_per_day': totals['committed'],
+                'days_off_count': 0,
+                'days_off_start': None,
+                'days_off_end': None,
+                'project_name': self.project_key,
+                'team_name': board['name'],
+            })
+            capacities.append({
+                'sprint_id': sprint_id,
+                'sprint_name': sprint_name,
+                'team_member_id': member_id,
+                'team_member_name': totals['name'],
+                'activity': 'Story Points (completed)',
+                'capacity_per_day': totals['completed'],
+                'days_off_count': 0,
+                'days_off_start': None,
+                'days_off_end': None,
+                'project_name': self.project_key,
+                'team_name': board['name'],
+            })
+        return capacities
+
+    def update_sprints(self):
+        boards = self._resolve_boards()
+        if not boards:
+            print("------>Skipping Jira sprints sync; no boards configured or discovered")
+            return 0
+
+        all_sprints = []
+        seen_ids = set()
+        for board in boards:
+            print(f"------>Fetching Jira sprints for board {board['name']} ({board['id']})")
+            board_sprints = self._fetch_sprints_for_board(board['id'], board['name'])
+            print(f"------>Found {len(board_sprints)} sprints for board {board['name']}")
+            for sprint in board_sprints:
+                if sprint['id'] in seen_ids:
+                    continue
+                seen_ids.add(sprint['id'])
+                all_sprints.append({
+                    'id': sprint['id'],
+                    'name': sprint['name'],
+                    'path': sprint['path'],
+                    'start_date': sprint['start_date'],
+                    'finish_date': sprint['finish_date'],
+                    'state': sprint['state'],
+                })
 
         if hasattr(self, 'db_connection') and self.db_connection:
-            processed_count = self.db_connection.upsert_sprints(sprints)
-            print(f"------>Processed {processed_count} Jira sprints")
+            processed_count = self.db_connection.upsert_sprints(all_sprints)
+            print(f"------>Processed {processed_count} Jira sprints from {len(boards)} board(s)")
             return processed_count
         return 0
 
     def update_sprint_capacities(self, current_sprint_only=True):
-        print("------>Skipping Jira sprint capacity sync; Jira does not expose ADO-style team capacity")
+        boards = self._resolve_boards()
+        if not boards:
+            print("------>Skipping Jira sprint capacity sync; no boards configured or discovered")
+            return 0
+
+        print(f"------>Fetching Jira sprint capacities from {len(boards)} board(s)")
+        all_capacities = []
+        for board in boards:
+            board_sprints = self._fetch_sprints_for_board(board['id'], board['name'])
+            sprints_to_process = board_sprints
+            if current_sprint_only:
+                sprints_to_process = [sprint for sprint in board_sprints if sprint.get('state') == 'active']
+
+            print(
+                f"------>Processing capacities for {len(sprints_to_process)} sprint(s) "
+                f"on board {board['name']}"
+            )
+            for sprint in sprints_to_process:
+                sprint_capacities = self._fetch_sprint_issue_capacities(board, sprint)
+                all_capacities.extend(sprint_capacities)
+
+        if hasattr(self, 'db_connection') and self.db_connection:
+            processed_count = self.db_connection.upsert_sprint_capacities(all_capacities)
+            print(f"------>Processed {processed_count} Jira sprint capacity records from {len(boards)} board(s)")
+            return processed_count
         return 0
+
+def get_jira_initial_sync_date():
+  """First Jira sync window (default: 3 months back)."""
+  months = int(os.getenv('JIRA_INITIAL_SYNC_MONTHS', '3'))
+  return datetime.now() - timedelta(days=months * 30)
+
 
 def main():
     # Load configuration from .env file
@@ -3068,24 +3275,35 @@ def main():
     project = os.getenv('ADO_PROJECT')
     scrum_project = os.getenv('ADO_SCRUM_PROJECT')
     pat = os.getenv('ADO_PERSONAL_ACCESS_TOKEN')
-    
-    if not all([organization, project, pat]):
-        raise ValueError("Please check your .env file and ensure ADO_ORGANIZATION, ADO_PROJECT, and ADO_PERSONAL_ACCESS_TOKEN are set")
 
-    if pat == "your-pat-token-here":
-        raise ValueError("Please update the ADO_PERSONAL_ACCESS_TOKEN in your .env file with your actual PAT")
-
-    # Initialize extractor and database connection
-    extractor = ADOExtractor(organization, project, pat, scrum_project)
-    db = get_database_connection()
-    
-    # Set the database connection for the extractor
-    extractor.db_connection = db
+    include_ado = os.getenv('INCLUDE_ADO', 'true').lower() in ('1', 'true', 'yes')
+    if '--skip-ado' in sys.argv:
+        include_ado = False
+    elif '--include-ado' in sys.argv:
+        include_ado = True
 
     include_jira = os.getenv('INCLUDE_JIRA', 'false').lower() in ('1', 'true', 'yes') or '--include-jira' in sys.argv
+
+    if not include_ado and not include_jira:
+        raise ValueError("At least one of INCLUDE_ADO or INCLUDE_JIRA must be enabled")
+
+    db = get_database_connection()
+
+    extractor = None
+    if include_ado:
+        if not all([organization, project, pat]):
+            raise ValueError("Please check your .env file and ensure ADO_ORGANIZATION, ADO_PROJECT, and ADO_PERSONAL_ACCESS_TOKEN are set")
+
+        if pat == "your-pat-token-here":
+            raise ValueError("Please update the ADO_PERSONAL_ACCESS_TOKEN in your .env file with your actual PAT")
+
+        extractor = ADOExtractor(organization, project, pat, scrum_project)
+        extractor.db_connection = db
+
     run_once = os.getenv('RUN_ONCE', 'false').lower() in ('1', 'true', 'yes') or '--once' in sys.argv
     skip_ado_history = os.getenv('SKIP_ADO_HISTORY', 'false').lower() in ('1', 'true', 'yes') or '--skip-ado-history' in sys.argv
     skip_github_metrics = os.getenv('SKIP_GITHUB_METRICS', 'false').lower() in ('1', 'true', 'yes') or '--skip-github-metrics' in sys.argv
+    include_azure_cost = os.getenv('INCLUDE_AZURE_COST', 'false').lower() in ('1', 'true', 'yes') or '--include-azure-cost' in sys.argv
     jira_extractor = None
     if include_jira:
         jira_url = os.getenv('JIRA_CLOUD_URL')
@@ -3093,11 +3311,16 @@ def main():
         jira_email = os.getenv('JIRA_USER_EMAIL')
         jira_token = os.getenv('JIRA_API_TOKEN')
         jira_board_id = os.getenv('JIRA_NEXUS_BOARD_ID', '1766')
+        board_ids_env = os.getenv('JIRA_NEXUS_BOARD_IDS', '').strip()
+        board_ids = [board_id.strip() for board_id in board_ids_env.split(',') if board_id.strip()] if board_ids_env else None
         if not all([jira_url, jira_project, jira_email, jira_token]):
             raise ValueError("INCLUDE_JIRA is enabled, but JIRA_CLOUD_URL, JIRA_NEXUS_PROJECT_KEY/JIRA_PROJECT_KEY, JIRA_USER_EMAIL, or JIRA_API_TOKEN is missing")
-        jira_extractor = JIRAExtractor(jira_url, jira_project, jira_email, jira_token, jira_board_id)
+        jira_extractor = JIRAExtractor(jira_url, jira_project, jira_email, jira_token, jira_board_id, board_ids=board_ids)
         jira_extractor.db_connection = db
-        print(f"------>Jira sync enabled for project {jira_project}, board {jira_board_id}")
+        if board_ids:
+            print(f"------>Jira sync enabled for project {jira_project}, boards {board_ids}")
+        else:
+            print(f"------>Jira sync enabled for project {jira_project}, auto-discovering boards (fallback board {jira_board_id})")
 
     # Process bugs from CSV file
     # bugs_csv_file_path = '/Users/haviv_rosh/work/scripts_python/metabase/bugs_202503011913.csv'
@@ -3116,10 +3339,18 @@ def main():
     print(f"Starting continuous sync with {SLEEP_INTERVAL/60} minute intervals")
     if run_once:
         print("Running a single sync cycle (--once/RUN_ONCE enabled)")
+    if include_ado:
+        print("ADO sync enabled (INCLUDE_ADO=true)")
+    else:
+        print("ADO sync disabled (INCLUDE_ADO=false)")
+    if include_jira:
+        print("Jira sync enabled (INCLUDE_JIRA=true)")
     if skip_ado_history:
         print("Skipping ADO change-history refresh (--skip-ado-history/SKIP_ADO_HISTORY enabled)")
     if skip_github_metrics:
         print("Skipping GitHub metric refresh (--skip-github-metrics/SKIP_GITHUB_METRICS enabled)")
+    if include_azure_cost:
+        print("Azure cost sync enabled (--include-azure-cost/INCLUDE_AZURE_COST)")
     print("Press Ctrl+C to stop the program")
     
     while True:
@@ -3153,67 +3384,73 @@ def main():
                 else:
                     print(f"------>Last full sync was {days_since_full_sync} days ago. Running delta sync")
             
-            # Get last sync times from database
-            issues_last_sync = db.get_last_sync_time('issue')
-            bugs_last_sync = db.get_last_sync_time('bug')
-            work_items_last_sync = db.get_last_sync_time('work_item')
-            
-            # Override with full sync date if needed
-            if should_run_full_sync:
-                issues_last_sync = sync_date_override
-                bugs_last_sync = sync_date_override
-                work_items_last_sync = sync_date_override
-                print(f"------>Using sync date: {sync_date_override.strftime('%Y-%m-%d')} (1 month back)")
-            
-            # Extract and store all work items first
-            work_items = extractor.get_all_work_items(work_items_last_sync.strftime('%Y-%m-%d'))
-            processed_work_items = db.upsert_items(work_items, db.work_items, 'work_item')
-            print(f"------>Processed {processed_work_items} work items")
+            processed_issues = 0
+            processed_bugs = 0
+            processed_work_items = 0
+            processed_sprints = 0
+            processed_capacities = 0
 
-            # Process state changes for all work items
-            if skip_ado_history:
-                print("------>Skipping ADO work item state changes")
+            if include_ado:
+                # Get last sync times from database
+                issues_last_sync = db.get_last_sync_time('issue')
+                bugs_last_sync = db.get_last_sync_time('bug')
+                work_items_last_sync = db.get_last_sync_time('work_item')
+
+                # Override with full sync date if needed
+                if should_run_full_sync:
+                    issues_last_sync = sync_date_override
+                    bugs_last_sync = sync_date_override
+                    work_items_last_sync = sync_date_override
+                    print(f"------>Using ADO sync date: {sync_date_override.strftime('%Y-%m-%d')} (1 month back)")
+
+                # Extract and store all work items first
+                work_items = extractor.get_all_work_items(work_items_last_sync.strftime('%Y-%m-%d'))
+                processed_work_items = db.upsert_items(work_items, db.work_items, 'work_item')
+                print(f"------>Processed {processed_work_items} work items")
+
+                # Process state changes for all work items
+                if skip_ado_history:
+                    print("------>Skipping ADO work item state changes")
+                else:
+                    print("------>Processing work item state changes")
+                    extractor.handle_work_item_changes(work_items, db)
+                    print(f"------>Processed state changes for {len(work_items)} work items")
+
+                # Extract and store issues
+                issues = extractor.get_work_items('Issue Report', issues_last_sync.strftime('%Y-%m-%d'))
+                processed_issues = db.upsert_items(issues, db.issues, 'issue')
+                print(f"------>Processed {processed_issues} issues")
+
+                # Extract and store bugs with parent relationships
+                bugs = extractor.get_work_items('Bug', bugs_last_sync.strftime('%Y-%m-%d'))
+                processed_bugs = db.upsert_items(bugs, db.bugs, 'bug')
+                print(f"------>Processed {processed_bugs} bugs")
+
+                # Process state changes for all bugs at once
+                if skip_ado_history:
+                    print("------>Skipping ADO bug state changes")
+                else:
+                    print("------>Processing bug state changes")
+                    extractor.handle_bug_changes(bugs, db)
+                    print(f"------>Processed state changes for {len(bugs)} bugs")
+
+                # Clean up invalid parent issue references
+                print("------>Cleaning up invalid parent issue references")
+                db.update_parent_issue()
+
+                # Update sprints
+                processed_sprints = extractor.update_sprints()
+
+                # Update sprint capacities
+                last_capacity_sync = db.get_last_sprint_capacity_sync()
+                if last_capacity_sync is None:
+                    print("------>First sprint capacity sync - fetching all historical data")
+                    processed_capacities = extractor.update_sprint_capacities(current_sprint_only=False)
+                else:
+                    print("------>Daily sprint capacity sync - fetching current sprint only")
+                    processed_capacities = extractor.update_sprint_capacities(current_sprint_only=True)
             else:
-                print("------>Processing work item state changes")
-                extractor.handle_work_item_changes(work_items, db)
-                print(f"------>Processed state changes for {len(work_items)} work items")
-            
-            # Extract and store issues
-            issues = extractor.get_work_items('Issue Report', issues_last_sync.strftime('%Y-%m-%d'))
-            processed_issues = db.upsert_items(issues, db.issues, 'issue')
-            print(f"------>Processed {processed_issues} issues")
-            
-            # Extract and store bugs with parent relationships
-            bugs = extractor.get_work_items('Bug', bugs_last_sync.strftime('%Y-%m-%d'))
-            processed_bugs = db.upsert_items(bugs, db.bugs, 'bug')
-            print(f"------>Processed {processed_bugs} bugs")
-
-            # Process state changes for all bugs at once
-            if skip_ado_history:
-                print("------>Skipping ADO bug state changes")
-            else:
-                print("------>Processing bug state changes")
-                extractor.handle_bug_changes(bugs, db)
-                print(f"------>Processed state changes for {len(bugs)} bugs")
-
-            # Clean up invalid parent issue references
-            print("------>Cleaning up invalid parent issue references")
-            db.update_parent_issue()
-
-            # Update sprints
-            processed_sprints = extractor.update_sprints()
-
-            # Update sprint capacities
-            # Check if this is the first sprint capacity sync
-            last_capacity_sync = db.get_last_sprint_capacity_sync()
-            if last_capacity_sync is None:
-                # First run - sync all historical sprint capacities
-                print("------>First sprint capacity sync - fetching all historical data")
-                processed_capacities = extractor.update_sprint_capacities(current_sprint_only=False)
-            else:
-                # Daily run - only sync current sprint capacity
-                print("------>Daily sprint capacity sync - fetching current sprint only")
-                processed_capacities = extractor.update_sprint_capacities(current_sprint_only=True)
+                print("------>Skipping ADO sync (INCLUDE_ADO=false)")
 
             processed_jira_work_items = 0
             processed_jira_issues = 0
@@ -3222,14 +3459,21 @@ def main():
             processed_jira_capacities = 0
 
             if include_jira and jira_extractor:
-                jira_work_items_last_sync = db.get_last_sync_time('jira_work_item')
-                jira_issues_last_sync = db.get_last_sync_time('jira_issue')
-                jira_bugs_last_sync = db.get_last_sync_time('jira_bug')
+                if not db.has_entity_sync_history('jira_work_item'):
+                    jira_sync_from = get_jira_initial_sync_date()
+                    print(
+                        f"------>First Jira sync — fetching all issues updated since "
+                        f"{jira_sync_from.strftime('%Y-%m-%d')}"
+                    )
+                elif should_run_full_sync:
+                    jira_sync_from = sync_date_override
+                    print(f"------>Using Jira full sync date: {jira_sync_from.strftime('%Y-%m-%d')}")
+                else:
+                    jira_sync_from = db.get_last_sync_time('jira_work_item')
 
-                if should_run_full_sync:
-                    jira_work_items_last_sync = sync_date_override
-                    jira_issues_last_sync = sync_date_override
-                    jira_bugs_last_sync = sync_date_override
+                jira_work_items_last_sync = jira_sync_from
+                jira_issues_last_sync = jira_sync_from
+                jira_bugs_last_sync = jira_sync_from
 
                 jira_work_items = jira_extractor.get_all_work_items(jira_work_items_last_sync.strftime('%Y-%m-%d'))
                 processed_jira_work_items = db.upsert_items(jira_work_items, db.work_items, 'work_item')
@@ -3257,7 +3501,11 @@ def main():
                 print("------>Normalized existing Jira states to ADO values")
 
                 processed_jira_sprints = jira_extractor.update_sprints()
-                processed_jira_capacities = jira_extractor.update_sprint_capacities(current_sprint_only=True)
+                if not db.has_entity_sync_history('jira_sprint_capacity'):
+                    print("------>First Jira sprint capacity sync - fetching all boards/sprints")
+                    processed_jira_capacities = jira_extractor.update_sprint_capacities(current_sprint_only=False)
+                else:
+                    processed_jira_capacities = jira_extractor.update_sprint_capacities(current_sprint_only=True)
 
             # Update GitHub Copilot metrics (if configured)
             # Uses org users-1-day usage reports + team membership (export_github_copilot).
@@ -3362,6 +3610,28 @@ def main():
                 else:
                     print("------>Skipping GitHub tests (GITHUB_TOKEN or GITHUB_TEST_CONFIGS not configured)")
 
+            # Azure subscription cost + tenant metrics (daily, at most once per 24h)
+            processed_azure_cost = 0
+            if include_azure_cost and AZURE_COST_AVAILABLE:
+                last_azure_cost_sync = db.get_last_sync_time('azure_cost')
+                min_sync_hours = int(os.getenv('AZURE_COST_MIN_SYNC_HOURS', '24'))
+                if should_sync_azure_cost(last_azure_cost_sync, min_sync_hours):
+                    print("------>Syncing Azure subscription cost metrics")
+                    try:
+                        azure_cost_extractor = AzureCostExtractor()
+                        processed_azure_cost = azure_cost_extractor.sync_to_database(db)
+                        print(f"------>Processed {processed_azure_cost} Azure cost records")
+                    except Exception as e:
+                        print(f"------>Error syncing Azure cost metrics: {str(e)}")
+                else:
+                    hours_since = (datetime.now() - last_azure_cost_sync).total_seconds() / 3600
+                    print(
+                        f"------>Skipping Azure cost metrics "
+                        f"(last sync {hours_since:.1f}h ago; min interval {min_sync_hours}h)"
+                    )
+            elif include_azure_cost and not AZURE_COST_AVAILABLE:
+                print("------>Skipping Azure cost metrics (export_azure_cost not available)")
+
             # Update history snapshots
             db.update_history_snapshots()
             print("------>Updated history snapshots")
@@ -3405,6 +3675,9 @@ def main():
 
             if processed_tests > 0:
                 db.update_sync_status('github_tests', processed_tests)
+
+            if processed_azure_cost > 0:
+                db.update_sync_status('azure_cost', processed_azure_cost)
 
             # Update full sync status if we ran a full sync
             if should_run_full_sync:
