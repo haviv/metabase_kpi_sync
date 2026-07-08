@@ -144,6 +144,62 @@ class DatabaseConnection:
             connection.rollback()
             raise
 
+    def update_jira_parent_links(self, items):
+        """Resolve Jira parent keys to numeric parent IDs after all items are upserted."""
+        if not items:
+            return 0
+
+        updated = 0
+        with self.engine.connect() as connection:
+            try:
+                for item in items:
+                    parent_key = item.get('ParentJiraKey')
+                    if not parent_key:
+                        continue
+
+                    parent_id = None
+                    for table_name in ('bugs', 'work_items', 'issues'):
+                        parent_row = connection.execute(
+                            text(f"SELECT id FROM {table_name} WHERE jira_id = :jira_id"),
+                            {"jira_id": parent_key},
+                        ).first()
+                        if parent_row:
+                            parent_id = parent_row[0]
+                            break
+                    if not parent_id:
+                        continue
+
+                    work_item_type = item.get('WorkItemType', '')
+                    if work_item_type == 'Bug':
+                        result = connection.execute(
+                            text("""
+                                UPDATE bugs
+                                SET parent_issue = :parent_id
+                                WHERE id = :id
+                                  AND COALESCE(parent_issue, -1) <> :parent_id
+                            """),
+                            {"id": item['ID'], "parent_id": parent_id},
+                        )
+                    else:
+                        result = connection.execute(
+                            text("""
+                                UPDATE work_items
+                                SET parent_work_item = :parent_id
+                                WHERE id = :id
+                                  AND COALESCE(parent_work_item, -1) <> :parent_id
+                            """),
+                            {"id": item['ID'], "parent_id": parent_id},
+                        )
+                    updated += result.rowcount
+                connection.commit()
+            except SQLAlchemyError as e:
+                print(f"Error updating Jira parent links: {str(e)}")
+                connection.rollback()
+                raise
+        if updated:
+            print(f"Updated {updated} Jira records with resolved parent links")
+        return updated
+
     def _add_new_columns(self, connection, table_name):
         """Add new columns to existing tables if they don't exist"""
         inspector = inspect(self.engine)
@@ -679,10 +735,43 @@ class DatabaseConnection:
                             item[date_field] = parsed_date
 
                     # Check if item exists
+                    existing_columns = "jira_id, source"
+                    if item.get('Source') == 'JIRA':
+                        if item_type == 'work_item':
+                            existing_columns += ", area_path, iteration_path, parent_work_item"
+                        elif item_type == 'bug':
+                            existing_columns += ", area_path, iteration_path, parent_issue"
+                        else:
+                            existing_columns += ", area_path, iteration_path"
                     result = connection.execute(
-                        text(f"SELECT jira_id, source FROM {table.name} WHERE id = :id"),
+                        text(f"SELECT {existing_columns} FROM {table.name} WHERE id = :id"),
                         {"id": item['ID']}
                     ).first()
+
+                    if result and item.get('Source') == 'JIRA':
+                        existing_area = result[2] if len(result) > 2 else None
+                        existing_iteration = result[3] if len(result) > 3 else None
+                        if not item.get('AreaPath') and existing_area:
+                            item['AreaPath'] = existing_area
+                        elif (
+                            existing_area
+                            and item.get('AreaPath')
+                            and '\\' not in item['AreaPath']
+                            and (
+                                existing_area.endswith(f"\\{item['AreaPath']}")
+                                or existing_area == item['AreaPath']
+                            )
+                        ):
+                            item['AreaPath'] = existing_area
+                        if not item.get('IterationPath') and existing_iteration:
+                            item['IterationPath'] = existing_iteration
+                        elif (
+                            existing_iteration
+                            and item.get('IterationPath')
+                            and '\\' not in item['IterationPath']
+                            and existing_iteration.endswith(item['IterationPath'])
+                        ):
+                            item['IterationPath'] = existing_iteration
 
                     if result:
                         if item.get('Source', 'ADO') != 'JIRA' and result[0]:
@@ -857,13 +946,26 @@ class DatabaseConnection:
         with self.engine.connect() as connection:
             for sprint in sprints:
                 try:
-                    # Check if sprint exists
+                    sprint_id = sprint['id']
                     result = connection.execute(
+                        text("""
+                            SELECT id FROM sprints
+                            WHERE path = :path
+                               OR (name = :name AND path NOT LIKE 'JIRA/%')
+                            ORDER BY CASE WHEN path = :path THEN 0 ELSE 1 END
+                            LIMIT 1
+                        """),
+                        {"path": sprint['path'], "name": sprint['name']},
+                    ).first()
+                    if result:
+                        sprint_id = result[0]
+
+                    existing = connection.execute(
                         text("SELECT id FROM sprints WHERE id = :id"),
-                        {"id": sprint['id']}
+                        {"id": sprint_id}
                     ).first()
 
-                    if result:
+                    if existing:
                         # Update existing sprint
                         connection.execute(
                             text("""
@@ -877,7 +979,7 @@ class DatabaseConnection:
                                 WHERE id = :id
                             """),
                             {
-                                "id": sprint['id'],
+                                "id": sprint_id,
                                 "name": sprint['name'],
                                 "path": sprint['path'],
                                 "start_date": sprint['start_date'],
@@ -893,7 +995,7 @@ class DatabaseConnection:
                                 VALUES (:id, :name, :path, :start_date, :finish_date, :state)
                             """),
                             {
-                                "id": sprint['id'],
+                                "id": sprint_id,
                                 "name": sprint['name'],
                                 "path": sprint['path'],
                                 "start_date": sprint['start_date'],
@@ -907,6 +1009,26 @@ class DatabaseConnection:
                 except SQLAlchemyError as e:
                     print(f"Error upserting sprint {sprint['id']}: {str(e)}")
                     connection.rollback()
+
+            try:
+                cleanup = connection.execute(
+                    text("""
+                        DELETE FROM sprints AS jira_sprint
+                        WHERE jira_sprint.path LIKE 'JIRA/%'
+                          AND EXISTS (
+                            SELECT 1
+                            FROM sprints AS ado_sprint
+                            WHERE ado_sprint.name = jira_sprint.name
+                              AND ado_sprint.path NOT LIKE 'JIRA/%'
+                          )
+                    """)
+                )
+                connection.commit()
+                if cleanup.rowcount:
+                    print(f"------>Removed {cleanup.rowcount} duplicate Jira sprint rows with ADO path equivalents")
+            except SQLAlchemyError as e:
+                print(f"Error cleaning duplicate Jira sprints: {str(e)}")
+                connection.rollback()
 
         return processed_count
 
@@ -2490,7 +2612,9 @@ class JIRAExtractor:
         }
 
         self.sprint_field = os.getenv('JIRA_SPRINT_FIELD_ID', 'customfield_10020')
+        self.area_path_field = os.getenv('JIRA_AREA_PATH_FIELD_ID', 'customfield_12494')
         self.story_points_field = os.getenv('JIRA_STORY_POINTS_FIELD_ID', 'customfield_10037')
+        self._area_path_cache = {}
         self.ado_work_item_id_field = os.getenv('JIRA_ADO_WORK_ITEM_ID_FIELD_ID', 'customfield_12495')
         self._done_statuses = {'done', 'closed'}
         self.customer_name_fields = [
@@ -2689,25 +2813,131 @@ class JIRAExtractor:
                     return fallback_id
         return jira_internal_id
 
-    def _sprint_names(self, fields):
+    def _board_name_map(self):
+        return {board['id']: board['name'] for board in self._resolve_boards()}
+
+    def _parse_ado_project_from_goal(self, goal):
+        if not goal:
+            return None
+        match = re.search(r'Migrated from ADO project:\s*(.+)', goal, re.IGNORECASE)
+        return match.group(1).strip() if match else None
+
+    def _ado_iteration_path(self, sprint_name, ado_project):
+        if not sprint_name:
+            return ''
+        if ado_project == 'PathlockGRC':
+            return f"PathlockGRC\\PLC Engineering Sprints\\{sprint_name}"
+        if ado_project == 'Flex Connectors':
+            return f"Flex Connectors\\{sprint_name}"
+        if ado_project:
+            return f"{ado_project}\\{sprint_name}"
+        return sprint_name
+
+    def _parse_sprint_entries(self, fields):
         sprint_val = fields.get(self.sprint_field) or fields.get('customfield_10020') or fields.get('sprint')
         if isinstance(sprint_val, dict):
-            return sprint_val.get('name', '')
+            return [sprint_val]
         if isinstance(sprint_val, list):
-            names = []
+            entries = []
             for sprint in sprint_val:
                 if isinstance(sprint, dict):
-                    name = sprint.get('name')
-                    if name:
-                        names.append(name)
+                    entries.append(sprint)
                 elif isinstance(sprint, str):
-                    match = re.search(r"name=([^,\]]+)", sprint)
-                    if match:
-                        names.append(match.group(1))
-            return ', '.join(names)
+                    match_id = re.search(r"id=(\d+)", sprint)
+                    match_name = re.search(r"name=([^,\]]+)", sprint)
+                    match_board = re.search(r"boardId=(\d+)", sprint)
+                    match_goal = re.search(r"goal=([^,\]]+)", sprint)
+                    if match_name:
+                        entries.append({
+                            'id': int(match_id.group(1)) if match_id else None,
+                            'name': match_name.group(1),
+                            'boardId': int(match_board.group(1)) if match_board else None,
+                            'goal': match_goal.group(1) if match_goal else '',
+                        })
+            return entries
         if isinstance(sprint_val, str):
-            return sprint_val
+            return [{'name': sprint_val}]
+        return []
+
+    def _iteration_path(self, fields):
+        entries = self._parse_sprint_entries(fields)
+        if not entries:
+            return ''
+        paths = []
+        for sprint in entries:
+            sprint_name = sprint.get('name', '')
+            if not sprint_name:
+                continue
+            ado_project = self._parse_ado_project_from_goal(sprint.get('goal', ''))
+            paths.append(self._ado_iteration_path(sprint_name, ado_project))
+        return ', '.join([path for path in paths if path])
+
+    def _lookup_ado_area_path(self, leaf):
+        if not leaf or '\\' in leaf:
+            return leaf
+        if leaf in self._area_path_cache:
+            return self._area_path_cache[leaf]
+        resolved = ''
+        if hasattr(self, 'db_connection') and self.db_connection:
+            with self.db_connection.engine.connect() as connection:
+                result = connection.execute(
+                    text("""
+                        SELECT area_path
+                        FROM work_items
+                        WHERE source = 'ADO'
+                          AND area_path LIKE :pattern
+                        GROUP BY area_path
+                        ORDER BY COUNT(*) DESC
+                        LIMIT 1
+                    """),
+                    {"pattern": f"%\\{leaf}"},
+                ).first()
+                if result and result[0]:
+                    resolved = result[0]
+        if not resolved:
+            if leaf.startswith('Connectors'):
+                resolved = f"Flex Connectors\\{leaf}"
+            else:
+                resolved = leaf
+        self._area_path_cache[leaf] = resolved
+        return resolved
+
+    def _area_path(self, fields, ado_project=None):
+        components = fields.get('components', [])
+        component_path = ", ".join([component.get("name", "") for component in components if component.get("name")])
+        jira_area = self._extract_value(fields, self.area_path_field) or ''
+        if jira_area:
+            if '\\' in jira_area:
+                return jira_area
+            return self._lookup_ado_area_path(jira_area)
+        if component_path:
+            return component_path
+        if ado_project == 'Flex Connectors':
+            return ''
         return ''
+
+    def _extract_parent_jira_key(self, fields):
+        parent = fields.get('parent')
+        if isinstance(parent, dict) and parent.get('key'):
+            return parent['key']
+        for link in fields.get('issuelinks', []) or []:
+            link_type = (link.get('type') or {}).get('name', '')
+            if link_type == 'Parent / Child' and link.get('inwardIssue'):
+                return link['inwardIssue'].get('key')
+        return None
+
+    def _resolve_parent_id(self, parent_jira_key):
+        if not parent_jira_key or not hasattr(self, 'db_connection') or not self.db_connection:
+            return None
+        with self.db_connection.engine.connect() as connection:
+            for table_name in ('bugs', 'work_items', 'issues'):
+                result = connection.execute(
+                    text(f"SELECT id FROM {table_name} WHERE jira_id = :jira_id"),
+                    {"jira_id": parent_jira_key},
+                ).first()
+                if result:
+                    return result[0]
+        return None
 
     def _base_item_data(self, issue, table_name):
         fields = issue["fields"]
@@ -2719,6 +2949,12 @@ class JIRAExtractor:
         labels = fields.get("labels", [])
         fix_versions = fields.get("fixVersions", [])
         target_date = self._parse_jira_date(self._extract_value(fields, self.target_date_field) or fields.get('duedate'))
+        sprint_entries = self._parse_sprint_entries(fields)
+        ado_project = None
+        if sprint_entries:
+            ado_project = self._parse_ado_project_from_goal(sprint_entries[0].get('goal', ''))
+        parent_jira_key = self._extract_parent_jira_key(fields)
+        parent_id = self._resolve_parent_id(parent_jira_key)
 
         return {
             'ID': self._compatibility_id(issue, table_name),
@@ -2730,10 +2966,10 @@ class JIRAExtractor:
             'Severity': self._normalize_priority_to_ado_severity(priority.get("name", "") if priority else ""),
             'State': self._normalize_jira_state_to_ado_state(status.get("name", "") if status else ""),
             'CustomerName': self._first_value(fields, self.customer_name_fields),
-            'AreaPath': ", ".join([component.get("name", "") for component in components if component.get("name")]),
+            'AreaPath': self._area_path(fields, ado_project),
             'CreatedDate': fields.get("created", ""),
             'ChangedDate': fields.get("updated", ""),
-            'IterationPath': self._sprint_names(fields),
+            'IterationPath': self._iteration_path(fields),
             'HotfixDeliveredVersion': self._extract_value(fields, self.hotfix_delivered_version_field) or '',
             'TargetDate': target_date,
             'HFStatus': self._extract_value(fields, self.hf_status_field) or '',
@@ -2744,7 +2980,9 @@ class JIRAExtractor:
             'QAEffortEstimation': self._extract_value(fields, self.qa_effort_estimation_field, 'number'),
             'QAEffortActual': self._extract_value(fields, self.qa_effort_actual_field, 'number'),
             'TShirtEstimation': self._extract_value(fields, self.tshirt_estimation_field) or '',
-            'ParentWorkItem': None,
+            'ParentWorkItem': parent_id,
+            'ParentID': parent_id,
+            'ParentJiraKey': parent_jira_key,
             'TicketType': self._extract_value(fields, self.ticket_type_field) or '',
             'FreshdeskTicket': self._extract_value(fields, self.freshdesk_ticket_field) or '',
             'TargetVersion': self._first_value(fields, self.target_version_fields) or ", ".join(
@@ -2811,7 +3049,10 @@ class JIRAExtractor:
             return {}
 
         all_state_changes = {}
-        for item_data in items:
+        total_items = len(items)
+        for index, item_data in enumerate(items, start=1):
+            if index == 1 or index % 500 == 0 or index == total_items:
+                print(f"------>Processing Jira changelog {index}/{total_items}")
             if not isinstance(item_data, dict):
                 print(f"Skipping Jira change history for unsupported item reference: {item_data}")
                 continue
@@ -2923,6 +3164,8 @@ class JIRAExtractor:
             "summary", "description", "assignee", "priority", "status", "components",
             "created", "updated", "parent", "creator", "reporter", "issuetype", "labels",
             "fixVersions", "duedate", "timetracking", "worklog", "sprint", "customfield_10020",
+            "issuelinks",
+            self.area_path_field, self.sprint_field,
             *self.customer_name_fields, self.hotfix_delivered_version_field, self.target_date_field,
             self.hf_status_field, self.hf_requested_versions_field, self.effort_field,
             self.effort_dev_estimate_field, self.effort_dev_actual_field,
@@ -2934,13 +3177,21 @@ class JIRAExtractor:
         }
         return ",".join(sorted([field for field in fields if field]))
 
-    def get_all_work_items(self, last_update):
-        print(f"------>Fetching Jira work items with updated >= {last_update}")
-        jql_query = (
-            f'project = {self.project_key} '
-            f'AND issuetype in (Story, Bug, Task, Epic, "Sub-task") '
-            f'AND updated >= "{last_update}" ORDER BY updated DESC'
-        )
+    def get_all_work_items(self, last_update, full_sync=False):
+        if full_sync:
+            print(f"------>Fetching all Jira work items for project {self.project_key}")
+            jql_query = (
+                f'project = {self.project_key} '
+                f'AND issuetype in (Story, Bug, Task, Epic, "Sub-task") '
+                f'ORDER BY updated DESC'
+            )
+        else:
+            print(f"------>Fetching Jira work items with updated >= {last_update}")
+            jql_query = (
+                f'project = {self.project_key} '
+                f'AND issuetype in (Story, Bug, Task, Epic, "Sub-task") '
+                f'AND updated >= "{last_update}" ORDER BY updated DESC'
+            )
         issues = self._search_issues(jql_query, self._fields_param())
         work_items = []
         for issue in issues:
@@ -2950,24 +3201,30 @@ class JIRAExtractor:
         print(f"------>Total Jira work items fetched: {len(work_items)}")
         return work_items
 
-    def get_work_items(self, work_item_type, last_update):
+    def get_work_items(self, work_item_type, last_update, full_sync=False):
         if work_item_type == 'Issue Report':
             print("------>Skipping Jira Issue Report sync; NEXUS has no Issue Report issue type")
             return []
 
-        print(f"------>Fetching Jira {work_item_type} items with updated >= {last_update}")
-        jql_query = (
-            f'project = {self.project_key} '
-            f'AND issuetype = "{work_item_type}" '
-            f'AND updated >= "{last_update}" ORDER BY updated DESC'
-        )
+        if full_sync:
+            print(f"------>Fetching all Jira {work_item_type} items for project {self.project_key}")
+            jql_query = (
+                f'project = {self.project_key} '
+                f'AND issuetype = "{work_item_type}" '
+                f'ORDER BY updated DESC'
+            )
+        else:
+            print(f"------>Fetching Jira {work_item_type} items with updated >= {last_update}")
+            jql_query = (
+                f'project = {self.project_key} '
+                f'AND issuetype = "{work_item_type}" '
+                f'AND updated >= "{last_update}" ORDER BY updated DESC'
+            )
         issues = self._search_issues(jql_query, self._fields_param())
         items = []
         for issue in issues:
             item_data = self._base_item_data(issue, 'bugs' if work_item_type == 'Bug' else 'work_items')
             item_data['WorkItemType'] = work_item_type
-            if work_item_type == 'Bug':
-                item_data['ParentID'] = None
             items.append(item_data)
         print(f"------>Total Jira {work_item_type} items fetched: {len(items)}")
         return items
@@ -3109,10 +3366,15 @@ class JIRAExtractor:
             ) or {}
             for sprint in data.get('values', []):
                 sprint_name = sprint.get('name', '')
+                ado_project = self._parse_ado_project_from_goal(sprint.get('goal', ''))
+                if ado_project:
+                    sprint_path = self._ado_iteration_path(sprint_name, ado_project)
+                else:
+                    sprint_path = f"JIRA/{self.project_key}/{board_name}/{sprint_name}"
                 sprints.append({
                     'id': str(sprint.get('id')),
                     'name': sprint_name,
-                    'path': f"JIRA/{self.project_key}/{board_name}/{sprint_name}",
+                    'path': sprint_path,
                     'start_date': self._parse_jira_date(sprint.get('startDate')) if sprint.get('startDate') else None,
                     'finish_date': self._parse_jira_date(sprint.get('endDate')) if sprint.get('endDate') else None,
                     'state': sprint.get('state', ''),
@@ -3302,6 +3564,7 @@ def main():
 
     run_once = os.getenv('RUN_ONCE', 'false').lower() in ('1', 'true', 'yes') or '--once' in sys.argv
     skip_ado_history = os.getenv('SKIP_ADO_HISTORY', 'false').lower() in ('1', 'true', 'yes') or '--skip-ado-history' in sys.argv
+    skip_jira_history = os.getenv('SKIP_JIRA_HISTORY', 'false').lower() in ('1', 'true', 'yes') or '--skip-jira-history' in sys.argv
     skip_github_metrics = os.getenv('SKIP_GITHUB_METRICS', 'false').lower() in ('1', 'true', 'yes') or '--skip-github-metrics' in sys.argv
     include_azure_cost = os.getenv('INCLUDE_AZURE_COST', 'false').lower() in ('1', 'true', 'yes') or '--include-azure-cost' in sys.argv
     jira_extractor = None
@@ -3347,6 +3610,8 @@ def main():
         print("Jira sync enabled (INCLUDE_JIRA=true)")
     if skip_ado_history:
         print("Skipping ADO change-history refresh (--skip-ado-history/SKIP_ADO_HISTORY enabled)")
+    if skip_jira_history:
+        print("Skipping Jira change-history refresh (--skip-jira-history/SKIP_JIRA_HISTORY enabled)")
     if skip_github_metrics:
         print("Skipping GitHub metric refresh (--skip-github-metrics/SKIP_GITHUB_METRICS enabled)")
     if include_azure_cost:
@@ -3459,7 +3724,11 @@ def main():
             processed_jira_capacities = 0
 
             if include_jira and jira_extractor:
-                if not db.has_entity_sync_history('jira_work_item'):
+                jira_full_project_sync = os.getenv('JIRA_FULL_PROJECT_SYNC', 'false').lower() in ('1', 'true', 'yes')
+                if jira_full_project_sync:
+                    print("------>JIRA_FULL_PROJECT_SYNC enabled — fetching entire NEXUS project")
+                    jira_sync_from = None
+                elif not db.has_entity_sync_history('jira_work_item'):
                     jira_sync_from = get_jira_initial_sync_date()
                     print(
                         f"------>First Jira sync — fetching all issues updated since "
@@ -3475,27 +3744,46 @@ def main():
                 jira_issues_last_sync = jira_sync_from
                 jira_bugs_last_sync = jira_sync_from
 
-                jira_work_items = jira_extractor.get_all_work_items(jira_work_items_last_sync.strftime('%Y-%m-%d'))
+                jira_work_items = jira_extractor.get_all_work_items(
+                    jira_work_items_last_sync.strftime('%Y-%m-%d') if jira_work_items_last_sync else '2000-01-01',
+                    full_sync=jira_full_project_sync,
+                )
                 processed_jira_work_items = db.upsert_items(jira_work_items, db.work_items, 'work_item')
                 print(f"------>Processed {processed_jira_work_items} Jira work items")
 
                 print("------>Processing Jira work item state changes")
-                jira_extractor.handle_work_item_changes(jira_work_items, db)
-                print(f"------>Processed Jira state changes for {len(jira_work_items)} work items")
+                if skip_jira_history:
+                    print("------>Skipping Jira work item state changes")
+                else:
+                    jira_extractor.handle_work_item_changes(jira_work_items, db)
+                    print(f"------>Processed Jira state changes for {len(jira_work_items)} work items")
+                db.update_jira_parent_links(jira_work_items)
 
-                jira_issues = jira_extractor.get_work_items('Issue Report', jira_issues_last_sync.strftime('%Y-%m-%d'))
+                jira_issues = jira_extractor.get_work_items(
+                    'Issue Report',
+                    jira_issues_last_sync.strftime('%Y-%m-%d') if jira_issues_last_sync else '2000-01-01',
+                    full_sync=jira_full_project_sync,
+                )
                 processed_jira_issues = db.upsert_items(jira_issues, db.issues, 'issue')
                 print(f"------>Processed {processed_jira_issues} Jira issues")
 
-                jira_bugs = jira_extractor.get_work_items('Bug', jira_bugs_last_sync.strftime('%Y-%m-%d'))
+                jira_bugs = jira_extractor.get_work_items(
+                    'Bug',
+                    jira_bugs_last_sync.strftime('%Y-%m-%d') if jira_bugs_last_sync else '2000-01-01',
+                    full_sync=jira_full_project_sync,
+                )
                 processed_jira_bugs = db.upsert_items(jira_bugs, db.bugs, 'bug')
                 print(f"------>Processed {processed_jira_bugs} Jira bugs")
                 processed_jira_bug_work_items = db.upsert_items(jira_bugs, db.work_items, 'work_item')
                 print(f"------>Refreshed {processed_jira_bug_work_items} Jira bugs in work_items")
 
                 print("------>Processing Jira bug state changes")
-                jira_extractor.handle_bug_changes(jira_bugs, db)
-                print(f"------>Processed Jira state changes for {len(jira_bugs)} bugs")
+                if skip_jira_history:
+                    print("------>Skipping Jira bug state changes")
+                else:
+                    jira_extractor.handle_bug_changes(jira_bugs, db)
+                    print(f"------>Processed Jira state changes for {len(jira_bugs)} bugs")
+                db.update_jira_parent_links(jira_bugs)
 
                 jira_extractor.normalize_existing_jira_states(db)
                 print("------>Normalized existing Jira states to ADO values")
