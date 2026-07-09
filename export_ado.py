@@ -2,7 +2,7 @@ import requests
 import csv
 import base64
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 from dotenv import load_dotenv
 from pathlib import Path
@@ -199,6 +199,30 @@ class DatabaseConnection:
         if updated:
             print(f"Updated {updated} Jira records with resolved parent links")
         return updated
+
+    def purge_invalid_jira_change_history(self):
+        """Remove Jira migration replay and pre-cutover Jira history rows."""
+        cutover = get_jira_cutover_date()
+        migration_authors = get_jira_migration_authors()
+        with self.engine.connect() as connection:
+            result = connection.execute(
+                text("""
+                    DELETE FROM change_history
+                    WHERE source = 'JIRA'
+                      AND (
+                        changed_date < :cutover
+                        OR LOWER(COALESCE(changed_by, '')) LIKE ANY(:author_patterns)
+                      )
+                """),
+                {
+                    "cutover": cutover,
+                    "author_patterns": [f"%{author.lower()}%" for author in migration_authors] or ['%tfs4jira%'],
+                },
+            )
+            connection.commit()
+            deleted = result.rowcount
+        print(f"------>Purged {deleted} invalid Jira change_history rows (pre-cutover or migration replay)")
+        return deleted
 
     def _add_new_columns(self, connection, table_name):
         """Add new columns to existing tables if they don't exist"""
@@ -715,15 +739,20 @@ class DatabaseConnection:
                 try:
                     # Convert dates from string to datetime
                     for date_field in ['CreatedDate', 'ChangedDate']:
+                        if item.get(date_field) is None:
+                            continue
                         if item[date_field]:
                             if isinstance(item[date_field], datetime):
+                                item[date_field] = normalize_utc_naive(item[date_field])
                                 continue
                             parsed_date = None
                             for date_format in (
+                                "%Y-%m-%d",
                                 "%Y-%m-%dT%H:%M:%S.%fZ",
                                 "%Y-%m-%dT%H:%M:%SZ",
                                 "%Y-%m-%dT%H:%M:%S.%f%z",
                                 "%Y-%m-%dT%H:%M:%S%z",
+                                "%a, %d %b %Y %H:%M:%S %z",
                             ):
                                 try:
                                     parsed_date = datetime.strptime(item[date_field], date_format)
@@ -732,11 +761,12 @@ class DatabaseConnection:
                                     continue
                             if parsed_date is None:
                                 raise ValueError(f"Unsupported date format for {date_field}: {item[date_field]}")
-                            item[date_field] = parsed_date
+                            item[date_field] = normalize_utc_naive(parsed_date)
 
                     # Check if item exists
                     existing_columns = "jira_id, source"
                     if item.get('Source') == 'JIRA':
+                        existing_columns += ", created_date"
                         if item_type == 'work_item':
                             existing_columns += ", area_path, iteration_path, parent_work_item"
                         elif item_type == 'bug':
@@ -749,8 +779,12 @@ class DatabaseConnection:
                     ).first()
 
                     if result and item.get('Source') == 'JIRA':
-                        existing_area = result[2] if len(result) > 2 else None
-                        existing_iteration = result[3] if len(result) > 3 else None
+                        existing_created = result[2] if len(result) > 2 else None
+                        path_offset = 3
+                        if item.get('MigratedFromADO') and item.get('CreatedDate') is None and existing_created:
+                            item['CreatedDate'] = existing_created
+                        existing_area = result[path_offset] if len(result) > path_offset else None
+                        existing_iteration = result[path_offset + 1] if len(result) > path_offset + 1 else None
                         if not item.get('AreaPath') and existing_area:
                             item['AreaPath'] = existing_area
                         elif (
@@ -1351,6 +1385,98 @@ class ADOExtractor:
             print(f"Warning: could not check Jira ownership for {table_name} {record_id}: {str(e)}")
             return False
 
+    def _parse_ado_changed_date(self, changed_date):
+        if not changed_date:
+            return None
+        for date_format in (
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%dT%H:%M:%S%z",
+        ):
+            try:
+                return normalize_utc_naive(datetime.strptime(changed_date, date_format))
+            except ValueError:
+                continue
+        return None
+
+    def store_pre_cutover_history(self, record_id, table_name, tracked_fields, jira_id=None, db_connection=None):
+        """Restore ADO change history for migrated items before the Jira cutover."""
+        if not db_connection:
+            return 0
+
+        cutover = get_jira_cutover_date()
+        updates_url = f"https://dev.azure.com/{self.organization}/{self.project}/_apis/wit/workitems/{record_id}/updates?api-version=7.0"
+        response = requests.get(updates_url, headers=self.headers)
+        if response.status_code != 200:
+            print(f"Error fetching ADO history for {record_id}: {response.status_code}")
+            return 0
+
+        inserted = 0
+        updates = response.json().get("value", [])
+        with db_connection.engine.connect() as connection:
+            try:
+                connection.execute(
+                    text("""
+                        DELETE FROM change_history
+                        WHERE record_id = :record_id
+                          AND table_name = :table_name
+                          AND source = 'ADO'
+                          AND field_changed = ANY(:tracked_fields)
+                          AND changed_date < :cutover
+                    """),
+                    {
+                        "record_id": record_id,
+                        "table_name": table_name,
+                        "tracked_fields": list(tracked_fields),
+                        "cutover": cutover,
+                    },
+                )
+
+                for update in updates:
+                    changed_date = update.get("fields", {}).get("System.ChangedDate", {}).get("newValue", "")
+                    changed_date_obj = self._parse_ado_changed_date(changed_date)
+                    if not changed_date_obj or changed_date_obj >= cutover:
+                        continue
+                    changed_by = update.get("revisedBy", {}).get("displayName", "")
+
+                    for field_name in tracked_fields:
+                        if field_name not in update.get("fields", {}):
+                            continue
+                        field_change = update["fields"][field_name]
+                        old_value = field_change.get("oldValue", "")
+                        new_value = field_change.get("newValue", "")
+
+                        if field_name == 'Microsoft.VSTS.Scheduling.TargetDate':
+                            old_value = str(old_value) if old_value else ""
+                            new_value = str(new_value) if new_value else ""
+
+                        connection.execute(
+                            text("""
+                                INSERT INTO change_history
+                                (record_id, jira_id, source, table_name, field_changed, old_value, new_value, changed_by, changed_date)
+                                VALUES
+                                (:record_id, :jira_id, 'ADO', :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
+                            """),
+                            {
+                                "record_id": record_id,
+                                "jira_id": jira_id,
+                                "table_name": table_name,
+                                "field_changed": field_name,
+                                "old_value": str(old_value)[:500] if old_value else "",
+                                "new_value": str(new_value)[:500] if new_value else "",
+                                "changed_by": changed_by,
+                                "changed_date": changed_date_obj,
+                            },
+                        )
+                        inserted += 1
+
+                connection.commit()
+            except SQLAlchemyError as e:
+                print(f"Error storing pre-cutover ADO history for {record_id}: {str(e)}")
+                connection.rollback()
+        return inserted
+
     def handle_bug_changes(self, bugs, db_connection=None):
         """
         Get and store the change history for a list of bugs (State, HF Status, HF Target Date)
@@ -1369,7 +1495,21 @@ class ADOExtractor:
 
         for bug_id in bug_ids:
             if self._is_jira_owned_record(db_connection, 'bugs', bug_id):
-                print(f"Skipping ADO bug history for {bug_id}; Jira is the source of truth")
+                jira_id = None
+                if db_connection:
+                    with db_connection.engine.connect() as connection:
+                        row = connection.execute(
+                            text("SELECT jira_id FROM bugs WHERE id = :id"),
+                            {"id": bug_id},
+                        ).first()
+                        jira_id = row[0] if row else None
+                self.store_pre_cutover_history(
+                    bug_id,
+                    'bugs',
+                    BUG_CHANGE_HISTORY_FIELDS,
+                    jira_id=jira_id,
+                    db_connection=db_connection,
+                )
                 continue
 
             updates_url = f"https://dev.azure.com/{self.organization}/{self.project}/_apis/wit/workitems/{bug_id}/updates?api-version=7.0"
@@ -1991,7 +2131,24 @@ class ADOExtractor:
 
         for work_item_id in work_item_ids:
             if self._is_jira_owned_record(db_connection, 'work_items', work_item_id):
-                print(f"Skipping ADO work item history for {work_item_id}; Jira is the source of truth")
+                jira_id = None
+                work_item_type = None
+                if db_connection:
+                    with db_connection.engine.connect() as connection:
+                        row = connection.execute(
+                            text("SELECT jira_id, work_item_type FROM work_items WHERE id = :id"),
+                            {"id": work_item_id},
+                        ).first()
+                        if row:
+                            jira_id, work_item_type = row[0], row[1]
+                if work_item_type and work_item_type != 'Bug':
+                    self.store_pre_cutover_history(
+                        work_item_id,
+                        work_item_type,
+                        WORK_ITEM_CHANGE_HISTORY_FIELDS,
+                        jira_id=jira_id,
+                        db_connection=db_connection,
+                    )
                 continue
 
             # First get the work item details to ensure we have the type
@@ -2616,6 +2773,7 @@ class JIRAExtractor:
         self.story_points_field = os.getenv('JIRA_STORY_POINTS_FIELD_ID', 'customfield_10037')
         self._area_path_cache = {}
         self.ado_work_item_id_field = os.getenv('JIRA_ADO_WORK_ITEM_ID_FIELD_ID', 'customfield_12495')
+        self.ado_created_date_field = os.getenv('JIRA_ADO_CREATED_DATE_FIELD_ID', 'customfield_12499')
         self._done_statuses = {'done', 'closed'}
         self.customer_name_fields = [
             os.getenv('JIRA_NEXUS_CUSTOMER_NAME_FIELD_ID', 'customfield_12470'),
@@ -2939,6 +3097,40 @@ class JIRAExtractor:
                     return result[0]
         return None
 
+    def _parse_ado_created_date(self, fields):
+        raw_value = fields.get(self.ado_created_date_field)
+        if raw_value in (None, '', [], {}):
+            return None
+        if isinstance(raw_value, datetime):
+            return normalize_utc_naive(raw_value)
+        raw_text = str(raw_value).strip()
+        for date_format in (
+            "%Y-%m-%d",
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%a, %d %b %Y %H:%M:%S %z",
+        ):
+            try:
+                return normalize_utc_naive(datetime.strptime(raw_text, date_format))
+            except ValueError:
+                continue
+        parsed = self._parse_jira_date(raw_text)
+        return normalize_utc_naive(parsed) if parsed else None
+
+    def _created_date(self, fields):
+        """Use Azure DevOps Created Date for migrated items instead of Jira import timestamp."""
+        migrated = self._extract_migrated_ado_id(fields) is not None
+        ado_created = self._parse_ado_created_date(fields)
+        if migrated:
+            if ado_created:
+                return ado_created
+            return None
+        if ado_created:
+            return ado_created
+        return fields.get("created", "")
+
     def _base_item_data(self, issue, table_name):
         fields = issue["fields"]
         assignee = fields.get("assignee")
@@ -2967,7 +3159,8 @@ class JIRAExtractor:
             'State': self._normalize_jira_state_to_ado_state(status.get("name", "") if status else ""),
             'CustomerName': self._first_value(fields, self.customer_name_fields),
             'AreaPath': self._area_path(fields, ado_project),
-            'CreatedDate': fields.get("created", ""),
+            'CreatedDate': self._created_date(fields),
+            'MigratedFromADO': self._extract_migrated_ado_id(fields) is not None,
             'ChangedDate': fields.get("updated", ""),
             'IterationPath': self._iteration_path(fields),
             'HotfixDeliveredVersion': self._extract_value(fields, self.hotfix_delivered_version_field) or '',
@@ -3082,10 +3275,12 @@ class JIRAExtractor:
             if db_connection:
                 with db_connection.engine.connect() as connection:
                     try:
+                        cutover = get_jira_cutover_date()
                         connection.execute(
                             text("""
                                 DELETE FROM change_history
                                 WHERE record_id = :record_id
+                                AND source = 'JIRA'
                                 AND field_changed = ANY(:tracked_fields)
                             """),
                             {
@@ -3095,10 +3290,12 @@ class JIRAExtractor:
                         )
 
                         for history in changelog:
-                            changed_date_obj = self._parse_jira_date(history.get("created"))
+                            changed_date_obj = normalize_utc_naive(self._parse_jira_date(history.get("created")))
                             if not changed_date_obj:
                                 continue
                             changed_by = history.get("author", {}).get("displayName", "")
+                            if is_jira_migration_changelog_entry(changed_by, changed_date_obj, cutover):
+                                continue
                             for history_item in history.get("items", []):
                                 field_changed = self._jira_change_field_name(history_item)
                                 if not field_changed:
@@ -3171,7 +3368,7 @@ class JIRAExtractor:
             self.effort_dev_estimate_field, self.effort_dev_actual_field,
             self.qa_effort_estimation_field, self.qa_effort_actual_field,
             self.tshirt_estimation_field, self.ticket_type_field, self.freshdesk_ticket_field,
-            self.ado_work_item_id_field,
+            self.ado_work_item_id_field, self.ado_created_date_field,
             *self.target_version_fields, *self.connector_fields, self.blocker_field,
             self.business_value_field, self.business_outcome_field
         }
@@ -3531,6 +3728,176 @@ def get_jira_initial_sync_date():
   return datetime.now() - timedelta(days=months * 30)
 
 
+def get_jira_cutover_date():
+    """UTC cutover when Jira became source of truth for live changes."""
+    raw = os.getenv('JIRA_CUTOVER_DATE', '2026-07-08T00:00:00')
+    for date_format in (
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            parsed = datetime.strptime(raw, date_format)
+            return parsed.replace(tzinfo=None)
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported JIRA_CUTOVER_DATE format: {raw}")
+
+
+def get_jira_migration_authors():
+    raw = os.getenv('JIRA_MIGRATION_AUTHORS', 'TFS4JIRA Azure DevOps integration')
+    return [author.strip() for author in raw.split(',') if author.strip()]
+
+
+def normalize_utc_naive(value):
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def is_jira_migration_changelog_entry(changed_by, changed_date, cutover=None):
+    cutover = cutover or get_jira_cutover_date()
+    changed_date = normalize_utc_naive(changed_date)
+    if changed_date and changed_date < cutover:
+        return True
+    changed_by_text = (changed_by or '').lower()
+    for author in get_jira_migration_authors():
+        if author.lower() in changed_by_text:
+            return True
+    return False
+
+
+BUG_CHANGE_HISTORY_FIELDS = (
+    'System.State',
+    'Custom.HFstatus',
+    'Microsoft.VSTS.Scheduling.TargetDate',
+    'Custom.HFrequestedversions',
+)
+
+WORK_ITEM_CHANGE_HISTORY_FIELDS = (
+    'System.State',
+    'System.IterationPath',
+)
+
+
+def backfill_migrated_created_dates(db, jira_extractor):
+    """Refresh created_date from Azure DevOps Created Date (customfield_12499) for migrated items."""
+    with db.engine.connect() as connection:
+        keys = [
+            row[0] for row in connection.execute(
+                text("""
+                    SELECT DISTINCT jira_id FROM (
+                        SELECT jira_id FROM bugs WHERE jira_id IS NOT NULL
+                        UNION
+                        SELECT jira_id FROM work_items WHERE jira_id IS NOT NULL
+                    ) items
+                    ORDER BY jira_id
+                """)
+            ).fetchall()
+        ]
+
+    print(f"------>Backfilling created_date for {len(keys)} Jira keys from ADO Created Date field")
+    fields_param = jira_extractor._fields_param()
+    updated = 0
+    batch_size = 50
+    for index in range(0, len(keys), batch_size):
+        batch = keys[index:index + batch_size]
+        issues = jira_extractor._search_issues(f"key in ({','.join(batch)})", fields_param)
+        bug_items = []
+        work_items = []
+        for issue in issues:
+            fields = issue.get('fields', {})
+            if not jira_extractor._extract_migrated_ado_id(fields):
+                continue
+            item_data = jira_extractor._base_item_data(issue, 'work_items')
+            item_data['WorkItemType'] = jira_extractor._extract_value(fields, 'issuetype') or 'Unknown'
+            work_items.append(item_data)
+            if item_data['WorkItemType'] == 'Bug':
+                bug_items.append(item_data)
+
+        if bug_items:
+            db.upsert_items(bug_items, db.bugs, 'bug')
+        if work_items:
+            db.upsert_items(work_items, db.work_items, 'work_item')
+        updated += len(work_items)
+
+        if index == 0 or (index // batch_size) % 20 == 0 or index + batch_size >= len(keys):
+            print(f"------>Created date backfill {min(index + batch_size, len(keys))}/{len(keys)}")
+        time.sleep(0.15)
+
+    print(f"------>Updated created_date for {updated} migrated items")
+    return updated
+
+
+def repair_migrated_change_history(db, ado_extractor, jira_extractor=None):
+    """One-time repair: ADO history before cutover, Jira history after cutover only."""
+    cutover = get_jira_cutover_date()
+    print(f"------>Repairing migrated change history (cutover UTC: {cutover.isoformat(sep=' ')})")
+
+    db.purge_invalid_jira_change_history()
+
+    ado_restored = 0
+    with db.engine.connect() as connection:
+        bug_rows = connection.execute(
+            text("SELECT id, jira_id FROM bugs WHERE jira_id IS NOT NULL ORDER BY id")
+        ).fetchall()
+        work_item_rows = connection.execute(
+            text("""
+                SELECT id, jira_id, work_item_type
+                FROM work_items
+                WHERE jira_id IS NOT NULL
+                  AND work_item_type <> 'Bug'
+                ORDER BY id
+            """)
+        ).fetchall()
+
+    total_ado = len(bug_rows) + len(work_item_rows)
+    print(f"------>Restoring pre-cutover ADO history for {total_ado} migrated records")
+
+    for index, row in enumerate(bug_rows, start=1):
+        if index == 1 or index % 250 == 0 or index == len(bug_rows):
+            print(f"------>ADO bug history restore {index}/{len(bug_rows)}")
+        ado_restored += ado_extractor.store_pre_cutover_history(
+            row[0], 'bugs', BUG_CHANGE_HISTORY_FIELDS, jira_id=row[1], db_connection=db
+        )
+        if index % 50 == 0:
+            time.sleep(0.2)
+
+    for index, row in enumerate(work_item_rows, start=1):
+        if index == 1 or index % 250 == 0 or index == len(work_item_rows):
+            print(f"------>ADO work item history restore {index}/{len(work_item_rows)}")
+        ado_restored += ado_extractor.store_pre_cutover_history(
+            row[0], row[2], WORK_ITEM_CHANGE_HISTORY_FIELDS, jira_id=row[1], db_connection=db
+        )
+        if index % 50 == 0:
+            time.sleep(0.2)
+
+    print(f"------>Inserted {ado_restored} pre-cutover ADO change_history rows")
+
+    if jira_extractor:
+        backfill_migrated_created_dates(db, jira_extractor)
+
+    if not jira_extractor:
+        print("------>Skipping post-cutover Jira history refresh (no Jira extractor configured)")
+        return ado_restored
+
+    jira_bug_items = [{'ID': row[0], 'JiraID': row[1], 'WorkItemType': 'Bug'} for row in bug_rows]
+    jira_work_items = [
+        {'ID': row[0], 'JiraID': row[1], 'WorkItemType': row[2]}
+        for row in work_item_rows
+    ]
+
+    print(f"------>Refreshing post-cutover Jira history for {len(jira_bug_items)} bugs")
+    jira_extractor.handle_bug_changes(jira_bug_items, db)
+    print(f"------>Refreshing post-cutover Jira history for {len(jira_work_items)} work items")
+    jira_extractor.handle_work_item_changes(jira_work_items, db)
+    return ado_restored
+
+
 def main():
     # Load configuration from .env file
     organization = os.getenv('ADO_ORGANIZATION')
@@ -3545,8 +3912,10 @@ def main():
         include_ado = True
 
     include_jira = os.getenv('INCLUDE_JIRA', 'false').lower() in ('1', 'true', 'yes') or '--include-jira' in sys.argv
+    repair_jira_history = os.getenv('JIRA_REPAIR_HISTORY', 'false').lower() in ('1', 'true', 'yes') or '--repair-jira-history' in sys.argv
+    repair_only = os.getenv('JIRA_REPAIR_ONLY', 'false').lower() in ('1', 'true', 'yes') or '--repair-jira-history-only' in sys.argv
 
-    if not include_ado and not include_jira:
+    if not include_ado and not include_jira and not repair_jira_history:
         raise ValueError("At least one of INCLUDE_ADO or INCLUDE_JIRA must be enabled")
 
     db = get_database_connection()
@@ -3584,6 +3953,18 @@ def main():
             print(f"------>Jira sync enabled for project {jira_project}, boards {board_ids}")
         else:
             print(f"------>Jira sync enabled for project {jira_project}, auto-discovering boards (fallback board {jira_board_id})")
+
+    if repair_jira_history:
+        if not all([organization, project, pat]):
+            raise ValueError("Jira history repair requires ADO_ORGANIZATION, ADO_PROJECT, and ADO_PERSONAL_ACCESS_TOKEN")
+        if not jira_extractor:
+            raise ValueError("Jira history repair requires INCLUDE_JIRA=true for post-cutover Jira history")
+        ado_for_repair = extractor or ADOExtractor(organization, project, pat, scrum_project)
+        ado_for_repair.db_connection = db
+        repair_migrated_change_history(db, ado_for_repair, jira_extractor)
+        if repair_only:
+            print("Jira history repair completed; exiting")
+            return
 
     # Process bugs from CSV file
     # bugs_csv_file_path = '/Users/haviv_rosh/work/scripts_python/metabase/bugs_202503011913.csv'
