@@ -4059,6 +4059,11 @@ def main():
             processed_work_items = 0
             processed_sprints = 0
             processed_capacities = 0
+            ado_issues_attempted = False
+            ado_bugs_attempted = False
+            ado_work_items_attempted = False
+            ado_sprints_attempted = False
+            ado_capacities_attempted = False
 
             if include_ado:
                 # Get last sync times from database
@@ -4074,6 +4079,7 @@ def main():
                     print(f"------>Using ADO sync date: {sync_date_override.strftime('%Y-%m-%d')} (1 month back)")
 
                 # Extract and store all work items first
+                ado_work_items_attempted = True
                 work_items = extractor.get_all_work_items(work_items_last_sync.strftime('%Y-%m-%d'))
                 processed_work_items = db.upsert_items(work_items, db.work_items, 'work_item')
                 print(f"------>Processed {processed_work_items} work items")
@@ -4087,11 +4093,13 @@ def main():
                     print(f"------>Processed state changes for {len(work_items)} work items")
 
                 # Extract and store issues
+                ado_issues_attempted = True
                 issues = extractor.get_work_items('Issue Report', issues_last_sync.strftime('%Y-%m-%d'))
                 processed_issues = db.upsert_items(issues, db.issues, 'issue')
                 print(f"------>Processed {processed_issues} issues")
 
                 # Extract and store bugs with parent relationships
+                ado_bugs_attempted = True
                 bugs = extractor.get_work_items('Bug', bugs_last_sync.strftime('%Y-%m-%d'))
                 processed_bugs = db.upsert_items(bugs, db.bugs, 'bug')
                 print(f"------>Processed {processed_bugs} bugs")
@@ -4109,9 +4117,11 @@ def main():
                 db.update_parent_issue()
 
                 # Update sprints
+                ado_sprints_attempted = True
                 processed_sprints = extractor.update_sprints()
 
                 # Update sprint capacities
+                ado_capacities_attempted = True
                 last_capacity_sync = db.get_last_sprint_capacity_sync()
                 if last_capacity_sync is None:
                     print("------>First sprint capacity sync - fetching all historical data")
@@ -4127,6 +4137,11 @@ def main():
             processed_jira_bugs = 0
             processed_jira_sprints = 0
             processed_jira_capacities = 0
+            jira_work_items_attempted = False
+            jira_issues_attempted = False
+            jira_bugs_attempted = False
+            jira_sprints_attempted = False
+            jira_capacities_attempted = False
 
             if include_jira and jira_extractor:
                 jira_full_project_sync = os.getenv('JIRA_FULL_PROJECT_SYNC', 'false').lower() in ('1', 'true', 'yes')
@@ -4149,6 +4164,7 @@ def main():
                 jira_issues_last_sync = jira_sync_from
                 jira_bugs_last_sync = jira_sync_from
 
+                jira_work_items_attempted = True
                 jira_work_items = jira_extractor.get_all_work_items(
                     jira_work_items_last_sync.strftime('%Y-%m-%d') if jira_work_items_last_sync else '2000-01-01',
                     full_sync=jira_full_project_sync,
@@ -4156,14 +4172,7 @@ def main():
                 processed_jira_work_items = db.upsert_items(jira_work_items, db.work_items, 'work_item')
                 print(f"------>Processed {processed_jira_work_items} Jira work items")
 
-                print("------>Processing Jira work item state changes")
-                if skip_jira_history:
-                    print("------>Skipping Jira work item state changes")
-                else:
-                    jira_extractor.handle_work_item_changes(jira_work_items, db)
-                    print(f"------>Processed Jira state changes for {len(jira_work_items)} work items")
-                db.update_jira_parent_links(jira_work_items)
-
+                jira_issues_attempted = True
                 jira_issues = jira_extractor.get_work_items(
                     'Issue Report',
                     jira_issues_last_sync.strftime('%Y-%m-%d') if jira_issues_last_sync else '2000-01-01',
@@ -4172,6 +4181,7 @@ def main():
                 processed_jira_issues = db.upsert_items(jira_issues, db.issues, 'issue')
                 print(f"------>Processed {processed_jira_issues} Jira issues")
 
+                jira_bugs_attempted = True
                 jira_bugs = jira_extractor.get_work_items(
                     'Bug',
                     jira_bugs_last_sync.strftime('%Y-%m-%d') if jira_bugs_last_sync else '2000-01-01',
@@ -4181,6 +4191,23 @@ def main():
                 print(f"------>Processed {processed_jira_bugs} Jira bugs")
                 processed_jira_bug_work_items = db.upsert_items(jira_bugs, db.work_items, 'work_item')
                 print(f"------>Refreshed {processed_jira_bug_work_items} Jira bugs in work_items")
+
+                # Record sync status before slow changelog processing so bugs/status stay current
+                db.update_sync_status('jira_work_item', processed_jira_work_items)
+                db.update_sync_status('jira_issue', processed_jira_issues)
+                db.update_sync_status('jira_bug', processed_jira_bugs)
+                if not include_ado:
+                    db.update_sync_status('work_item', processed_jira_work_items)
+                    db.update_sync_status('bug', processed_jira_bugs)
+                print("------>Updated sync status for Jira work items, issues, and bugs")
+
+                print("------>Processing Jira work item state changes")
+                if skip_jira_history:
+                    print("------>Skipping Jira work item state changes")
+                else:
+                    jira_extractor.handle_work_item_changes(jira_work_items, db)
+                    print(f"------>Processed Jira state changes for {len(jira_work_items)} work items")
+                db.update_jira_parent_links(jira_work_items)
 
                 print("------>Processing Jira bug state changes")
                 if skip_jira_history:
@@ -4193,7 +4220,9 @@ def main():
                 jira_extractor.normalize_existing_jira_states(db)
                 print("------>Normalized existing Jira states to ADO values")
 
+                jira_sprints_attempted = True
                 processed_jira_sprints = jira_extractor.update_sprints()
+                jira_capacities_attempted = True
                 if not db.has_entity_sync_history('jira_sprint_capacity'):
                     print("------>First Jira sprint capacity sync - fetching all boards/sprints")
                     processed_jira_capacities = jira_extractor.update_sprint_capacities(current_sprint_only=False)
@@ -4329,46 +4358,43 @@ def main():
             db.update_history_snapshots()
             print("------>Updated history snapshots")
 
-            # Only update sync status if all operations completed successfully
-            if processed_issues > 0:
+            # Record sync status for every step that ran (even when zero rows changed)
+            if ado_issues_attempted:
                 db.update_sync_status('issue', processed_issues)
-            
-            if processed_bugs > 0:
+            if ado_bugs_attempted:
                 db.update_sync_status('bug', processed_bugs)
-
-            if processed_work_items > 0:
+            if ado_work_items_attempted:
                 db.update_sync_status('work_item', processed_work_items)
-
-            if processed_sprints > 0:
+            if ado_sprints_attempted:
                 db.update_sync_status('sprint', processed_sprints)
-
-            if processed_capacities > 0:
+            if ado_capacities_attempted:
                 db.update_sync_status('sprint_capacity', processed_capacities)
 
-            if processed_jira_issues > 0:
+            if jira_issues_attempted:
                 db.update_sync_status('jira_issue', processed_jira_issues)
-
-            if processed_jira_bugs > 0:
+            if jira_bugs_attempted:
                 db.update_sync_status('jira_bug', processed_jira_bugs)
-
-            if processed_jira_work_items > 0:
+                if not include_ado:
+                    db.update_sync_status('bug', processed_jira_bugs)
+            if jira_work_items_attempted:
                 db.update_sync_status('jira_work_item', processed_jira_work_items)
-
-            if processed_jira_sprints > 0:
+                if not include_ado:
+                    db.update_sync_status('work_item', processed_jira_work_items)
+            if jira_sprints_attempted:
                 db.update_sync_status('jira_sprint', processed_jira_sprints)
-
-            if processed_jira_capacities > 0:
+                if not include_ado:
+                    db.update_sync_status('sprint', processed_jira_sprints)
+            if jira_capacities_attempted:
                 db.update_sync_status('jira_sprint_capacity', processed_jira_capacities)
+                if not include_ado:
+                    db.update_sync_status('sprint_capacity', processed_jira_capacities)
 
             if processed_copilot > 0:
                 db.update_sync_status('copilot_metrics', processed_copilot)
-
             if processed_prs > 0:
                 db.update_sync_status('pr_metrics', processed_prs)
-
             if processed_tests > 0:
                 db.update_sync_status('github_tests', processed_tests)
-
             if processed_azure_cost > 0:
                 db.update_sync_status('azure_cost', processed_azure_cost)
 
