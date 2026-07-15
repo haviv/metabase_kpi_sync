@@ -3261,6 +3261,59 @@ class JIRAExtractor:
             return "Custom.HFrequestedversions"
         return None
 
+    def _insert_initial_jira_state_history(
+        self,
+        connection,
+        record_id,
+        jira_key,
+        table_name,
+        issue_fields,
+        cutover,
+        state_changes,
+    ):
+        """Jira omits creation from changelog until the first transition; synthesize initial state."""
+        has_ado_history = connection.execute(
+            text("""
+                SELECT 1 FROM change_history
+                WHERE record_id = :record_id AND source = 'ADO'
+                LIMIT 1
+            """),
+            {"record_id": record_id},
+        ).first()
+        if has_ado_history:
+            return 0
+
+        created_date = normalize_utc_naive(self._parse_jira_date(issue_fields.get("created")))
+        if not created_date or created_date < cutover:
+            return 0
+
+        status_name = (issue_fields.get("status") or {}).get("name", "")
+        new_state = self._normalize_jira_state_to_ado_state(status_name)
+        if not new_state:
+            return 0
+
+        creator = issue_fields.get("creator") or issue_fields.get("reporter") or {}
+        changed_by = creator.get("displayName", "") if isinstance(creator, dict) else ""
+
+        connection.execute(
+            text("""
+                INSERT INTO change_history
+                (record_id, jira_id, source, table_name, field_changed, old_value, new_value, changed_by, changed_date)
+                VALUES
+                (:record_id, :jira_id, 'JIRA', :table_name, 'System.State', '', :new_value, :changed_by, :changed_date)
+            """),
+            {
+                "record_id": record_id,
+                "jira_id": jira_key,
+                "table_name": table_name,
+                "new_value": new_state,
+                "changed_by": changed_by,
+                "changed_date": created_date,
+            },
+        )
+        state_changes.append([created_date.isoformat(), "", new_state])
+        return 1
+
     def _handle_jira_changes(self, items, table_name_getter, db_connection=None):
         if not items:
             return {}
@@ -3280,11 +3333,15 @@ class JIRAExtractor:
                 print(f"Skipping Jira change history for {record_id}; missing jira_id")
                 continue
 
-            issue_data = self._request_json(f"/rest/api/3/issue/{jira_key}", {"expand": "changelog"})
+            issue_data = self._request_json(
+                f"/rest/api/3/issue/{jira_key}",
+                {"expand": "changelog", "fields": "created,status,creator,reporter"},
+            )
             if not issue_data:
                 continue
 
             changelog = issue_data.get("changelog", {}).get("histories", [])
+            issue_fields = issue_data.get("fields", {})
             state_changes = []
             table_name = table_name_getter(item_data)
             tracked_fields = (
@@ -3313,6 +3370,7 @@ class JIRAExtractor:
                             }
                         )
 
+                        state_rows_inserted = 0
                         for history in changelog:
                             changed_date_obj = normalize_utc_naive(self._parse_jira_date(history.get("created")))
                             if not changed_date_obj:
@@ -3360,7 +3418,19 @@ class JIRAExtractor:
                                 )
 
                                 if field_changed == "System.State":
+                                    state_rows_inserted += 1
                                     state_changes.append([history.get("created", ""), old_value, new_value])
+
+                        if state_rows_inserted == 0:
+                            state_rows_inserted += self._insert_initial_jira_state_history(
+                                connection,
+                                record_id=record_id,
+                                jira_key=jira_key,
+                                table_name=table_name,
+                                issue_fields=issue_fields,
+                                cutover=cutover,
+                                state_changes=state_changes,
+                            )
 
                         connection.commit()
                     except SQLAlchemyError as e:
