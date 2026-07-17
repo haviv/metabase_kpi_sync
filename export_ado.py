@@ -248,6 +248,7 @@ class DatabaseConnection:
             for col_name, col_type in {
                 'ticket_type': 'VARCHAR(200)',
                 'jira_component': 'VARCHAR(500)',
+                'team': 'VARCHAR(200)',
             }.items():
                 if col_name not in existing_columns:
                     new_columns[col_name] = col_type
@@ -272,6 +273,7 @@ class DatabaseConnection:
                 'business_value': 'INTEGER',
                 'business_outcome': 'VARCHAR(200)',
                 'jira_component': 'VARCHAR(500)',
+                'team': 'VARCHAR(200)',
             }
             for col_name, col_type in work_item_columns.items():
                 if col_name not in existing_columns:
@@ -378,6 +380,7 @@ class DatabaseConnection:
                 Column('hf_requested_versions', String(200), nullable=True),
                 Column('ticket_type', String(200), nullable=True),
                 Column('jira_component', String(500), nullable=True),
+                Column('team', String(200), nullable=True),
             )
 
             # Sync status table
@@ -428,6 +431,7 @@ class DatabaseConnection:
                 Column('business_value', Integer, nullable=True),
                 Column('business_outcome', String(200), nullable=True),
                 Column('jira_component', String(500), nullable=True),
+                Column('team', String(200), nullable=True),
             )
 
             # History snapshots table
@@ -847,9 +851,9 @@ class DatabaseConnection:
                         """
                         
                         if item_type == 'bug':
-                            update_stmt += ", parent_issue = :parent_issue, ticket_type = :ticket_type, jira_component = :jira_component"
+                            update_stmt += ", parent_issue = :parent_issue, ticket_type = :ticket_type, jira_component = :jira_component, team = :team"
                         elif item_type == 'work_item':
-                            update_stmt += ", work_item_type = :work_item_type, effort = :effort, effort_dev_estimate = :effort_dev_estimate, effort_dev_actual = :effort_dev_actual, qa_effort_estimation = :qa_effort_estimation, qa_effort_actual = :qa_effort_actual, tshirt_estimation = :tshirt_estimation, parent_work_item = :parent_work_item, ticket_type = :ticket_type, jira_component = :jira_component, freshdesk_ticket = :freshdesk_ticket, target_version = :target_version, tags = :tags, connector = :connector, created_by = :created_by, blocker = :blocker, business_value = :business_value, business_outcome = :business_outcome"
+                            update_stmt += ", work_item_type = :work_item_type, effort = :effort, effort_dev_estimate = :effort_dev_estimate, effort_dev_actual = :effort_dev_actual, qa_effort_estimation = :qa_effort_estimation, qa_effort_actual = :qa_effort_actual, tshirt_estimation = :tshirt_estimation, parent_work_item = :parent_work_item, ticket_type = :ticket_type, jira_component = :jira_component, team = :team, freshdesk_ticket = :freshdesk_ticket, target_version = :target_version, tags = :tags, connector = :connector, created_by = :created_by, blocker = :blocker, business_value = :business_value, business_outcome = :business_outcome"
                         
                         update_stmt += " WHERE id = :id"
 
@@ -877,6 +881,7 @@ class DatabaseConnection:
                             params["parent_issue"] = item.get('ParentID')
                             params["ticket_type"] = item.get('TicketType', '')
                             params["jira_component"] = item.get('JiraComponent', '')
+                            params["team"] = item.get('Team', '')
                         elif item_type == 'work_item':
                             params["work_item_type"] = item.get('WorkItemType', '')
                             params["effort"] = item.get('Effort')
@@ -888,6 +893,7 @@ class DatabaseConnection:
                             params["parent_work_item"] = item.get('ParentWorkItem')
                             params["ticket_type"] = item.get('TicketType', '')
                             params["jira_component"] = item.get('JiraComponent', '')
+                            params["team"] = item.get('Team', '')
                             params["freshdesk_ticket"] = item.get('FreshdeskTicket', '')
                             params["target_version"] = item.get('TargetVersion', '')
                             params["tags"] = item.get('Tags', '')
@@ -911,9 +917,9 @@ class DatabaseConnection:
                         """
                         
                         if item_type == 'bug':
-                            insert_stmt += ", parent_issue, ticket_type, jira_component"
+                            insert_stmt += ", parent_issue, ticket_type, jira_component, team"
                         elif item_type == 'work_item':
-                            insert_stmt += ", work_item_type, effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type, jira_component, freshdesk_ticket, target_version, tags, connector, created_by, blocker, business_value, business_outcome"
+                            insert_stmt += ", work_item_type, effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type, jira_component, team, freshdesk_ticket, target_version, tags, connector, created_by, blocker, business_value, business_outcome"
                         
                         insert_stmt += """
                         )
@@ -924,9 +930,9 @@ class DatabaseConnection:
                         """
                         
                         if item_type == 'bug':
-                            insert_stmt += ", :parent_issue, :ticket_type, :jira_component"
+                            insert_stmt += ", :parent_issue, :ticket_type, :jira_component, :team"
                         elif item_type == 'work_item':
-                            insert_stmt += ", :work_item_type, :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type, :jira_component, :freshdesk_ticket, :target_version, :tags, :connector, :created_by, :blocker, :business_value, :business_outcome"
+                            insert_stmt += ", :work_item_type, :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type, :jira_component, :team, :freshdesk_ticket, :target_version, :tags, :connector, :created_by, :blocker, :business_value, :business_outcome"
                         
                         insert_stmt += ")"
 
@@ -954,6 +960,7 @@ class DatabaseConnection:
                             params["parent_issue"] = item.get('ParentID')
                             params["ticket_type"] = item.get('TicketType', '')
                             params["jira_component"] = item.get('JiraComponent', '')
+                            params["team"] = item.get('Team', '')
                         elif item_type == 'work_item':
                             params["work_item_type"] = item.get('WorkItemType', '')
                             params["effort"] = item.get('Effort')
@@ -965,6 +972,7 @@ class DatabaseConnection:
                             params["parent_work_item"] = item.get('ParentWorkItem')
                             params["ticket_type"] = item.get('TicketType', '')
                             params["jira_component"] = item.get('JiraComponent', '')
+                            params["team"] = item.get('Team', '')
                             params["freshdesk_ticket"] = item.get('FreshdeskTicket', '')
                             params["target_version"] = item.get('TargetVersion', '')
                             params["tags"] = item.get('Tags', '')
@@ -2808,6 +2816,7 @@ class JIRAExtractor:
         self.qa_effort_actual_field = os.getenv('JIRA_QA_EFFORT_ACTUAL_FIELD_ID', 'customfield_12483')
         self.tshirt_estimation_field = os.getenv('JIRA_TSHIRT_ESTIMATION_FIELD_ID', 'customfield_12489')
         self.ticket_type_field = os.getenv('JIRA_TICKET_TYPE_FIELD_ID', 'customfield_12491')
+        self.team_field = os.getenv('JIRA_TEAM_FIELD_ID', 'customfield_12628')
         self.freshdesk_ticket_field = os.getenv('JIRA_FRESHDESK_TICKET_FIELD_ID', 'customfield_12476')
         self.target_version_fields = [
             os.getenv('JIRA_TARGET_VERSION_FIELD_ID', 'customfield_12490'),
@@ -3200,6 +3209,7 @@ class JIRAExtractor:
             'ParentID': parent_id,
             'ParentJiraKey': parent_jira_key,
             'TicketType': self._extract_value(fields, self.ticket_type_field) or '',
+            'Team': (self._extract_value(fields, self.team_field) or '').strip(),
             'JiraComponent': self._jira_component(fields),
             'FreshdeskTicket': self._extract_value(fields, self.freshdesk_ticket_field) or '',
             'TargetVersion': self._first_value(fields, self.target_version_fields) or ", ".join(
@@ -3461,7 +3471,7 @@ class JIRAExtractor:
             self.hf_status_field, self.hf_requested_versions_field, self.effort_field,
             self.effort_dev_estimate_field, self.effort_dev_actual_field,
             self.qa_effort_estimation_field, self.qa_effort_actual_field,
-            self.tshirt_estimation_field, self.ticket_type_field, self.freshdesk_ticket_field,
+            self.tshirt_estimation_field, self.ticket_type_field, self.team_field, self.freshdesk_ticket_field,
             self.ado_work_item_id_field, self.ado_created_date_field,
             *self.target_version_fields, *self.connector_fields, self.blocker_field,
             self.business_value_field, self.business_outcome_field
