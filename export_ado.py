@@ -3343,12 +3343,63 @@ class JIRAExtractor:
         state_changes.append([created_date.isoformat(), "", new_state])
         return 1
 
-    def _handle_jira_changes(self, items, table_name_getter, db_connection=None):
+    def _collect_jira_changelog_rows(self, jira_key, changelog, record_id, table_name, cutover):
+        rows = []
+        state_changes = []
+        state_rows_inserted = 0
+        for history in changelog:
+            changed_date_obj = normalize_utc_naive(self._parse_jira_date(history.get("created")))
+            if not changed_date_obj:
+                continue
+            changed_by = history.get("author", {}).get("displayName", "")
+            if is_jira_migration_changelog_entry(changed_by, changed_date_obj, cutover):
+                continue
+            for history_item in history.get("items", []):
+                field_changed = self._jira_change_field_name(history_item)
+                if not field_changed:
+                    continue
+                old_value = history_item.get("fromString", "") or ""
+                new_value = history_item.get("toString", "") or ""
+                if field_changed == "System.State":
+                    old_value = self._normalize_jira_state_to_ado_state(old_value)
+                    new_value = self._normalize_jira_state_to_ado_state(new_value)
+
+                if field_changed == "Work Log Entry" and new_value:
+                    old_value = ""
+                    worklog_details = self._get_worklog_details(jira_key, new_value)
+                    if worklog_details:
+                        new_value = str(
+                            worklog_details.get('timeSpentSeconds')
+                            or worklog_details.get('timeSpent')
+                            or new_value
+                        )
+
+                rows.append({
+                    "record_id": record_id,
+                    "jira_id": jira_key,
+                    "table_name": table_name,
+                    "field_changed": field_changed,
+                    "old_value": str(old_value)[:500] if old_value else "",
+                    "new_value": str(new_value)[:500] if new_value else "",
+                    "changed_by": changed_by,
+                    "changed_date": changed_date_obj,
+                })
+
+                if field_changed == "System.State":
+                    state_rows_inserted += 1
+                    state_changes.append([history.get("created", ""), old_value, new_value])
+
+        return rows, state_changes, state_rows_inserted
+
+    def _handle_jira_changes(self, items, db_connection=None):
         if not items:
             return {}
 
         all_state_changes = {}
         total_items = len(items)
+        tracked_fields = list(JIRA_CHANGE_HISTORY_FIELDS)
+        cutover = get_jira_cutover_date()
+
         for index, item_data in enumerate(items, start=1):
             if index == 1 or index % 500 == 0 or index == total_items:
                 LOGGER.info(f"------>Processing Jira changelog {index}/{total_items}")
@@ -3371,87 +3422,43 @@ class JIRAExtractor:
 
             changelog = issue_data.get("changelog", {}).get("histories", [])
             issue_fields = issue_data.get("fields", {})
-            state_changes = []
-            table_name = table_name_getter(item_data)
-            tracked_fields = (
-                'System.State',
-                'System.IterationPath',
-                'Work Log Entry',
-                'Custom.HFstatus',
-                'Microsoft.VSTS.Scheduling.TargetDate',
-                'Custom.HFrequestedversions',
-            )
+            table_name = jira_change_history_table_name(item_data)
 
             if db_connection:
                 with db_connection.engine.connect() as connection:
                     try:
-                        cutover = get_jira_cutover_date()
                         connection.execute(
                             text("""
                                 DELETE FROM change_history
                                 WHERE record_id = :record_id
                                 AND source = 'JIRA'
+                                AND table_name = :table_name
                                 AND field_changed = ANY(:tracked_fields)
                             """),
                             {
                                 "record_id": record_id,
-                                "tracked_fields": list(tracked_fields),
+                                "table_name": table_name,
+                                "tracked_fields": tracked_fields,
                             }
                         )
 
-                        state_rows_inserted = 0
-                        for history in changelog:
-                            changed_date_obj = normalize_utc_naive(self._parse_jira_date(history.get("created")))
-                            if not changed_date_obj:
-                                continue
-                            changed_by = history.get("author", {}).get("displayName", "")
-                            if is_jira_migration_changelog_entry(changed_by, changed_date_obj, cutover):
-                                continue
-                            for history_item in history.get("items", []):
-                                field_changed = self._jira_change_field_name(history_item)
-                                if not field_changed:
-                                    continue
-                                old_value = history_item.get("fromString", "") or ""
-                                new_value = history_item.get("toString", "") or ""
-                                if field_changed == "System.State":
-                                    old_value = self._normalize_jira_state_to_ado_state(old_value)
-                                    new_value = self._normalize_jira_state_to_ado_state(new_value)
+                        rows_to_insert, state_changes, state_rows_inserted = self._collect_jira_changelog_rows(
+                            jira_key, changelog, record_id, table_name, cutover
+                        )
 
-                                if field_changed == "Work Log Entry" and new_value:
-                                    old_value = ""
-                                    worklog_details = self._get_worklog_details(jira_key, new_value)
-                                    if worklog_details:
-                                        new_value = str(
-                                            worklog_details.get('timeSpentSeconds')
-                                            or worklog_details.get('timeSpent')
-                                            or new_value
-                                        )
-
-                                connection.execute(
-                                    text("""
-                                        INSERT INTO change_history
-                                        (record_id, jira_id, source, table_name, field_changed, old_value, new_value, changed_by, changed_date)
-                                        VALUES
-                                        (:record_id, :jira_id, 'JIRA', :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
-                                    """),
-                                    {
-                                        "record_id": record_id,
-                                        "jira_id": jira_key,
-                                        "table_name": table_name,
-                                        "field_changed": field_changed,
-                                        "old_value": str(old_value)[:500] if old_value else "",
-                                        "new_value": str(new_value)[:500] if new_value else "",
-                                        "changed_by": changed_by,
-                                        "changed_date": changed_date_obj,
-                                    }
-                                )
-
-                                if field_changed == "System.State":
-                                    state_rows_inserted += 1
-                                    state_changes.append([history.get("created", ""), old_value, new_value])
+                        if rows_to_insert:
+                            connection.execute(
+                                text("""
+                                    INSERT INTO change_history
+                                    (record_id, jira_id, source, table_name, field_changed, old_value, new_value, changed_by, changed_date)
+                                    VALUES
+                                    (:record_id, :jira_id, 'JIRA', :table_name, :field_changed, :old_value, :new_value, :changed_by, :changed_date)
+                                """),
+                                rows_to_insert,
+                            )
 
                         if state_rows_inserted == 0:
-                            state_rows_inserted += self._insert_initial_jira_state_history(
+                            self._insert_initial_jira_state_history(
                                 connection,
                                 record_id=record_id,
                                 jira_key=jira_key,
@@ -3465,7 +3472,9 @@ class JIRAExtractor:
                     except SQLAlchemyError as e:
                         LOGGER.error(f"Error processing Jira changes for {jira_key}: {str(e)}")
                         connection.rollback()
+                        state_changes = []
             else:
+                state_changes = []
                 for history in changelog:
                     for history_item in history.get("items", []):
                         if self._jira_change_field_name(history_item) == "System.State":
@@ -3550,18 +3559,22 @@ class JIRAExtractor:
         return items
 
     def handle_work_item_changes(self, work_items, db_connection=None):
-        return self._handle_jira_changes(
-            work_items,
-            lambda item: item.get('WorkItemType', 'work_items'),
-            db_connection
-        )
+        return self._handle_jira_changes(work_items, db_connection)
 
     def handle_bug_changes(self, bugs, db_connection=None):
-        return self._handle_jira_changes(
-            bugs,
-            lambda item: 'bugs',
-            db_connection
-        )
+        return self._handle_jira_changes(bugs, db_connection)
+
+    def sync_change_history(self, work_items, bugs, db_connection=None):
+        """One Jira changelog fetch per unique issue (bugs deduped against work items)."""
+        items = merge_jira_changelog_items(work_items, bugs)
+        if items:
+            work_count = len(work_items or [])
+            bug_count = len(bugs or [])
+            LOGGER.info(
+                f"------>Syncing Jira changelog for {len(items)} unique items "
+                f"({work_count} work items + {bug_count} bugs input)"
+            )
+        return self._handle_jira_changes(items, db_connection)
 
     def normalize_existing_jira_states(self, db_connection):
         """Backfill existing Jira-owned rows that were synced before state normalization existed."""
@@ -3906,6 +3919,37 @@ WORK_ITEM_CHANGE_HISTORY_FIELDS = (
     'System.IterationPath',
 )
 
+JIRA_CHANGE_HISTORY_FIELDS = (
+    'System.State',
+    'System.IterationPath',
+    'Work Log Entry',
+    'Custom.HFstatus',
+    'Microsoft.VSTS.Scheduling.TargetDate',
+    'Custom.HFrequestedversions',
+)
+
+
+def jira_change_history_table_name(item):
+    """Map a Jira item to change_history.table_name (bugs table vs ADO work item type)."""
+    work_item_type = item.get('WorkItemType', '')
+    if work_item_type == 'Bug':
+        return 'bugs'
+    return work_item_type or 'work_items'
+
+
+def merge_jira_changelog_items(work_items, bugs):
+    """Deduplicate changelog targets by jira_id; bugs list wins for Bug issuetype."""
+    by_key = {}
+    for item in work_items or []:
+        jira_key = item.get('JiraID')
+        if jira_key:
+            by_key[jira_key] = item
+    for item in bugs or []:
+        jira_key = item.get('JiraID')
+        if jira_key:
+            by_key[jira_key] = item
+    return list(by_key.values())
+
 
 def backfill_migrated_created_dates(db, jira_extractor):
     """Refresh created_date from Azure DevOps Created Date (customfield_12499) for migrated items."""
@@ -4014,10 +4058,11 @@ def repair_migrated_change_history(db, ado_extractor, jira_extractor=None):
         for row in work_item_rows
     ]
 
-    LOGGER.info(f"------>Refreshing post-cutover Jira history for {len(jira_bug_items)} bugs")
-    jira_extractor.handle_bug_changes(jira_bug_items, db)
-    LOGGER.info(f"------>Refreshing post-cutover Jira history for {len(jira_work_items)} work items")
-    jira_extractor.handle_work_item_changes(jira_work_items, db)
+    LOGGER.info(
+        f"------>Refreshing post-cutover Jira history for "
+        f"{len(jira_bug_items)} bugs and {len(jira_work_items)} work items"
+    )
+    jira_extractor.sync_change_history(jira_work_items, jira_bug_items, db)
     return ado_restored
 
 
@@ -4301,20 +4346,15 @@ def main():
                     db.update_sync_status('bug', processed_jira_bugs)
                 LOGGER.info("------>Updated sync status for Jira work items, issues, and bugs")
 
-                LOGGER.info("------>Processing Jira work item state changes")
                 if skip_jira_history:
-                    LOGGER.info("------>Skipping Jira work item state changes")
+                    LOGGER.info("------>Skipping Jira change-history refresh")
                 else:
-                    jira_extractor.handle_work_item_changes(jira_work_items, db)
-                    LOGGER.info(f"------>Processed Jira state changes for {len(jira_work_items)} work items")
+                    merged_changelog_items = merge_jira_changelog_items(jira_work_items, jira_bugs)
+                    jira_extractor.sync_change_history(jira_work_items, jira_bugs, db)
+                    LOGGER.info(
+                        f"------>Processed Jira state changes for {len(merged_changelog_items)} unique items"
+                    )
                 db.update_jira_parent_links(jira_work_items)
-
-                LOGGER.info("------>Processing Jira bug state changes")
-                if skip_jira_history:
-                    LOGGER.info("------>Skipping Jira bug state changes")
-                else:
-                    jira_extractor.handle_bug_changes(jira_bugs, db)
-                    LOGGER.info(f"------>Processed Jira state changes for {len(jira_bugs)} bugs")
                 db.update_jira_parent_links(jira_bugs)
 
                 jira_extractor.normalize_existing_jira_states(db)
