@@ -12,7 +12,26 @@ from sqlalchemy.exc import SQLAlchemyError
 import json
 import re
 import sys
+import logging
 from abc import ABC, abstractmethod
+
+LOGGER = logging.getLogger(__name__)
+
+
+def configure_logging():
+    """Configure stdout logging with timestamps (once)."""
+    if LOGGER.handlers:
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+    LOGGER.addHandler(handler)
+    level_name = os.getenv('LOG_LEVEL', 'INFO').upper()
+    LOGGER.setLevel(getattr(logging, level_name, logging.INFO))
+    LOGGER.propagate = False
+
 
 # Import GitHub Copilot metrics extractor
 try:
@@ -137,10 +156,10 @@ class DatabaseConnection:
                 connection.commit()
                 
                 rows_affected = result.rowcount
-                print(f"Updated {rows_affected} bugs with new parent issue references")
+                LOGGER.info(f"Updated {rows_affected} bugs with new parent issue references")
                 
         except SQLAlchemyError as e:
-            print(f"Error updating parent issues: {str(e)}")
+            LOGGER.error(f"Error updating parent issues: {str(e)}")
             connection.rollback()
             raise
 
@@ -193,11 +212,11 @@ class DatabaseConnection:
                     updated += result.rowcount
                 connection.commit()
             except SQLAlchemyError as e:
-                print(f"Error updating Jira parent links: {str(e)}")
+                LOGGER.error(f"Error updating Jira parent links: {str(e)}")
                 connection.rollback()
                 raise
         if updated:
-            print(f"Updated {updated} Jira records with resolved parent links")
+            LOGGER.info(f"Updated {updated} Jira records with resolved parent links")
         return updated
 
     def purge_invalid_jira_change_history(self):
@@ -221,7 +240,7 @@ class DatabaseConnection:
             )
             connection.commit()
             deleted = result.rowcount
-        print(f"------>Purged {deleted} invalid Jira change_history rows (pre-cutover or migration replay)")
+        LOGGER.info(f"------>Purged {deleted} invalid Jira change_history rows (pre-cutover or migration replay)")
         return deleted
 
     def _add_new_columns(self, connection, table_name):
@@ -583,12 +602,12 @@ class DatabaseConnection:
                     
                     connection.commit()
                 except SQLAlchemyError as e:
-                    print(f"Error creating indexes: {str(e)}")
+                    LOGGER.error(f"Error creating indexes: {str(e)}")
                     connection.rollback()
                     raise
                 
         except SQLAlchemyError as e:
-            print(f"Error setting up database: {str(e)}")
+            LOGGER.error(f"Error setting up database: {str(e)}")
             raise
 
     def get_last_sync_time(self, entity_type):
@@ -645,7 +664,7 @@ class DatabaseConnection:
                 )
                 connection.commit()
             except SQLAlchemyError as e:
-                print(f"Error updating full sync status: {str(e)}")
+                LOGGER.error(f"Error updating full sync status: {str(e)}")
                 connection.rollback()
 
     def update_sync_status(self, entity_type, records_processed, status='completed'):
@@ -665,7 +684,7 @@ class DatabaseConnection:
                 )
                 connection.commit()
             except SQLAlchemyError as e:
-                print(f"Error updating sync status: {str(e)}")
+                LOGGER.error(f"Error updating sync status: {str(e)}")
                 connection.rollback()
 
     def update_history_snapshots(self):
@@ -698,7 +717,7 @@ class DatabaseConnection:
                 connection.execute(text(merge_query))
                 connection.commit()
         except SQLAlchemyError as e:
-            print(f"Error updating history snapshots: {str(e)}")
+            LOGGER.error(f"Error updating history snapshots: {str(e)}")
             raise
 
     def update_bug_relations(self, bug_id, relations):
@@ -737,13 +756,13 @@ class DatabaseConnection:
                                 }
                             )
                         except (ValueError, IndexError) as e:
-                            print(f"Error processing relation URL for bug {bug_id}: {str(e)}")
+                            LOGGER.error(f"Error processing relation URL for bug {bug_id}: {str(e)}")
                             continue
 
                 connection.commit()
                 
         except SQLAlchemyError as e:
-            print(f"Error updating relations for bug {bug_id}: {str(e)}")
+            LOGGER.error(f"Error updating relations for bug {bug_id}: {str(e)}")
             connection.rollback()
             raise
 
@@ -825,7 +844,7 @@ class DatabaseConnection:
 
                     if result:
                         if item.get('Source', 'ADO') != 'JIRA' and result[0]:
-                            print(f"Skipping ADO update for {table.name} {item['ID']} because it is owned by Jira ({result[0]})")
+                            LOGGER.info(f"Skipping ADO update for {table.name} {item['ID']} because it is owned by Jira ({result[0]})")
                             processed_count += 1
                             continue
 
@@ -990,7 +1009,7 @@ class DatabaseConnection:
                     connection.commit()
                     processed_count += 1
                 except SQLAlchemyError as e:
-                    print(f"Error upserting item {item['ID']}: {str(e)}")
+                    LOGGER.error(f"Error upserting item {item['ID']}: {str(e)}")
                     connection.rollback()
                     # Ensure identity insert is turned OFF in case of error
                     try:
@@ -1067,7 +1086,7 @@ class DatabaseConnection:
                     connection.commit()
                     processed_count += 1
                 except SQLAlchemyError as e:
-                    print(f"Error upserting sprint {sprint['id']}: {str(e)}")
+                    LOGGER.error(f"Error upserting sprint {sprint['id']}: {str(e)}")
                     connection.rollback()
 
             try:
@@ -1085,9 +1104,9 @@ class DatabaseConnection:
                 )
                 connection.commit()
                 if cleanup.rowcount:
-                    print(f"------>Removed {cleanup.rowcount} duplicate Jira sprint rows with ADO path equivalents")
+                    LOGGER.info(f"------>Removed {cleanup.rowcount} duplicate Jira sprint rows with ADO path equivalents")
             except SQLAlchemyError as e:
-                print(f"Error cleaning duplicate Jira sprints: {str(e)}")
+                LOGGER.error(f"Error cleaning duplicate Jira sprints: {str(e)}")
                 connection.rollback()
 
         return processed_count
@@ -1171,7 +1190,7 @@ class DatabaseConnection:
                     connection.commit()
                     processed_count += 1
                 except SQLAlchemyError as e:
-                    print(f"Error upserting sprint capacity for {capacity.get('team_member_name', 'unknown')} in sprint {capacity.get('sprint_id', 'unknown')}: {str(e)}")
+                    LOGGER.error(f"Error upserting sprint capacity for {capacity.get('team_member_name', 'unknown')} in sprint {capacity.get('sprint_id', 'unknown')}: {str(e)}")
                     connection.rollback()
 
         return processed_count
@@ -1248,7 +1267,7 @@ class ADOExtractor:
         else:
             last_update_str = last_update
         
-        print(f"------>Fetching {work_item_type} items with ChangedDate >= {last_update_str}")
+        LOGGER.info(f"------>Fetching {work_item_type} items with ChangedDate >= {last_update_str}")
         
         # Modified WIQL query to include all required fields
         query_payload = {
@@ -1280,7 +1299,7 @@ class ADOExtractor:
         # Get work item IDs
         response = requests.post(query_url, json=query_payload, headers=self.headers)
         if response.status_code != 200:
-            print(f"Error fetching WIQL query: {response.status_code} - {response.text}")
+            LOGGER.error(f"Error fetching WIQL query: {response.status_code} - {response.text}")
             return []
 
         work_items = response.json().get("workItems", [])
@@ -1299,8 +1318,8 @@ class ADOExtractor:
             details_response = requests.get(details_url, headers=self.headers)
             
             if details_response.status_code != 200:
-                print(f"Error fetching work item details: {details_response.status_code}")
-                print(f"Response text: {details_response.text}")
+                LOGGER.error(f"Error fetching work item details: {details_response.status_code}")
+                LOGGER.info(f"Response text: {details_response.text}")
                 continue  # Skip this batch but continue with others
             
             batch_data = []
@@ -1408,7 +1427,7 @@ class ADOExtractor:
                 ).first()
                 return bool(result and result[0])
         except SQLAlchemyError as e:
-            print(f"Warning: could not check Jira ownership for {table_name} {record_id}: {str(e)}")
+            LOGGER.warning(f"Warning: could not check Jira ownership for {table_name} {record_id}: {str(e)}")
             return False
 
     def _parse_ado_changed_date(self, changed_date):
@@ -1435,7 +1454,7 @@ class ADOExtractor:
         updates_url = f"https://dev.azure.com/{self.organization}/{self.project}/_apis/wit/workitems/{record_id}/updates?api-version=7.0"
         response = requests.get(updates_url, headers=self.headers)
         if response.status_code != 200:
-            print(f"Error fetching ADO history for {record_id}: {response.status_code}")
+            LOGGER.error(f"Error fetching ADO history for {record_id}: {response.status_code}")
             return 0
 
         inserted = 0
@@ -1499,7 +1518,7 @@ class ADOExtractor:
 
                 connection.commit()
             except SQLAlchemyError as e:
-                print(f"Error storing pre-cutover ADO history for {record_id}: {str(e)}")
+                LOGGER.error(f"Error storing pre-cutover ADO history for {record_id}: {str(e)}")
                 connection.rollback()
         return inserted
 
@@ -1542,7 +1561,7 @@ class ADOExtractor:
             response = requests.get(updates_url, headers=self.headers)
             
             if response.status_code != 200:
-                print(f"Error fetching changes for bug {bug_id}: {response.status_code}")
+                LOGGER.error(f"Error fetching changes for bug {bug_id}: {response.status_code}")
                 continue
                 
             updates = response.json().get("value", [])
@@ -1640,7 +1659,7 @@ class ADOExtractor:
                         connection.commit()
                         
                     except SQLAlchemyError as e:
-                        print(f"Error processing changes for bug {bug_id}: {str(e)}")
+                        LOGGER.error(f"Error processing changes for bug {bug_id}: {str(e)}")
                         connection.rollback()
             else:
                 # If no database connection, just collect the state changes
@@ -1677,30 +1696,30 @@ class ADOExtractor:
                         bug_id = int(row['id'])
                         bug_ids.append(bug_id)
                     except (KeyError, ValueError) as e:
-                        print(f"Error processing row: {row}. Error: {str(e)}")
+                        LOGGER.error(f"Error processing row: {row}. Error: {str(e)}")
                         continue
 
             if not bug_ids:
-                print("No valid bug IDs found in the CSV file")
+                LOGGER.info("No valid bug IDs found in the CSV file")
                 return
 
-            print(f"Found {len(bug_ids)} bug IDs in the CSV file")
-            print("Processing state changes...")
+            LOGGER.info(f"Found {len(bug_ids)} bug IDs in the CSV file")
+            LOGGER.info("Processing state changes...")
             
             # Process state changes in batches of 50 to avoid overwhelming the API
             batch_size = 50
             for i in range(0, len(bug_ids), batch_size):
                 batch = bug_ids[i:i + batch_size]
-                print(f"Processing batch {i//batch_size + 1} ({len(batch)} bugs)...")
+                LOGGER.info(f"Processing batch {i//batch_size + 1} ({len(batch)} bugs)...")
                 self.handle_bug_changes(batch, db_connection)
                 time.sleep(1)  # Add a small delay between batches
                 
-            print("Completed processing bug history updates")
+            LOGGER.info("Completed processing bug history updates")
             
         except FileNotFoundError:
-            print(f"CSV file not found: {csv_file_path}")
+            LOGGER.error(f"CSV file not found: {csv_file_path}")
         except Exception as e:
-            print(f"Error processing CSV file: {str(e)}")
+            LOGGER.error(f"Error processing CSV file: {str(e)}")
 
     def update_bugs_relations_from_csv(self, csv_file_path):
         """
@@ -1709,7 +1728,7 @@ class ADOExtractor:
             csv_file_path: Path to the CSV file containing bug IDs
         """
         if not hasattr(self, 'db_connection'):
-            print("No database connection available")
+            LOGGER.info("No database connection available")
             return
 
         try:
@@ -1721,21 +1740,21 @@ class ADOExtractor:
                         bug_id = int(row['id'])
                         bug_ids.append(bug_id)
                     except (KeyError, ValueError) as e:
-                        print(f"Error processing row: {row}. Error: {str(e)}")
+                        LOGGER.error(f"Error processing row: {row}. Error: {str(e)}")
                         continue
 
             if not bug_ids:
-                print("No valid bug IDs found in the CSV file")
+                LOGGER.info("No valid bug IDs found in the CSV file")
                 return
 
-            print(f"Found {len(bug_ids)} bug IDs in the CSV file")
-            print("Processing bug relations...")
+            LOGGER.info(f"Found {len(bug_ids)} bug IDs in the CSV file")
+            LOGGER.info("Processing bug relations...")
             
             # Process bugs in batches of 200 to match Azure DevOps API recommendations
             batch_size = 200
             for i in range(0, len(bug_ids), batch_size):
                 batch = bug_ids[i:i + batch_size]
-                print(f"Processing batch {i//batch_size + 1} ({len(batch)} bugs)...")
+                LOGGER.info(f"Processing batch {i//batch_size + 1} ({len(batch)} bugs)...")
                 
                 # Get work item details with relations
                 item_ids = ",".join(str(bug_id) for bug_id in batch)
@@ -1744,8 +1763,8 @@ class ADOExtractor:
                 details_response = requests.get(details_url, headers=self.headers)
                 
                 if details_response.status_code != 200:
-                    print(f"Error fetching work item details: {details_response.status_code}")
-                    print(f"Response text: {details_response.text}")
+                    LOGGER.error(f"Error fetching work item details: {details_response.status_code}")
+                    LOGGER.info(f"Response text: {details_response.text}")
                     continue
 
                 # Process each work item's relations
@@ -1754,16 +1773,16 @@ class ADOExtractor:
                     relations = item.get("relations", [])
                     self.db_connection.update_bug_relations(bug_id, relations)
                 
-                print(f"Completed processing relations for batch {i//batch_size + 1}")
+                LOGGER.info(f"Completed processing relations for batch {i//batch_size + 1}")
                 if len(batch) == batch_size:
                     time.sleep(1)  # Rate limiting between large batches
                 
-            print("Completed processing bug relations")
+            LOGGER.info("Completed processing bug relations")
             
         except FileNotFoundError:
-            print(f"CSV file not found: {csv_file_path}")
+            LOGGER.error(f"CSV file not found: {csv_file_path}")
         except Exception as e:
-            print(f"Error processing CSV file: {str(e)}")
+            LOGGER.error(f"Error processing CSV file: {str(e)}")
 
     def update_bugs_customer_names_from_csv(self, csv_file_path):
         """
@@ -1772,7 +1791,7 @@ class ADOExtractor:
             csv_file_path: Path to the CSV file containing bug IDs
         """
         if not hasattr(self, 'db_connection'):
-            print("No database connection available")
+            LOGGER.info("No database connection available")
             return
 
         try:
@@ -1784,21 +1803,21 @@ class ADOExtractor:
                         bug_id = int(row['id'])
                         bug_ids.append(bug_id)
                     except (KeyError, ValueError) as e:
-                        print(f"Error processing row: {row}. Error: {str(e)}")
+                        LOGGER.error(f"Error processing row: {row}. Error: {str(e)}")
                         continue
 
             if not bug_ids:
-                print("No valid bug IDs found in the CSV file")
+                LOGGER.info("No valid bug IDs found in the CSV file")
                 return
 
-            print(f"Found {len(bug_ids)} bug IDs in the CSV file")
-            print("Processing bug customer names...")
+            LOGGER.info(f"Found {len(bug_ids)} bug IDs in the CSV file")
+            LOGGER.info("Processing bug customer names...")
             
             # Process bugs in batches of 200 to match Azure DevOps API recommendations
             batch_size = 200
             for i in range(0, len(bug_ids), batch_size):
                 batch = bug_ids[i:i + batch_size]
-                print(f"Processing batch {i//batch_size + 1} ({len(batch)} bugs)...")
+                LOGGER.info(f"Processing batch {i//batch_size + 1} ({len(batch)} bugs)...")
                 
                 # Get work item details
                 item_ids = ",".join(str(bug_id) for bug_id in batch)
@@ -1807,8 +1826,8 @@ class ADOExtractor:
                 details_response = requests.get(details_url, headers=self.headers)
                 
                 if details_response.status_code != 200:
-                    print(f"Error fetching work item details: {details_response.status_code}")
-                    print(f"Response text: {details_response.text}")
+                    LOGGER.error(f"Error fetching work item details: {details_response.status_code}")
+                    LOGGER.info(f"Response text: {details_response.text}")
                     continue
 
                 # Process each work item's customer name
@@ -1818,7 +1837,7 @@ class ADOExtractor:
                         fields = item["fields"]
                         customer_name = fields.get('Custom.CustomernameGRC', '')
                         
-                        print(f"Bug {bug_id} - Customer Name: {customer_name}")
+                        LOGGER.info(f"Bug {bug_id} - Customer Name: {customer_name}")
                         
                         try:
                             # Update the customer name in the database
@@ -1835,19 +1854,19 @@ class ADOExtractor:
                             )
                             connection.commit()
                         except SQLAlchemyError as e:
-                            print(f"Error updating customer name for bug {bug_id}: {str(e)}")
+                            LOGGER.error(f"Error updating customer name for bug {bug_id}: {str(e)}")
                             connection.rollback()
                 
-                print(f"Completed processing customer names for batch {i//batch_size + 1}")
+                LOGGER.info(f"Completed processing customer names for batch {i//batch_size + 1}")
                 if len(batch) == batch_size:
                     time.sleep(1)  # Rate limiting between large batches
                 
-            print("Completed processing bug customer names")
+            LOGGER.info("Completed processing bug customer names")
             
         except FileNotFoundError:
-            print(f"CSV file not found: {csv_file_path}")
+            LOGGER.error(f"CSV file not found: {csv_file_path}")
         except Exception as e:
-            print(f"Error processing CSV file: {str(e)}")
+            LOGGER.error(f"Error processing CSV file: {str(e)}")
 
     def update_issues_customer_names_from_csv(self, csv_file_path):
         """
@@ -1856,7 +1875,7 @@ class ADOExtractor:
             csv_file_path: Path to the CSV file containing issue IDs
         """
         if not hasattr(self, 'db_connection'):
-            print("No database connection available")
+            LOGGER.info("No database connection available")
             return
 
         try:
@@ -1868,21 +1887,21 @@ class ADOExtractor:
                         issue_id = int(row['id'])
                         issue_ids.append(issue_id)
                     except (KeyError, ValueError) as e:
-                        print(f"Error processing row: {row}. Error: {str(e)}")
+                        LOGGER.error(f"Error processing row: {row}. Error: {str(e)}")
                         continue
 
             if not issue_ids:
-                print("No valid issue IDs found in the CSV file")
+                LOGGER.info("No valid issue IDs found in the CSV file")
                 return
 
-            print(f"Found {len(issue_ids)} issue IDs in the CSV file")
-            print("Processing issue customer names...")
+            LOGGER.info(f"Found {len(issue_ids)} issue IDs in the CSV file")
+            LOGGER.info("Processing issue customer names...")
             
             # Process issues in batches of 200 to match Azure DevOps API recommendations
             batch_size = 200
             for i in range(0, len(issue_ids), batch_size):
                 batch = issue_ids[i:i + batch_size]
-                print(f"Processing batch {i//batch_size + 1} ({len(batch)} issues)...")
+                LOGGER.info(f"Processing batch {i//batch_size + 1} ({len(batch)} issues)...")
                 
                 # Get work item details
                 item_ids = ",".join(str(issue_id) for issue_id in batch)
@@ -1891,8 +1910,8 @@ class ADOExtractor:
                 details_response = requests.get(details_url, headers=self.headers)
                 
                 if details_response.status_code != 200:
-                    print(f"Error fetching work item details: {details_response.status_code}")
-                    print(f"Response text: {details_response.text}")
+                    LOGGER.error(f"Error fetching work item details: {details_response.status_code}")
+                    LOGGER.info(f"Response text: {details_response.text}")
                     continue
 
                 # Process each work item's customer name
@@ -1902,7 +1921,7 @@ class ADOExtractor:
                         fields = item["fields"]
                         customer_name = fields.get('Custom.CustomernameGRC', '')
                         
-                        print(f"Issue {issue_id} - Customer Name: {customer_name}")
+                        LOGGER.info(f"Issue {issue_id} - Customer Name: {customer_name}")
                         
                         try:
                             # Update the customer name in the database
@@ -1919,19 +1938,19 @@ class ADOExtractor:
                             )
                             connection.commit()
                         except SQLAlchemyError as e:
-                            print(f"Error updating customer name for issue {issue_id}: {str(e)}")
+                            LOGGER.error(f"Error updating customer name for issue {issue_id}: {str(e)}")
                             connection.rollback()
                 
-                print(f"Completed processing customer names for batch {i//batch_size + 1}")
+                LOGGER.info(f"Completed processing customer names for batch {i//batch_size + 1}")
                 if len(batch) == batch_size:
                     time.sleep(1)  # Rate limiting between large batches
                 
-            print("Completed processing issue customer names")
+            LOGGER.info("Completed processing issue customer names")
             
         except FileNotFoundError:
-            print(f"CSV file not found: {csv_file_path}")
+            LOGGER.error(f"CSV file not found: {csv_file_path}")
         except Exception as e:
-            print(f"Error processing CSV file: {str(e)}")
+            LOGGER.error(f"Error processing CSV file: {str(e)}")
 
     def get_all_work_items(self, last_update):
         """Query all work items regardless of type that were changed since last update"""
@@ -1943,7 +1962,7 @@ class ADOExtractor:
         else:
             last_update_str = last_update
         
-        print(f"------>Fetching all work items with ChangedDate >= {last_update_str}")
+        LOGGER.info(f"------>Fetching all work items with ChangedDate >= {last_update_str}")
         
         # Modified WIQL query to include all required fields without type filter
         query_payload = {
@@ -1990,7 +2009,7 @@ class ADOExtractor:
         # Get work item IDs
         response = requests.post(query_url, json=query_payload, headers=self.headers)
         if response.status_code != 200:
-            print(f"Error fetching WIQL query: {response.status_code} - {response.text}")
+            LOGGER.error(f"Error fetching WIQL query: {response.status_code} - {response.text}")
             return []
 
         work_items = response.json().get("workItems", [])
@@ -2009,8 +2028,8 @@ class ADOExtractor:
             details_response = requests.get(details_url, headers=self.headers)
             
             if details_response.status_code != 200:
-                print(f"Error fetching work item details: {details_response.status_code}")
-                print(f"Response text: {details_response.text}")
+                LOGGER.error(f"Error fetching work item details: {details_response.status_code}")
+                LOGGER.info(f"Response text: {details_response.text}")
                 continue
             
             batch_data = []
@@ -2182,19 +2201,19 @@ class ADOExtractor:
             details_response = requests.get(details_url, headers=self.headers)
             
             if details_response.status_code != 200:
-                print(f"Error fetching work item details for {work_item_id}: {details_response.status_code}")
+                LOGGER.error(f"Error fetching work item details for {work_item_id}: {details_response.status_code}")
                 continue
 
             work_item_type = details_response.json()["fields"].get("System.WorkItemType")
             if not work_item_type:
-                print(f"Could not determine work item type for {work_item_id}")
+                LOGGER.warning(f"Could not determine work item type for {work_item_id}")
                 continue
 
             updates_url = f"https://dev.azure.com/{self.organization}/{self.project}/_apis/wit/workitems/{work_item_id}/updates?api-version=7.0"
             response = requests.get(updates_url, headers=self.headers)
             
             if response.status_code != 200:
-                print(f"Error fetching state changes for work item {work_item_id}: {response.status_code}")
+                LOGGER.error(f"Error fetching state changes for work item {work_item_id}: {response.status_code}")
                 continue
                 
             updates = response.json().get("value", [])
@@ -2344,7 +2363,7 @@ class ADOExtractor:
                                     "business_outcome": fields.get('Custom.BusinessOutcome', '')
                                 }
                             )
-                            print(f"Inserted missing work item {work_item_id} of type {work_item_type}")
+                            LOGGER.info(f"Inserted missing work item {work_item_id} of type {work_item_type}")
 
                         # Delete all existing entries for this work item
                         connection.execute(
@@ -2413,7 +2432,7 @@ class ADOExtractor:
                         connection.commit()
                         
                     except SQLAlchemyError as e:
-                        print(f"Error processing state changes for work item {work_item_id}: {str(e)}")
+                        LOGGER.error(f"Error processing state changes for work item {work_item_id}: {str(e)}")
                         connection.rollback()
             else:
                 # If no database connection, just collect the state changes
@@ -2436,7 +2455,7 @@ class ADOExtractor:
 
     def update_sprints(self):
         """Fetch all sprints from Azure DevOps and update the database"""
-        print("------>Fetching sprints from Azure DevOps")
+        LOGGER.info("------>Fetching sprints from Azure DevOps")
         
         all_sprints = []
         total_processed = 0
@@ -2446,19 +2465,19 @@ class ADOExtractor:
             project_name = scrum_config['project']
             team_name = scrum_config['team']
             
-            print(f"------>Processing sprints for project: {project_name}, team: {team_name}")
+            LOGGER.info(f"------>Processing sprints for project: {project_name}, team: {team_name}")
             
             # Get teams for this project
             teams_url = f"https://dev.azure.com/{self.organization}/_apis/projects/{project_name}/teams?api-version=7.0"
             teams_response = requests.get(teams_url, headers=self.headers)
             
             if teams_response.status_code != 200:
-                print(f"Error fetching teams for project {project_name}: {teams_response.status_code} - {teams_response.text}")
+                LOGGER.error(f"Error fetching teams for project {project_name}: {teams_response.status_code} - {teams_response.text}")
                 continue
             
             teams = teams_response.json().get("value", [])
             if not teams:
-                print(f"No teams found in project {project_name}")
+                LOGGER.info(f"No teams found in project {project_name}")
                 continue
             
             # Find the specific team if specified, otherwise use the first team
@@ -2471,27 +2490,27 @@ class ADOExtractor:
                         break
                 
                 if not target_team:
-                    print(f"Team '{team_name}' not found in project {project_name}. Available teams: {[t['name'] for t in teams]}")
+                    LOGGER.info(f"Team '{team_name}' not found in project {project_name}. Available teams: {[t['name'] for t in teams]}")
                     continue
             else:
                 # Use the first team if no specific team is specified
                 target_team = teams[0]
-                print(f"Using first team: {target_team['name']}")
+                LOGGER.info(f"Using first team: {target_team['name']}")
             
             team_id = target_team["id"]
             actual_team_name = target_team["name"]
-            print(f"------>Fetching sprints for team: {actual_team_name} in project: {project_name}")
+            LOGGER.info(f"------>Fetching sprints for team: {actual_team_name} in project: {project_name}")
             
             # Get iterations (sprints) for this team
             iterations_url = f"https://dev.azure.com/{self.organization}/{project_name}/{team_id}/_apis/work/teamsettings/iterations?api-version=7.0"
             iterations_response = requests.get(iterations_url, headers=self.headers)
             
             if iterations_response.status_code != 200:
-                print(f"Error fetching iterations for team {actual_team_name} in project {project_name}: {iterations_response.status_code}")
+                LOGGER.error(f"Error fetching iterations for team {actual_team_name} in project {project_name}: {iterations_response.status_code}")
                 continue
             
             iterations = iterations_response.json().get("value", [])
-            print(f"------>Found {len(iterations)} iterations for team {actual_team_name}")
+            LOGGER.info(f"------>Found {len(iterations)} iterations for team {actual_team_name}")
             
             for iteration in iterations:
                 # Get detailed iteration information
@@ -2500,7 +2519,7 @@ class ADOExtractor:
                 detail_response = requests.get(iteration_detail_url, headers=self.headers)
                 
                 if detail_response.status_code != 200:
-                    print(f"Error fetching iteration details for {iteration['name']}: {detail_response.status_code}")
+                    LOGGER.error(f"Error fetching iteration details for {iteration['name']}: {detail_response.status_code}")
                     continue
                 
                 iteration_detail = detail_response.json()
@@ -2517,7 +2536,7 @@ class ADOExtractor:
                         try:
                             start_date = datetime.strptime(attributes["startDate"], "%Y-%m-%dT%H:%M:%SZ")
                         except ValueError:
-                            print(f"Could not parse start date: {attributes['startDate']}")
+                            LOGGER.warning(f"Could not parse start date: {attributes['startDate']}")
                 
                 if "finishDate" in attributes and attributes["finishDate"]:
                     try:
@@ -2526,7 +2545,7 @@ class ADOExtractor:
                         try:
                             finish_date = datetime.strptime(attributes["finishDate"], "%Y-%m-%dT%H:%M:%SZ")
                         except ValueError:
-                            print(f"Could not parse finish date: {attributes['finishDate']}")
+                            LOGGER.warning(f"Could not parse finish date: {attributes['finishDate']}")
                 
                 sprint_data = {
                     'id': iteration_detail["id"],
@@ -2542,10 +2561,10 @@ class ADOExtractor:
         # Update database with sprints
         if hasattr(self, 'db_connection') and self.db_connection:
             processed_count = self.db_connection.upsert_sprints(all_sprints)
-            print(f"------>Processed {processed_count} sprints from {len(self.scrum_projects)} project:team combinations")
+            LOGGER.info(f"------>Processed {processed_count} sprints from {len(self.scrum_projects)} project:team combinations")
             return processed_count
         else:
-            print("------>No database connection available for sprints update")
+            LOGGER.info("------>No database connection available for sprints update")
             return 0
 
     def update_sprint_capacities(self, current_sprint_only=True):
@@ -2562,19 +2581,19 @@ class ADOExtractor:
             project_name = scrum_config['project']
             team_name = scrum_config['team']
             
-            print(f"------>Processing sprint capacities for project: {project_name}, team: {team_name}")
+            LOGGER.info(f"------>Processing sprint capacities for project: {project_name}, team: {team_name}")
             
             # Get teams for this project
             teams_url = f"https://dev.azure.com/{self.organization}/_apis/projects/{project_name}/teams?api-version=7.0"
             teams_response = requests.get(teams_url, headers=self.headers)
             
             if teams_response.status_code != 200:
-                print(f"Error fetching teams for project {project_name}: {teams_response.status_code} - {teams_response.text}")
+                LOGGER.error(f"Error fetching teams for project {project_name}: {teams_response.status_code} - {teams_response.text}")
                 continue
             
             teams = teams_response.json().get("value", [])
             if not teams:
-                print(f"No teams found in project {project_name}")
+                LOGGER.info(f"No teams found in project {project_name}")
                 continue
             
             # Find the specific team if specified, otherwise use the first team
@@ -2586,26 +2605,26 @@ class ADOExtractor:
                         break
                 
                 if not target_team:
-                    print(f"Team '{team_name}' not found in project {project_name}. Available teams: {[t['name'] for t in teams]}")
+                    LOGGER.info(f"Team '{team_name}' not found in project {project_name}. Available teams: {[t['name'] for t in teams]}")
                     continue
             else:
                 target_team = teams[0]
-                print(f"Using first team: {target_team['name']}")
+                LOGGER.info(f"Using first team: {target_team['name']}")
             
             team_id = target_team["id"]
             actual_team_name = target_team["name"]
-            print(f"------>Fetching sprint capacities for team: {actual_team_name} in project: {project_name}")
+            LOGGER.info(f"------>Fetching sprint capacities for team: {actual_team_name} in project: {project_name}")
             
             # Get iterations (sprints) for this team
             iterations_url = f"https://dev.azure.com/{self.organization}/{project_name}/{team_id}/_apis/work/teamsettings/iterations?api-version=7.0"
             iterations_response = requests.get(iterations_url, headers=self.headers)
             
             if iterations_response.status_code != 200:
-                print(f"Error fetching iterations for team {actual_team_name} in project {project_name}: {iterations_response.status_code}")
+                LOGGER.error(f"Error fetching iterations for team {actual_team_name} in project {project_name}: {iterations_response.status_code}")
                 continue
             
             iterations = iterations_response.json().get("value", [])
-            print(f"------>Found {len(iterations)} iterations for team {actual_team_name}")
+            LOGGER.info(f"------>Found {len(iterations)} iterations for team {actual_team_name}")
             
             # Filter iterations based on current_sprint_only flag
             iterations_to_process = []
@@ -2664,7 +2683,7 @@ class ADOExtractor:
                         'detail': iteration_detail
                     })
             
-            print(f"------>Processing capacities for {len(iterations_to_process)} iteration(s)")
+            LOGGER.info(f"------>Processing capacities for {len(iterations_to_process)} iteration(s)")
             
             for iter_data in iterations_to_process:
                 iteration = iter_data['iteration']
@@ -2678,13 +2697,13 @@ class ADOExtractor:
                 capacity_response = requests.get(capacity_url, headers=self.headers)
                 
                 if capacity_response.status_code != 200:
-                    print(f"Error fetching capacity for iteration {iteration_name}: {capacity_response.status_code} - {capacity_response.text}")
+                    LOGGER.error(f"Error fetching capacity for iteration {iteration_name}: {capacity_response.status_code} - {capacity_response.text}")
                     continue
                 
                 response_json = capacity_response.json()
                 # API returns data in 'teamMembers' key, not 'value'
                 capacity_data = response_json.get("teamMembers", [])
-                print(f"------>Found {len(capacity_data)} team member capacity records for sprint: {iteration_name}")
+                LOGGER.info(f"------>Found {len(capacity_data)} team member capacity records for sprint: {iteration_name}")
                 
                 for member_capacity in capacity_data:
                     team_member = member_capacity.get("teamMember", {})
@@ -2772,10 +2791,10 @@ class ADOExtractor:
         # Update database with capacities
         if hasattr(self, 'db_connection') and self.db_connection:
             processed_count = self.db_connection.upsert_sprint_capacities(all_capacities)
-            print(f"------>Processed {processed_count} sprint capacity records from {len(self.scrum_projects)} project:team combinations")
+            LOGGER.info(f"------>Processed {processed_count} sprint capacity records from {len(self.scrum_projects)} project:team combinations")
             return processed_count
         else:
-            print("------>No database connection available for sprint capacities update")
+            LOGGER.info("------>No database connection available for sprint capacities update")
             return 0
 
 class JIRAExtractor:
@@ -2833,7 +2852,7 @@ class JIRAExtractor:
     def _request_json(self, path, params=None):
         response = requests.get(f"{self.jira_url}{path}", headers=self.headers, params=params, timeout=60)
         if response.status_code != 200:
-            print(f"Error fetching Jira data from {path}: {response.status_code} - {response.text}")
+            LOGGER.error(f"Error fetching Jira data from {path}: {response.status_code} - {response.text}")
             return None
         return response.json()
 
@@ -2907,7 +2926,7 @@ class JIRAExtractor:
                 return datetime.strptime(value, date_format)
             except ValueError:
                 continue
-        print(f"Warning: unsupported Jira date format: {value}")
+        LOGGER.warning(f"Warning: unsupported Jira date format: {value}")
         return None
 
     def _normalize_priority_to_ado_severity(self, priority_name):
@@ -2930,7 +2949,7 @@ class JIRAExtractor:
         if any(token in normalized for token in ('lowest', 'low', 'minor', 'trivial')):
             return '4'
 
-        print(f"Warning: unknown Jira priority '{priority_name}', keeping original value")
+        LOGGER.warning(f"Warning: unknown Jira priority '{priority_name}', keeping original value")
         return priority_text
 
     def _normalize_jira_state_to_ado_state(self, state_name):
@@ -2956,7 +2975,7 @@ class JIRAExtractor:
         if mapped_state:
             return mapped_state
 
-        print(f"Warning: unknown Jira state '{state_name}', keeping original value")
+        LOGGER.warning(f"Warning: unknown Jira state '{state_name}', keeping original value")
         return state_text
 
     def _extract_migrated_ado_id(self, fields):
@@ -2968,7 +2987,7 @@ class JIRAExtractor:
                 raw_value = raw_value.replace(',', '').strip()
             return int(float(raw_value))
         except (TypeError, ValueError):
-            print(f"Warning: could not parse ADO work item id from {self.ado_work_item_id_field}: {raw_value}")
+            LOGGER.warning(f"Warning: could not parse ADO work item id from {self.ado_work_item_id_field}: {raw_value}")
             return None
 
     def _compatibility_id(self, issue, table_name):
@@ -2991,7 +3010,7 @@ class JIRAExtractor:
                 ).first()
                 if existing and not (existing[0] == jira_key or existing[1] == 'JIRA'):
                     fallback_id = 1_000_000_000 + jira_internal_id
-                    print(
+                    LOGGER.info(
                         f"Warning: Jira issue {jira_key} internal id {jira_internal_id} collides with "
                         f"existing {table_name} row. Using compatibility id {fallback_id}."
                     )
@@ -3237,7 +3256,7 @@ class JIRAExtractor:
                 params['nextPageToken'] = next_page_token
             response = requests.get(f"{self.jira_url}/rest/api/3/search/jql", headers=self.headers, params=params, timeout=60)
             if response.status_code != 200:
-                print(f"Error fetching Jira issues: {response.status_code} - {response.text}")
+                LOGGER.error(f"Error fetching Jira issues: {response.status_code} - {response.text}")
                 break
             data = response.json()
             issues.extend(data.get("issues", []))
@@ -3332,15 +3351,15 @@ class JIRAExtractor:
         total_items = len(items)
         for index, item_data in enumerate(items, start=1):
             if index == 1 or index % 500 == 0 or index == total_items:
-                print(f"------>Processing Jira changelog {index}/{total_items}")
+                LOGGER.info(f"------>Processing Jira changelog {index}/{total_items}")
             if not isinstance(item_data, dict):
-                print(f"Skipping Jira change history for unsupported item reference: {item_data}")
+                LOGGER.info(f"Skipping Jira change history for unsupported item reference: {item_data}")
                 continue
 
             record_id = item_data['ID']
             jira_key = item_data.get('JiraID')
             if not jira_key:
-                print(f"Skipping Jira change history for {record_id}; missing jira_id")
+                LOGGER.info(f"Skipping Jira change history for {record_id}; missing jira_id")
                 continue
 
             issue_data = self._request_json(
@@ -3444,7 +3463,7 @@ class JIRAExtractor:
 
                         connection.commit()
                     except SQLAlchemyError as e:
-                        print(f"Error processing Jira changes for {jira_key}: {str(e)}")
+                        LOGGER.error(f"Error processing Jira changes for {jira_key}: {str(e)}")
                         connection.rollback()
             else:
                 for history in changelog:
@@ -3480,14 +3499,14 @@ class JIRAExtractor:
 
     def get_all_work_items(self, last_update, full_sync=False):
         if full_sync:
-            print(f"------>Fetching all Jira work items for project {self.project_key}")
+            LOGGER.info(f"------>Fetching all Jira work items for project {self.project_key}")
             jql_query = (
                 f'project = {self.project_key} '
                 f'AND issuetype in (Story, Bug, Task, Epic, "Sub-task") '
                 f'ORDER BY updated DESC'
             )
         else:
-            print(f"------>Fetching Jira work items with updated >= {last_update}")
+            LOGGER.info(f"------>Fetching Jira work items with updated >= {last_update}")
             jql_query = (
                 f'project = {self.project_key} '
                 f'AND issuetype in (Story, Bug, Task, Epic, "Sub-task") '
@@ -3499,23 +3518,23 @@ class JIRAExtractor:
             item_data = self._base_item_data(issue, 'work_items')
             item_data['WorkItemType'] = self._extract_value(issue['fields'], 'issuetype') or 'Unknown'
             work_items.append(item_data)
-        print(f"------>Total Jira work items fetched: {len(work_items)}")
+        LOGGER.info(f"------>Total Jira work items fetched: {len(work_items)}")
         return work_items
 
     def get_work_items(self, work_item_type, last_update, full_sync=False):
         if work_item_type == 'Issue Report':
-            print("------>Skipping Jira Issue Report sync; NEXUS has no Issue Report issue type")
+            LOGGER.info("------>Skipping Jira Issue Report sync; NEXUS has no Issue Report issue type")
             return []
 
         if full_sync:
-            print(f"------>Fetching all Jira {work_item_type} items for project {self.project_key}")
+            LOGGER.info(f"------>Fetching all Jira {work_item_type} items for project {self.project_key}")
             jql_query = (
                 f'project = {self.project_key} '
                 f'AND issuetype = "{work_item_type}" '
                 f'ORDER BY updated DESC'
             )
         else:
-            print(f"------>Fetching Jira {work_item_type} items with updated >= {last_update}")
+            LOGGER.info(f"------>Fetching Jira {work_item_type} items with updated >= {last_update}")
             jql_query = (
                 f'project = {self.project_key} '
                 f'AND issuetype = "{work_item_type}" '
@@ -3527,7 +3546,7 @@ class JIRAExtractor:
             item_data = self._base_item_data(issue, 'bugs' if work_item_type == 'Bug' else 'work_items')
             item_data['WorkItemType'] = work_item_type
             items.append(item_data)
-        print(f"------>Total Jira {work_item_type} items fetched: {len(items)}")
+        LOGGER.info(f"------>Total Jira {work_item_type} items fetched: {len(items)}")
         return items
 
     def handle_work_item_changes(self, work_items, db_connection=None):
@@ -3600,7 +3619,7 @@ class JIRAExtractor:
                     )
                 connection.commit()
             except SQLAlchemyError as e:
-                print(f"Error normalizing existing Jira states: {str(e)}")
+                LOGGER.error(f"Error normalizing existing Jira states: {str(e)}")
                 connection.rollback()
 
     def _resolve_boards(self):
@@ -3770,15 +3789,15 @@ class JIRAExtractor:
     def update_sprints(self):
         boards = self._resolve_boards()
         if not boards:
-            print("------>Skipping Jira sprints sync; no boards configured or discovered")
+            LOGGER.info("------>Skipping Jira sprints sync; no boards configured or discovered")
             return 0
 
         all_sprints = []
         seen_ids = set()
         for board in boards:
-            print(f"------>Fetching Jira sprints for board {board['name']} ({board['id']})")
+            LOGGER.info(f"------>Fetching Jira sprints for board {board['name']} ({board['id']})")
             board_sprints = self._fetch_sprints_for_board(board['id'], board['name'])
-            print(f"------>Found {len(board_sprints)} sprints for board {board['name']}")
+            LOGGER.info(f"------>Found {len(board_sprints)} sprints for board {board['name']}")
             for sprint in board_sprints:
                 if sprint['id'] in seen_ids:
                     continue
@@ -3794,17 +3813,17 @@ class JIRAExtractor:
 
         if hasattr(self, 'db_connection') and self.db_connection:
             processed_count = self.db_connection.upsert_sprints(all_sprints)
-            print(f"------>Processed {processed_count} Jira sprints from {len(boards)} board(s)")
+            LOGGER.info(f"------>Processed {processed_count} Jira sprints from {len(boards)} board(s)")
             return processed_count
         return 0
 
     def update_sprint_capacities(self, current_sprint_only=True):
         boards = self._resolve_boards()
         if not boards:
-            print("------>Skipping Jira sprint capacity sync; no boards configured or discovered")
+            LOGGER.info("------>Skipping Jira sprint capacity sync; no boards configured or discovered")
             return 0
 
-        print(f"------>Fetching Jira sprint capacities from {len(boards)} board(s)")
+        LOGGER.info(f"------>Fetching Jira sprint capacities from {len(boards)} board(s)")
         all_capacities = []
         for board in boards:
             board_sprints = self._fetch_sprints_for_board(board['id'], board['name'])
@@ -3812,7 +3831,7 @@ class JIRAExtractor:
             if current_sprint_only:
                 sprints_to_process = [sprint for sprint in board_sprints if sprint.get('state') == 'active']
 
-            print(
+            LOGGER.info(
                 f"------>Processing capacities for {len(sprints_to_process)} sprint(s) "
                 f"on board {board['name']}"
             )
@@ -3822,7 +3841,7 @@ class JIRAExtractor:
 
         if hasattr(self, 'db_connection') and self.db_connection:
             processed_count = self.db_connection.upsert_sprint_capacities(all_capacities)
-            print(f"------>Processed {processed_count} Jira sprint capacity records from {len(boards)} board(s)")
+            LOGGER.info(f"------>Processed {processed_count} Jira sprint capacity records from {len(boards)} board(s)")
             return processed_count
         return 0
 
@@ -3904,7 +3923,7 @@ def backfill_migrated_created_dates(db, jira_extractor):
             ).fetchall()
         ]
 
-    print(f"------>Backfilling created_date for {len(keys)} Jira keys from ADO Created Date field")
+    LOGGER.info(f"------>Backfilling created_date for {len(keys)} Jira keys from ADO Created Date field")
     fields_param = jira_extractor._fields_param()
     updated = 0
     batch_size = 50
@@ -3930,17 +3949,17 @@ def backfill_migrated_created_dates(db, jira_extractor):
         updated += len(work_items)
 
         if index == 0 or (index // batch_size) % 20 == 0 or index + batch_size >= len(keys):
-            print(f"------>Created date backfill {min(index + batch_size, len(keys))}/{len(keys)}")
+            LOGGER.info(f"------>Created date backfill {min(index + batch_size, len(keys))}/{len(keys)}")
         time.sleep(0.15)
 
-    print(f"------>Updated created_date for {updated} migrated items")
+    LOGGER.info(f"------>Updated created_date for {updated} migrated items")
     return updated
 
 
 def repair_migrated_change_history(db, ado_extractor, jira_extractor=None):
     """One-time repair: ADO history before cutover, Jira history after cutover only."""
     cutover = get_jira_cutover_date()
-    print(f"------>Repairing migrated change history (cutover UTC: {cutover.isoformat(sep=' ')})")
+    LOGGER.info(f"------>Repairing migrated change history (cutover UTC: {cutover.isoformat(sep=' ')})")
 
     db.purge_invalid_jira_change_history()
 
@@ -3960,11 +3979,11 @@ def repair_migrated_change_history(db, ado_extractor, jira_extractor=None):
         ).fetchall()
 
     total_ado = len(bug_rows) + len(work_item_rows)
-    print(f"------>Restoring pre-cutover ADO history for {total_ado} migrated records")
+    LOGGER.info(f"------>Restoring pre-cutover ADO history for {total_ado} migrated records")
 
     for index, row in enumerate(bug_rows, start=1):
         if index == 1 or index % 250 == 0 or index == len(bug_rows):
-            print(f"------>ADO bug history restore {index}/{len(bug_rows)}")
+            LOGGER.info(f"------>ADO bug history restore {index}/{len(bug_rows)}")
         ado_restored += ado_extractor.store_pre_cutover_history(
             row[0], 'bugs', BUG_CHANGE_HISTORY_FIELDS, jira_id=row[1], db_connection=db
         )
@@ -3973,20 +3992,20 @@ def repair_migrated_change_history(db, ado_extractor, jira_extractor=None):
 
     for index, row in enumerate(work_item_rows, start=1):
         if index == 1 or index % 250 == 0 or index == len(work_item_rows):
-            print(f"------>ADO work item history restore {index}/{len(work_item_rows)}")
+            LOGGER.info(f"------>ADO work item history restore {index}/{len(work_item_rows)}")
         ado_restored += ado_extractor.store_pre_cutover_history(
             row[0], row[2], WORK_ITEM_CHANGE_HISTORY_FIELDS, jira_id=row[1], db_connection=db
         )
         if index % 50 == 0:
             time.sleep(0.2)
 
-    print(f"------>Inserted {ado_restored} pre-cutover ADO change_history rows")
+    LOGGER.info(f"------>Inserted {ado_restored} pre-cutover ADO change_history rows")
 
     if jira_extractor:
         backfill_migrated_created_dates(db, jira_extractor)
 
     if not jira_extractor:
-        print("------>Skipping post-cutover Jira history refresh (no Jira extractor configured)")
+        LOGGER.info("------>Skipping post-cutover Jira history refresh (no Jira extractor configured)")
         return ado_restored
 
     jira_bug_items = [{'ID': row[0], 'JiraID': row[1], 'WorkItemType': 'Bug'} for row in bug_rows]
@@ -3995,14 +4014,15 @@ def repair_migrated_change_history(db, ado_extractor, jira_extractor=None):
         for row in work_item_rows
     ]
 
-    print(f"------>Refreshing post-cutover Jira history for {len(jira_bug_items)} bugs")
+    LOGGER.info(f"------>Refreshing post-cutover Jira history for {len(jira_bug_items)} bugs")
     jira_extractor.handle_bug_changes(jira_bug_items, db)
-    print(f"------>Refreshing post-cutover Jira history for {len(jira_work_items)} work items")
+    LOGGER.info(f"------>Refreshing post-cutover Jira history for {len(jira_work_items)} work items")
     jira_extractor.handle_work_item_changes(jira_work_items, db)
     return ado_restored
 
 
 def main():
+    configure_logging()
     # Load configuration from .env file
     organization = os.getenv('ADO_ORGANIZATION')
     project = os.getenv('ADO_PROJECT')
@@ -4054,9 +4074,9 @@ def main():
         jira_extractor = JIRAExtractor(jira_url, jira_project, jira_email, jira_token, jira_board_id, board_ids=board_ids)
         jira_extractor.db_connection = db
         if board_ids:
-            print(f"------>Jira sync enabled for project {jira_project}, boards {board_ids}")
+            LOGGER.info(f"------>Jira sync enabled for project {jira_project}, boards {board_ids}")
         else:
-            print(f"------>Jira sync enabled for project {jira_project}, auto-discovering boards (fallback board {jira_board_id})")
+            LOGGER.info(f"------>Jira sync enabled for project {jira_project}, auto-discovering boards (fallback board {jira_board_id})")
 
     if repair_jira_history:
         if not all([organization, project, pat]):
@@ -4067,7 +4087,7 @@ def main():
         ado_for_repair.db_connection = db
         repair_migrated_change_history(db, ado_for_repair, jira_extractor)
         if repair_only:
-            print("Jira history repair completed; exiting")
+            LOGGER.info("Jira history repair completed; exiting")
             return
 
     # Process bugs from CSV file
@@ -4084,29 +4104,29 @@ def main():
 
     SLEEP_INTERVAL = int(os.getenv('SYNC_INTERVAL_SECONDS', 60 * 60))  # 1 hour by default
     
-    print(f"Starting continuous sync with {SLEEP_INTERVAL/60} minute intervals")
+    LOGGER.info(f"Starting continuous sync with {SLEEP_INTERVAL/60} minute intervals")
     if run_once:
-        print("Running a single sync cycle (--once/RUN_ONCE enabled)")
+        LOGGER.info("Running a single sync cycle (--once/RUN_ONCE enabled)")
     if include_ado:
-        print("ADO sync enabled (INCLUDE_ADO=true)")
+        LOGGER.info("ADO sync enabled (INCLUDE_ADO=true)")
     else:
-        print("ADO sync disabled (INCLUDE_ADO=false)")
+        LOGGER.info("ADO sync disabled (INCLUDE_ADO=false)")
     if include_jira:
-        print("Jira sync enabled (INCLUDE_JIRA=true)")
+        LOGGER.info("Jira sync enabled (INCLUDE_JIRA=true)")
     if skip_ado_history:
-        print("Skipping ADO change-history refresh (--skip-ado-history/SKIP_ADO_HISTORY enabled)")
+        LOGGER.info("Skipping ADO change-history refresh (--skip-ado-history/SKIP_ADO_HISTORY enabled)")
     if skip_jira_history:
-        print("Skipping Jira change-history refresh (--skip-jira-history/SKIP_JIRA_HISTORY enabled)")
+        LOGGER.info("Skipping Jira change-history refresh (--skip-jira-history/SKIP_JIRA_HISTORY enabled)")
     if skip_github_metrics:
-        print("Skipping GitHub metric refresh (--skip-github-metrics/SKIP_GITHUB_METRICS enabled)")
+        LOGGER.info("Skipping GitHub metric refresh (--skip-github-metrics/SKIP_GITHUB_METRICS enabled)")
     if include_azure_cost:
-        print("Azure cost sync enabled (--include-azure-cost/INCLUDE_AZURE_COST)")
-    print("Press Ctrl+C to stop the program")
+        LOGGER.info("Azure cost sync enabled (--include-azure-cost/INCLUDE_AZURE_COST)")
+    LOGGER.info("Press Ctrl+C to stop the program")
     
     while True:
         try:
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"\n=== Starting sync cycle at {current_time} ===")
+            LOGGER.info(f"\n=== Starting sync cycle at {current_time} ===")
             
             # Check if full sync is disabled (for local development)
             disable_full_sync = os.getenv('DISABLE_FULL_SYNC', 'false').lower() == 'true'
@@ -4117,22 +4137,22 @@ def main():
             sync_date_override = None
             
             if disable_full_sync:
-                print(f"------>Full sync disabled (DISABLE_FULL_SYNC=true). Running delta sync only")
+                LOGGER.info(f"------>Full sync disabled (DISABLE_FULL_SYNC=true). Running delta sync only")
                 should_run_full_sync = False
             elif last_full_sync is None:
                 # First time running, do a full sync
                 should_run_full_sync = True
                 sync_date_override = datetime.now() - timedelta(days=30)
-                print(f"------>No previous full sync found. Running initial full sync (1 month back)")
+                LOGGER.info(f"------>No previous full sync found. Running initial full sync (1 month back)")
             else:
                 # Check if a week has passed since last full sync
                 days_since_full_sync = (datetime.now() - last_full_sync).days
                 if days_since_full_sync >= 7:
                     should_run_full_sync = True
                     sync_date_override = datetime.now() - timedelta(days=30)
-                    print(f"------>Last full sync was {days_since_full_sync} days ago. Running weekly full sync (1 month back)")
+                    LOGGER.info(f"------>Last full sync was {days_since_full_sync} days ago. Running weekly full sync (1 month back)")
                 else:
-                    print(f"------>Last full sync was {days_since_full_sync} days ago. Running delta sync")
+                    LOGGER.info(f"------>Last full sync was {days_since_full_sync} days ago. Running delta sync")
             
             processed_issues = 0
             processed_bugs = 0
@@ -4156,44 +4176,44 @@ def main():
                     issues_last_sync = sync_date_override
                     bugs_last_sync = sync_date_override
                     work_items_last_sync = sync_date_override
-                    print(f"------>Using ADO sync date: {sync_date_override.strftime('%Y-%m-%d')} (1 month back)")
+                    LOGGER.info(f"------>Using ADO sync date: {sync_date_override.strftime('%Y-%m-%d')} (1 month back)")
 
                 # Extract and store all work items first
                 ado_work_items_attempted = True
                 work_items = extractor.get_all_work_items(work_items_last_sync.strftime('%Y-%m-%d'))
                 processed_work_items = db.upsert_items(work_items, db.work_items, 'work_item')
-                print(f"------>Processed {processed_work_items} work items")
+                LOGGER.info(f"------>Processed {processed_work_items} work items")
 
                 # Process state changes for all work items
                 if skip_ado_history:
-                    print("------>Skipping ADO work item state changes")
+                    LOGGER.info("------>Skipping ADO work item state changes")
                 else:
-                    print("------>Processing work item state changes")
+                    LOGGER.info("------>Processing work item state changes")
                     extractor.handle_work_item_changes(work_items, db)
-                    print(f"------>Processed state changes for {len(work_items)} work items")
+                    LOGGER.info(f"------>Processed state changes for {len(work_items)} work items")
 
                 # Extract and store issues
                 ado_issues_attempted = True
                 issues = extractor.get_work_items('Issue Report', issues_last_sync.strftime('%Y-%m-%d'))
                 processed_issues = db.upsert_items(issues, db.issues, 'issue')
-                print(f"------>Processed {processed_issues} issues")
+                LOGGER.info(f"------>Processed {processed_issues} issues")
 
                 # Extract and store bugs with parent relationships
                 ado_bugs_attempted = True
                 bugs = extractor.get_work_items('Bug', bugs_last_sync.strftime('%Y-%m-%d'))
                 processed_bugs = db.upsert_items(bugs, db.bugs, 'bug')
-                print(f"------>Processed {processed_bugs} bugs")
+                LOGGER.info(f"------>Processed {processed_bugs} bugs")
 
                 # Process state changes for all bugs at once
                 if skip_ado_history:
-                    print("------>Skipping ADO bug state changes")
+                    LOGGER.info("------>Skipping ADO bug state changes")
                 else:
-                    print("------>Processing bug state changes")
+                    LOGGER.info("------>Processing bug state changes")
                     extractor.handle_bug_changes(bugs, db)
-                    print(f"------>Processed state changes for {len(bugs)} bugs")
+                    LOGGER.info(f"------>Processed state changes for {len(bugs)} bugs")
 
                 # Clean up invalid parent issue references
-                print("------>Cleaning up invalid parent issue references")
+                LOGGER.info("------>Cleaning up invalid parent issue references")
                 db.update_parent_issue()
 
                 # Update sprints
@@ -4204,13 +4224,13 @@ def main():
                 ado_capacities_attempted = True
                 last_capacity_sync = db.get_last_sprint_capacity_sync()
                 if last_capacity_sync is None:
-                    print("------>First sprint capacity sync - fetching all historical data")
+                    LOGGER.info("------>First sprint capacity sync - fetching all historical data")
                     processed_capacities = extractor.update_sprint_capacities(current_sprint_only=False)
                 else:
-                    print("------>Daily sprint capacity sync - fetching current sprint only")
+                    LOGGER.info("------>Daily sprint capacity sync - fetching current sprint only")
                     processed_capacities = extractor.update_sprint_capacities(current_sprint_only=True)
             else:
-                print("------>Skipping ADO sync (INCLUDE_ADO=false)")
+                LOGGER.info("------>Skipping ADO sync (INCLUDE_ADO=false)")
 
             processed_jira_work_items = 0
             processed_jira_issues = 0
@@ -4226,17 +4246,17 @@ def main():
             if include_jira and jira_extractor:
                 jira_full_project_sync = os.getenv('JIRA_FULL_PROJECT_SYNC', 'false').lower() in ('1', 'true', 'yes')
                 if jira_full_project_sync:
-                    print("------>JIRA_FULL_PROJECT_SYNC enabled — fetching entire NEXUS project")
+                    LOGGER.info("------>JIRA_FULL_PROJECT_SYNC enabled — fetching entire NEXUS project")
                     jira_sync_from = None
                 elif not db.has_entity_sync_history('jira_work_item'):
                     jira_sync_from = get_jira_initial_sync_date()
-                    print(
+                    LOGGER.info(
                         f"------>First Jira sync — fetching all issues updated since "
                         f"{jira_sync_from.strftime('%Y-%m-%d')}"
                     )
                 elif should_run_full_sync:
                     jira_sync_from = sync_date_override
-                    print(f"------>Using Jira full sync date: {jira_sync_from.strftime('%Y-%m-%d')}")
+                    LOGGER.info(f"------>Using Jira full sync date: {jira_sync_from.strftime('%Y-%m-%d')}")
                 else:
                     jira_sync_from = db.get_last_sync_time('jira_work_item')
 
@@ -4250,7 +4270,7 @@ def main():
                     full_sync=jira_full_project_sync,
                 )
                 processed_jira_work_items = db.upsert_items(jira_work_items, db.work_items, 'work_item')
-                print(f"------>Processed {processed_jira_work_items} Jira work items")
+                LOGGER.info(f"------>Processed {processed_jira_work_items} Jira work items")
 
                 jira_issues_attempted = True
                 jira_issues = jira_extractor.get_work_items(
@@ -4259,7 +4279,7 @@ def main():
                     full_sync=jira_full_project_sync,
                 )
                 processed_jira_issues = db.upsert_items(jira_issues, db.issues, 'issue')
-                print(f"------>Processed {processed_jira_issues} Jira issues")
+                LOGGER.info(f"------>Processed {processed_jira_issues} Jira issues")
 
                 jira_bugs_attempted = True
                 jira_bugs = jira_extractor.get_work_items(
@@ -4268,9 +4288,9 @@ def main():
                     full_sync=jira_full_project_sync,
                 )
                 processed_jira_bugs = db.upsert_items(jira_bugs, db.bugs, 'bug')
-                print(f"------>Processed {processed_jira_bugs} Jira bugs")
+                LOGGER.info(f"------>Processed {processed_jira_bugs} Jira bugs")
                 processed_jira_bug_work_items = db.upsert_items(jira_bugs, db.work_items, 'work_item')
-                print(f"------>Refreshed {processed_jira_bug_work_items} Jira bugs in work_items")
+                LOGGER.info(f"------>Refreshed {processed_jira_bug_work_items} Jira bugs in work_items")
 
                 # Record sync status before slow changelog processing so bugs/status stay current
                 db.update_sync_status('jira_work_item', processed_jira_work_items)
@@ -4279,32 +4299,32 @@ def main():
                 if not include_ado:
                     db.update_sync_status('work_item', processed_jira_work_items)
                     db.update_sync_status('bug', processed_jira_bugs)
-                print("------>Updated sync status for Jira work items, issues, and bugs")
+                LOGGER.info("------>Updated sync status for Jira work items, issues, and bugs")
 
-                print("------>Processing Jira work item state changes")
+                LOGGER.info("------>Processing Jira work item state changes")
                 if skip_jira_history:
-                    print("------>Skipping Jira work item state changes")
+                    LOGGER.info("------>Skipping Jira work item state changes")
                 else:
                     jira_extractor.handle_work_item_changes(jira_work_items, db)
-                    print(f"------>Processed Jira state changes for {len(jira_work_items)} work items")
+                    LOGGER.info(f"------>Processed Jira state changes for {len(jira_work_items)} work items")
                 db.update_jira_parent_links(jira_work_items)
 
-                print("------>Processing Jira bug state changes")
+                LOGGER.info("------>Processing Jira bug state changes")
                 if skip_jira_history:
-                    print("------>Skipping Jira bug state changes")
+                    LOGGER.info("------>Skipping Jira bug state changes")
                 else:
                     jira_extractor.handle_bug_changes(jira_bugs, db)
-                    print(f"------>Processed Jira state changes for {len(jira_bugs)} bugs")
+                    LOGGER.info(f"------>Processed Jira state changes for {len(jira_bugs)} bugs")
                 db.update_jira_parent_links(jira_bugs)
 
                 jira_extractor.normalize_existing_jira_states(db)
-                print("------>Normalized existing Jira states to ADO values")
+                LOGGER.info("------>Normalized existing Jira states to ADO values")
 
                 jira_sprints_attempted = True
                 processed_jira_sprints = jira_extractor.update_sprints()
                 jira_capacities_attempted = True
                 if not db.has_entity_sync_history('jira_sprint_capacity'):
-                    print("------>First Jira sprint capacity sync - fetching all boards/sprints")
+                    LOGGER.info("------>First Jira sprint capacity sync - fetching all boards/sprints")
                     processed_jira_capacities = jira_extractor.update_sprint_capacities(current_sprint_only=False)
                 else:
                     processed_jira_capacities = jira_extractor.update_sprint_capacities(current_sprint_only=True)
@@ -4314,7 +4334,7 @@ def main():
             # Runs at most once per calendar day; daily window is a few days ending yesterday.
             processed_copilot = 0
             if skip_github_metrics:
-                print("------>Skipping Copilot metrics")
+                LOGGER.info("------>Skipping Copilot metrics")
             elif COPILOT_AVAILABLE:
                 github_org = os.getenv('GITHUB_ORG')
                 github_teams = os.getenv('GITHUB_TEAMS')
@@ -4326,9 +4346,9 @@ def main():
                     last_sync_date = last_copilot_sync.date() if last_copilot_sync and last_copilot_sync != datetime(2025, 3, 1) else None
                     
                     if last_sync_date == today:
-                        print("------>Skipping Copilot metrics (already synced today)")
+                        LOGGER.info("------>Skipping Copilot metrics (already synced today)")
                     else:
-                        print("------>Syncing GitHub Copilot metrics")
+                        LOGGER.info("------>Syncing GitHub Copilot metrics")
                         try:
                             copilot_extractor = GitHubCopilotExtractor(
                                 organization=github_org,
@@ -4336,20 +4356,20 @@ def main():
                                 team_sizes=github_team_sizes
                             )
                             if last_copilot_sync == datetime(2025, 3, 1):
-                                print("------>First Copilot sync — backfill (GITHUB_COPILOT_INITIAL_SYNC_DAYS)")
+                                LOGGER.info("------>First Copilot sync — backfill (GITHUB_COPILOT_INITIAL_SYNC_DAYS)")
                                 processed_copilot = copilot_extractor.sync_to_database(db, initial_sync=True)
                             else:
                                 processed_copilot = copilot_extractor.sync_to_database(db)
                         except Exception as e:
-                            print(f"------>Error syncing Copilot metrics: {str(e)}")
+                            LOGGER.error(f"------>Error syncing Copilot metrics: {str(e)}")
                 else:
-                    print("------>Skipping Copilot metrics (GITHUB_ORG or GITHUB_TOKEN not configured)")
+                    LOGGER.info("------>Skipping Copilot metrics (GITHUB_ORG or GITHUB_TOKEN not configured)")
 
             # Update GitHub PR metrics (if configured)
             # PR metrics sync runs DAILY to avoid excessive API calls
             processed_prs = 0
             if skip_github_metrics:
-                print("------>Skipping PR metrics")
+                LOGGER.info("------>Skipping PR metrics")
             elif PR_METRICS_AVAILABLE:
                 github_org = os.getenv('GITHUB_ORG')
                 github_pr_repos = os.getenv('GITHUB_PR_REPOS')  # Comma-separated list of repos
@@ -4362,9 +4382,9 @@ def main():
                     last_sync_date = last_pr_sync.date() if last_pr_sync and last_pr_sync != datetime(2025, 3, 1) else None
                     
                     if last_sync_date == today:
-                        print("------>Skipping PR metrics (already synced today)")
+                        LOGGER.info("------>Skipping PR metrics (already synced today)")
                     else:
-                        print("------>Syncing GitHub PR metrics (daily sync)")
+                        LOGGER.info("------>Syncing GitHub PR metrics (daily sync)")
                         try:
                             pr_extractor = GitHubPRExtractor(
                                 organization=github_org,
@@ -4374,26 +4394,26 @@ def main():
                             
                             # Check if this is the first PR metrics sync
                             if last_pr_sync == datetime(2025, 3, 1):
-                                print("------>First PR metrics sync - fetching last 90 days")
+                                LOGGER.info("------>First PR metrics sync - fetching last 90 days")
                                 processed_prs = pr_extractor.sync_to_database(db, initial_sync=True)
                             else:
                                 processed_prs = pr_extractor.sync_to_database(db)
                         except Exception as e:
-                            print(f"------>Error syncing PR metrics: {str(e)}")
+                            LOGGER.error(f"------>Error syncing PR metrics: {str(e)}")
                 else:
-                    print("------>Skipping PR metrics (GITHUB_ORG, GITHUB_PR_REPOS or GITHUB_TOKEN not configured)")
+                    LOGGER.info("------>Skipping PR metrics (GITHUB_ORG, GITHUB_PR_REPOS or GITHUB_TOKEN not configured)")
 
             # Update GitHub Actions test results (if configured)
             processed_tests = 0
             if skip_github_metrics:
-                print("------>Skipping GitHub tests")
+                LOGGER.info("------>Skipping GitHub tests")
             elif GITHUB_TESTS_AVAILABLE:
                 # Support both new GITHUB_TEST_CONFIGS and legacy GITHUB_TEST_WORKFLOWS
                 github_test_configs = os.getenv('GITHUB_TEST_CONFIGS')
                 github_test_workflows = os.getenv('GITHUB_TEST_WORKFLOWS')
                 
                 if os.getenv('GITHUB_TOKEN') and (github_test_configs or github_test_workflows):
-                    print("------>Syncing GitHub Actions test results")
+                    LOGGER.info("------>Syncing GitHub Actions test results")
                     try:
                         tests_extractor = GitHubTestsExtractor(db_connection=db)
                         
@@ -4402,15 +4422,15 @@ def main():
                         # get_last_sync_time returns default date (2025-03-01) if no sync found
                         # If it's the default, this is first sync
                         if last_tests_sync == datetime(2025, 3, 1):
-                            print("------>First GitHub tests sync - fetching last 60 days")
+                            LOGGER.info("------>First GitHub tests sync - fetching last 60 days")
                             processed_tests = tests_extractor.sync_test_runs(initial_sync=True)
                         else:
                             # Watermark from MAX(run_started_at), not a 1-day window (misses weekly CI)
                             processed_tests = tests_extractor.sync_test_runs()
                     except Exception as e:
-                        print(f"------>Error syncing GitHub tests: {str(e)}")
+                        LOGGER.error(f"------>Error syncing GitHub tests: {str(e)}")
                 else:
-                    print("------>Skipping GitHub tests (GITHUB_TOKEN or GITHUB_TEST_CONFIGS not configured)")
+                    LOGGER.info("------>Skipping GitHub tests (GITHUB_TOKEN or GITHUB_TEST_CONFIGS not configured)")
 
             # Azure subscription cost + tenant metrics (daily, at most once per 24h)
             processed_azure_cost = 0
@@ -4418,25 +4438,25 @@ def main():
                 last_azure_cost_sync = db.get_last_sync_time('azure_cost')
                 min_sync_hours = int(os.getenv('AZURE_COST_MIN_SYNC_HOURS', '24'))
                 if should_sync_azure_cost(last_azure_cost_sync, min_sync_hours):
-                    print("------>Syncing Azure subscription cost metrics")
+                    LOGGER.info("------>Syncing Azure subscription cost metrics")
                     try:
                         azure_cost_extractor = AzureCostExtractor()
                         processed_azure_cost = azure_cost_extractor.sync_to_database(db)
-                        print(f"------>Processed {processed_azure_cost} Azure cost records")
+                        LOGGER.info(f"------>Processed {processed_azure_cost} Azure cost records")
                     except Exception as e:
-                        print(f"------>Error syncing Azure cost metrics: {str(e)}")
+                        LOGGER.error(f"------>Error syncing Azure cost metrics: {str(e)}")
                 else:
                     hours_since = (datetime.now() - last_azure_cost_sync).total_seconds() / 3600
-                    print(
+                    LOGGER.info(
                         f"------>Skipping Azure cost metrics "
                         f"(last sync {hours_since:.1f}h ago; min interval {min_sync_hours}h)"
                     )
             elif include_azure_cost and not AZURE_COST_AVAILABLE:
-                print("------>Skipping Azure cost metrics (export_azure_cost not available)")
+                LOGGER.info("------>Skipping Azure cost metrics (export_azure_cost not available)")
 
             # Update history snapshots
             db.update_history_snapshots()
-            print("------>Updated history snapshots")
+            LOGGER.info("------>Updated history snapshots")
 
             # Record sync status for every step that ran (even when zero rows changed)
             if ado_issues_attempted:
@@ -4481,25 +4501,25 @@ def main():
             # Update full sync status if we ran a full sync
             if should_run_full_sync:
                 db.update_full_sync_status()
-                print("------>Updated full sync timestamp")
+                LOGGER.info("------>Updated full sync timestamp")
 
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"=== Sync cycle completed at {current_time} ===")
+            LOGGER.info(f"=== Sync cycle completed at {current_time} ===")
             if run_once:
-                print("Single sync cycle completed; exiting")
+                LOGGER.info("Single sync cycle completed; exiting")
                 break
-            print(f"Sleeping for {SLEEP_INTERVAL/60} minutes...\n")
+            LOGGER.info(f"Sleeping for {SLEEP_INTERVAL/60} minutes...\n")
             
             time.sleep(SLEEP_INTERVAL)
             
         except KeyboardInterrupt:
-            print("\nReceived interrupt signal. Shutting down gracefully...")
+            LOGGER.info("\nReceived interrupt signal. Shutting down gracefully...")
             break
         except Exception as e:
-            print(f"\nError during processing: {str(e)}")
-            print(f"\nError during processing: {e}")
-            print("Will retry in the next cycle")
-            print(f"Sleeping for {SLEEP_INTERVAL/60} minutes...")
+            LOGGER.error(f"\nError during processing: {str(e)}")
+            LOGGER.error(f"\nError during processing: {e}")
+            LOGGER.info("Will retry in the next cycle")
+            LOGGER.info(f"Sleeping for {SLEEP_INTERVAL/60} minutes...")
             time.sleep(SLEEP_INTERVAL)
 
 if __name__ == "__main__":

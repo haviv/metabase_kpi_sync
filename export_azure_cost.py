@@ -18,14 +18,33 @@ Env:
 """
 
 import json
+import logging
 import os
 import subprocess
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import Column, Date, DateTime, Float, Integer, MetaData, String, Table, text
 from sqlalchemy.exc import SQLAlchemyError
+
+LOGGER = logging.getLogger(__name__)
+
+
+def configure_logging():
+    """Configure stdout logging with timestamps (once)."""
+    if LOGGER.handlers:
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+    LOGGER.addHandler(handler)
+    level_name = os.getenv('LOG_LEVEL', 'INFO').upper()
+    LOGGER.setLevel(getattr(logging, level_name, logging.INFO))
+    LOGGER.propagate = False
 
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
@@ -265,12 +284,12 @@ class AzureCostExtractor:
         with db_connection.engine.connect() as connection:
             try:
                 for subscription, azure_name in self.subscriptions.items():
-                    print(f"------>Azure cost sync for {subscription} ({azure_name})")
+                    LOGGER.info(f"------>Azure cost sync for {subscription} ({azure_name})")
                     subscription_id = self._resolve_subscription_id(azure_name)
 
                     tenant_count = self.count_tenant_databases(azure_name)
                     monthly_cost, currency = self.get_month_to_date_cost(subscription_id)
-                    print(
+                    LOGGER.info(
                         f"        tenants={tenant_count}, month_to_date_cost={monthly_cost:.2f} {currency}"
                     )
 
@@ -300,7 +319,7 @@ class AzureCostExtractor:
                     processed += 1
 
                     service_rows = self.get_daily_service_costs(subscription_id, service_start, snapshot_date)
-                    print(f"        service cost rows={len(service_rows)} ({service_start} to {snapshot_date})")
+                    LOGGER.info(f"        service cost rows={len(service_rows)} ({service_start} to {snapshot_date})")
                     for row in service_rows:
                         connection.execute(
                             text("""
@@ -341,9 +360,10 @@ def should_sync_azure_cost(last_sync_time, min_hours=24):
 
 
 if __name__ == '__main__':
+    configure_logging()
     from export_ado import get_database_connection
 
     extractor = AzureCostExtractor()
     db = get_database_connection()
     count = extractor.sync_to_database(db)
-    print(f'Processed {count} Azure cost records')
+    LOGGER.info(f'Processed {count} Azure cost records')
