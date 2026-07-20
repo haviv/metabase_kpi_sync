@@ -800,47 +800,10 @@ class DatabaseConnection:
 
                     # Check if item exists
                     existing_columns = "jira_id, source"
-                    if item.get('Source') == 'JIRA':
-                        existing_columns += ", created_date"
-                        if item_type == 'work_item':
-                            existing_columns += ", area_path, iteration_path, parent_work_item"
-                        elif item_type == 'bug':
-                            existing_columns += ", area_path, iteration_path, parent_issue"
-                        else:
-                            existing_columns += ", area_path, iteration_path"
                     result = connection.execute(
                         text(f"SELECT {existing_columns} FROM {table.name} WHERE id = :id"),
                         {"id": item['ID']}
                     ).first()
-
-                    if result and item.get('Source') == 'JIRA':
-                        existing_created = result[2] if len(result) > 2 else None
-                        path_offset = 3
-                        if item.get('MigratedFromADO') and item.get('CreatedDate') is None and existing_created:
-                            item['CreatedDate'] = existing_created
-                        existing_area = result[path_offset] if len(result) > path_offset else None
-                        existing_iteration = result[path_offset + 1] if len(result) > path_offset + 1 else None
-                        if not item.get('AreaPath') and existing_area:
-                            item['AreaPath'] = existing_area
-                        elif (
-                            existing_area
-                            and item.get('AreaPath')
-                            and '\\' not in item['AreaPath']
-                            and (
-                                existing_area.endswith(f"\\{item['AreaPath']}")
-                                or existing_area == item['AreaPath']
-                            )
-                        ):
-                            item['AreaPath'] = existing_area
-                        if not item.get('IterationPath') and existing_iteration:
-                            item['IterationPath'] = existing_iteration
-                        elif (
-                            existing_iteration
-                            and item.get('IterationPath')
-                            and '\\' not in item['IterationPath']
-                            and existing_iteration.endswith(item['IterationPath'])
-                        ):
-                            item['IterationPath'] = existing_iteration
 
                     if result:
                         if item.get('Source', 'ADO') != 'JIRA' and result[0]:
@@ -1026,19 +989,6 @@ class DatabaseConnection:
             for sprint in sprints:
                 try:
                     sprint_id = sprint['id']
-                    result = connection.execute(
-                        text("""
-                            SELECT id FROM sprints
-                            WHERE path = :path
-                               OR (name = :name AND path NOT LIKE 'JIRA/%')
-                            ORDER BY CASE WHEN path = :path THEN 0 ELSE 1 END
-                            LIMIT 1
-                        """),
-                        {"path": sprint['path'], "name": sprint['name']},
-                    ).first()
-                    if result:
-                        sprint_id = result[0]
-
                     existing = connection.execute(
                         text("SELECT id FROM sprints WHERE id = :id"),
                         {"id": sprint_id}
@@ -1088,26 +1038,6 @@ class DatabaseConnection:
                 except SQLAlchemyError as e:
                     LOGGER.error(f"Error upserting sprint {sprint['id']}: {str(e)}")
                     connection.rollback()
-
-            try:
-                cleanup = connection.execute(
-                    text("""
-                        DELETE FROM sprints AS jira_sprint
-                        WHERE jira_sprint.path LIKE 'JIRA/%'
-                          AND EXISTS (
-                            SELECT 1
-                            FROM sprints AS ado_sprint
-                            WHERE ado_sprint.name = jira_sprint.name
-                              AND ado_sprint.path NOT LIKE 'JIRA/%'
-                          )
-                    """)
-                )
-                connection.commit()
-                if cleanup.rowcount:
-                    LOGGER.info(f"------>Removed {cleanup.rowcount} duplicate Jira sprint rows with ADO path equivalents")
-            except SQLAlchemyError as e:
-                LOGGER.error(f"Error cleaning duplicate Jira sprints: {str(e)}")
-                connection.rollback()
 
         return processed_count
 
@@ -2798,7 +2728,7 @@ class ADOExtractor:
             return 0
 
 class JIRAExtractor:
-    """Jira implementation that emits ADO-compatible item dictionaries."""
+    """Jira implementation that emits dashboard-compatible item dictionaries."""
 
     def __init__(self, jira_url, project_key, email, api_token, board_id=None, board_ids=None):
         self.jira_url = jira_url.rstrip('/')
@@ -2816,7 +2746,6 @@ class JIRAExtractor:
         self.sprint_field = os.getenv('JIRA_SPRINT_FIELD_ID', 'customfield_10020')
         self.area_path_field = os.getenv('JIRA_AREA_PATH_FIELD_ID', 'customfield_12494')
         self.story_points_field = os.getenv('JIRA_STORY_POINTS_FIELD_ID', 'customfield_10037')
-        self._area_path_cache = {}
         self.ado_work_item_id_field = os.getenv('JIRA_ADO_WORK_ITEM_ID_FIELD_ID', 'customfield_12495')
         self.ado_created_date_field = os.getenv('JIRA_ADO_CREATED_DATE_FIELD_ID', 'customfield_12499')
         self._done_statuses = {'done', 'closed'}
@@ -3020,23 +2949,6 @@ class JIRAExtractor:
     def _board_name_map(self):
         return {board['id']: board['name'] for board in self._resolve_boards()}
 
-    def _parse_ado_project_from_goal(self, goal):
-        if not goal:
-            return None
-        match = re.search(r'Migrated from ADO project:\s*(.+)', goal, re.IGNORECASE)
-        return match.group(1).strip() if match else None
-
-    def _ado_iteration_path(self, sprint_name, ado_project):
-        if not sprint_name:
-            return ''
-        if ado_project == 'PathlockGRC':
-            return f"PathlockGRC\\PLC Engineering Sprints\\{sprint_name}"
-        if ado_project == 'Flex Connectors':
-            return f"Flex Connectors\\{sprint_name}"
-        if ado_project:
-            return f"{ado_project}\\{sprint_name}"
-        return sprint_name
-
     def _parse_sprint_entries(self, fields):
         sprint_val = fields.get(self.sprint_field) or fields.get('customfield_10020') or fields.get('sprint')
         if isinstance(sprint_val, dict):
@@ -3050,13 +2962,11 @@ class JIRAExtractor:
                     match_id = re.search(r"id=(\d+)", sprint)
                     match_name = re.search(r"name=([^,\]]+)", sprint)
                     match_board = re.search(r"boardId=(\d+)", sprint)
-                    match_goal = re.search(r"goal=([^,\]]+)", sprint)
                     if match_name:
                         entries.append({
                             'id': int(match_id.group(1)) if match_id else None,
                             'name': match_name.group(1),
                             'boardId': int(match_board.group(1)) if match_board else None,
-                            'goal': match_goal.group(1) if match_goal else '',
                         })
             return entries
         if isinstance(sprint_val, str):
@@ -3064,66 +2974,28 @@ class JIRAExtractor:
         return []
 
     def _iteration_path(self, fields):
-        entries = self._parse_sprint_entries(fields)
-        if not entries:
-            return ''
-        paths = []
-        for sprint in entries:
-            sprint_name = sprint.get('name', '')
-            if not sprint_name:
-                continue
-            ado_project = self._parse_ado_project_from_goal(sprint.get('goal', ''))
-            paths.append(self._ado_iteration_path(sprint_name, ado_project))
-        return ', '.join([path for path in paths if path])
-
-    def _lookup_ado_area_path(self, leaf):
-        if not leaf or '\\' in leaf:
-            return leaf
-        if leaf in self._area_path_cache:
-            return self._area_path_cache[leaf]
-        resolved = ''
-        if hasattr(self, 'db_connection') and self.db_connection:
-            with self.db_connection.engine.connect() as connection:
-                result = connection.execute(
-                    text("""
-                        SELECT area_path
-                        FROM work_items
-                        WHERE source = 'ADO'
-                          AND area_path LIKE :pattern
-                        GROUP BY area_path
-                        ORDER BY COUNT(*) DESC
-                        LIMIT 1
-                    """),
-                    {"pattern": f"%\\{leaf}"},
-                ).first()
-                if result and result[0]:
-                    resolved = result[0]
-        if not resolved:
-            if leaf.startswith('Connectors'):
-                resolved = f"Flex Connectors\\{leaf}"
-            else:
-                resolved = leaf
-        self._area_path_cache[leaf] = resolved
-        return resolved
+        """Return the sprint names supplied by Jira without reconstructing ADO paths."""
+        return ', '.join(
+            sprint.get('name', '')
+            for sprint in self._parse_sprint_entries(fields)
+            if sprint.get('name')
+        )
 
     def _jira_component(self, fields):
         components = fields.get('components', []) or []
         names = [component.get('name', '') for component in components if component.get('name')]
         return ', '.join(names)
 
-    def _area_path(self, fields, ado_project=None):
+    def _area_path(self, fields):
         components = fields.get('components', [])
         component_path = ", ".join([component.get("name", "") for component in components if component.get("name")])
         jira_area = self._extract_value(fields, self.area_path_field) or ''
+        team = (self._extract_value(fields, self.team_field) or '').strip()
         if jira_area:
-            if '\\' in jira_area:
-                return jira_area
-            return self._lookup_ado_area_path(jira_area)
+            return jira_area
         if component_path:
             return component_path
-        if ado_project == 'Flex Connectors':
-            return ''
-        return ''
+        return team
 
     def _extract_parent_jira_key(self, fields):
         parent = fields.get('parent')
@@ -3171,13 +3043,8 @@ class JIRAExtractor:
         return normalize_utc_naive(parsed) if parsed else None
 
     def _created_date(self, fields):
-        """Use Azure DevOps Created Date for migrated items instead of Jira import timestamp."""
-        migrated = self._extract_migrated_ado_id(fields) is not None
+        """Use the original-created field stored in Jira, falling back to Jira created."""
         ado_created = self._parse_ado_created_date(fields)
-        if migrated:
-            if ado_created:
-                return ado_created
-            return None
         if ado_created:
             return ado_created
         return fields.get("created", "")
@@ -3192,10 +3059,6 @@ class JIRAExtractor:
         labels = fields.get("labels", [])
         fix_versions = fields.get("fixVersions", [])
         target_date = self._parse_jira_date(self._extract_value(fields, self.target_date_field) or fields.get('duedate'))
-        sprint_entries = self._parse_sprint_entries(fields)
-        ado_project = None
-        if sprint_entries:
-            ado_project = self._parse_ado_project_from_goal(sprint_entries[0].get('goal', ''))
         parent_jira_key = self._extract_parent_jira_key(fields)
         parent_id = self._resolve_parent_id(parent_jira_key)
 
@@ -3209,7 +3072,7 @@ class JIRAExtractor:
             'Severity': self._normalize_priority_to_ado_severity(priority.get("name", "") if priority else ""),
             'State': self._normalize_jira_state_to_ado_state(status.get("name", "") if status else ""),
             'CustomerName': self._first_value(fields, self.customer_name_fields),
-            'AreaPath': self._area_path(fields, ado_project),
+            'AreaPath': self._area_path(fields),
             'CreatedDate': self._created_date(fields),
             'MigratedFromADO': self._extract_migrated_ado_id(fields) is not None,
             'ChangedDate': fields.get("updated", ""),
@@ -3301,20 +3164,10 @@ class JIRAExtractor:
         state_changes,
     ):
         """Jira omits creation from changelog until the first transition; synthesize initial state."""
-        has_ado_history = connection.execute(
-            text("""
-                SELECT 1 FROM change_history
-                WHERE record_id = :record_id AND source = 'ADO'
-                LIMIT 1
-            """),
-            {"record_id": record_id},
-        ).first()
-        if has_ado_history:
-            return 0
-
         created_date = normalize_utc_naive(self._parse_jira_date(issue_fields.get("created")))
-        if not created_date or created_date < cutover:
+        if not created_date:
             return 0
+        baseline_date = max(created_date, cutover)
 
         status_name = (issue_fields.get("status") or {}).get("name", "")
         new_state = self._normalize_jira_state_to_ado_state(status_name)
@@ -3337,10 +3190,10 @@ class JIRAExtractor:
                 "table_name": table_name,
                 "new_value": new_state,
                 "changed_by": changed_by,
-                "changed_date": created_date,
+                "changed_date": baseline_date,
             },
         )
-        state_changes.append([created_date.isoformat(), "", new_state])
+        state_changes.append([baseline_date.isoformat(), "", new_state])
         return 1
 
     def _collect_jira_changelog_rows(self, jira_key, changelog, record_id, table_name, cutover):
@@ -3653,6 +3506,7 @@ class JIRAExtractor:
                 boards.append({
                     'id': str(board_id),
                     'name': board_data.get('name', f"Board {board_id}"),
+                    'type': board_data.get('type', ''),
                 })
         else:
             start_at = 0
@@ -3669,6 +3523,7 @@ class JIRAExtractor:
                     boards.append({
                         'id': str(board.get('id')),
                         'name': board.get('name', f"Board {board.get('id')}"),
+                        'type': board.get('type', ''),
                     })
                 if data.get('isLast', True):
                     break
@@ -3679,6 +3534,7 @@ class JIRAExtractor:
             boards.append({
                 'id': str(self.board_id),
                 'name': board_data.get('name', f"Board {self.board_id}"),
+                'type': board_data.get('type', ''),
             })
 
         self._boards_cache = boards
@@ -3699,15 +3555,10 @@ class JIRAExtractor:
             ) or {}
             for sprint in data.get('values', []):
                 sprint_name = sprint.get('name', '')
-                ado_project = self._parse_ado_project_from_goal(sprint.get('goal', ''))
-                if ado_project:
-                    sprint_path = self._ado_iteration_path(sprint_name, ado_project)
-                else:
-                    sprint_path = f"JIRA/{self.project_key}/{board_name}/{sprint_name}"
                 sprints.append({
                     'id': str(sprint.get('id')),
                     'name': sprint_name,
-                    'path': sprint_path,
+                    'path': sprint_name,
                     'start_date': self._parse_jira_date(sprint.get('startDate')) if sprint.get('startDate') else None,
                     'finish_date': self._parse_jira_date(sprint.get('endDate')) if sprint.get('endDate') else None,
                     'state': sprint.get('state', ''),
@@ -3800,7 +3651,7 @@ class JIRAExtractor:
         return capacities
 
     def update_sprints(self):
-        boards = self._resolve_boards()
+        boards = [board for board in self._resolve_boards() if board.get('type') == 'scrum']
         if not boards:
             LOGGER.info("------>Skipping Jira sprints sync; no boards configured or discovered")
             return 0
@@ -3831,7 +3682,7 @@ class JIRAExtractor:
         return 0
 
     def update_sprint_capacities(self, current_sprint_only=True):
-        boards = self._resolve_boards()
+        boards = [board for board in self._resolve_boards() if board.get('type') == 'scrum']
         if not boards:
             LOGGER.info("------>Skipping Jira sprint capacity sync; no boards configured or discovered")
             return 0
@@ -4074,11 +3925,13 @@ def main():
     scrum_project = os.getenv('ADO_SCRUM_PROJECT')
     pat = os.getenv('ADO_PERSONAL_ACCESS_TOKEN')
 
-    include_ado = os.getenv('INCLUDE_ADO', 'true').lower() in ('1', 'true', 'yes')
-    if '--skip-ado' in sys.argv:
-        include_ado = False
-    elif '--include-ado' in sys.argv:
-        include_ado = True
+    ado_requested = (
+        os.getenv('INCLUDE_ADO', 'false').lower() in ('1', 'true', 'yes')
+        or '--include-ado' in sys.argv
+    )
+    if ado_requested:
+        raise ValueError("ADO sync is retired; use INCLUDE_JIRA=true")
+    include_ado = False
 
     include_jira = os.getenv('INCLUDE_JIRA', 'false').lower() in ('1', 'true', 'yes') or '--include-jira' in sys.argv
     repair_jira_history = os.getenv('JIRA_REPAIR_HISTORY', 'false').lower() in ('1', 'true', 'yes') or '--repair-jira-history' in sys.argv
@@ -4124,16 +3977,9 @@ def main():
             LOGGER.info(f"------>Jira sync enabled for project {jira_project}, auto-discovering boards (fallback board {jira_board_id})")
 
     if repair_jira_history:
-        if not all([organization, project, pat]):
-            raise ValueError("Jira history repair requires ADO_ORGANIZATION, ADO_PROJECT, and ADO_PERSONAL_ACCESS_TOKEN")
-        if not jira_extractor:
-            raise ValueError("Jira history repair requires INCLUDE_JIRA=true for post-cutover Jira history")
-        ado_for_repair = extractor or ADOExtractor(organization, project, pat, scrum_project)
-        ado_for_repair.db_connection = db
-        repair_migrated_change_history(db, ado_for_repair, jira_extractor)
-        if repair_only:
-            LOGGER.info("Jira history repair completed; exiting")
-            return
+        raise ValueError(
+            "ADO-backed Jira history repair is retired; run the normal Jira history sync"
+        )
 
     # Process bugs from CSV file
     # bugs_csv_file_path = '/Users/haviv_rosh/work/scripts_python/metabase/bugs_202503011913.csv'
