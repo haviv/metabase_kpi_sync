@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import os
 from dotenv import load_dotenv
 from pathlib import Path
-from sqlalchemy import create_engine, text, Table, Column, Integer, String, DateTime, MetaData, ForeignKey, inspect, Float
+from sqlalchemy import create_engine, text, Table, Column, Integer, String, DateTime, Date, MetaData, ForeignKey, inspect, Float
 from sqlalchemy.dialects.postgresql import TEXT as PG_TEXT
 from sqlalchemy.exc import SQLAlchemyError
 import json
@@ -16,6 +16,23 @@ import logging
 from abc import ABC, abstractmethod
 
 LOGGER = logging.getLogger(__name__)
+
+WORK_ITEM_SNAPSHOT_COLUMNS = (
+    'id', 'jira_id', 'source', 'title', 'description', 'assigned_to', 'severity', 'state',
+    'customer_name', 'area_path', 'created_date', 'changed_date', 'iteration_path',
+    'hotfix_delivered_version', 'work_item_type', 'target_date', 'hf_status',
+    'hf_requested_versions', 'effort', 'effort_dev_estimate', 'effort_dev_actual',
+    'qa_effort_estimation', 'qa_effort_actual', 'tshirt_estimation', 'parent_work_item',
+    'ticket_type', 'freshdesk_ticket', 'target_version', 'tags', 'connector', 'created_by',
+    'blocker', 'business_value', 'business_outcome', 'jira_component', 'team',
+)
+
+
+def should_snapshot_work_items(last_sync_time, min_hours=24):
+    """Return True when the daily work-item snapshot has not run within min_hours."""
+    if not last_sync_time or last_sync_time == datetime(2025, 3, 1):
+        return True
+    return datetime.now() - last_sync_time >= timedelta(hours=min_hours)
 
 
 def configure_logging():
@@ -461,6 +478,48 @@ class DatabaseConnection:
                 Column('number', Float, nullable=False)
             )
 
+            # Daily point-in-time copy of active-sprint work items
+            self.work_item_snapshot = Table(
+                'work_item_snapshot', self.metadata,
+                Column('snapshot_date', Date, primary_key=True),
+                Column('id', Integer, primary_key=True),
+                Column('jira_id', String(50), nullable=True),
+                Column('source', String(20), nullable=False, server_default=text("'ADO'")),
+                Column('title', String(500), nullable=False),
+                Column('description', text_type, nullable=True),
+                Column('assigned_to', String(200), nullable=True),
+                Column('severity', String(50), nullable=True),
+                Column('state', String(50), nullable=False),
+                Column('customer_name', String(200), nullable=True),
+                Column('area_path', String(500), nullable=True),
+                Column('created_date', DateTime, nullable=False),
+                Column('changed_date', DateTime, nullable=False),
+                Column('iteration_path', String(500), nullable=True),
+                Column('hotfix_delivered_version', String(200), nullable=True),
+                Column('work_item_type', String(50), nullable=False),
+                Column('target_date', DateTime, nullable=True),
+                Column('hf_status', String(200), nullable=True),
+                Column('hf_requested_versions', String(200), nullable=True),
+                Column('effort', Float, nullable=True),
+                Column('effort_dev_estimate', Float, nullable=True),
+                Column('effort_dev_actual', Float, nullable=True),
+                Column('qa_effort_estimation', Float, nullable=True),
+                Column('qa_effort_actual', Float, nullable=True),
+                Column('tshirt_estimation', String(50), nullable=True),
+                Column('parent_work_item', Integer, nullable=True),
+                Column('ticket_type', String(200), nullable=True),
+                Column('freshdesk_ticket', String(200), nullable=True),
+                Column('target_version', String(200), nullable=True),
+                Column('tags', String(500), nullable=True),
+                Column('connector', String(1000), nullable=True),
+                Column('created_by', String(200), nullable=True),
+                Column('blocker', String(200), nullable=True),
+                Column('business_value', Integer, nullable=True),
+                Column('business_outcome', String(200), nullable=True),
+                Column('jira_component', String(500), nullable=True),
+                Column('team', String(200), nullable=True),
+            )
+
             # Change history table
             self.change_history = Table(
                 'change_history', self.metadata,
@@ -599,6 +658,15 @@ class DatabaseConnection:
                     self._create_index(connection, "idx_sprint_capacity_sprint_id", "sprint_capacity", "sprint_id")
                     self._create_index(connection, "idx_sprint_capacity_team_member", "sprint_capacity", "team_member_id")
                     self._create_index(connection, "idx_sprint_capacity_composite", "sprint_capacity", "sprint_id, team_member_id, activity")
+
+                    self._create_index(connection, "idx_work_item_snapshot_date", "work_item_snapshot", "snapshot_date")
+                    self._create_index(connection, "idx_work_item_snapshot_work_item_id", "work_item_snapshot", "id")
+                    self._create_index(
+                        connection,
+                        "idx_work_item_snapshot_type_date",
+                        "work_item_snapshot",
+                        "snapshot_date, work_item_type",
+                    )
                     
                     connection.commit()
                 except SQLAlchemyError as e:
@@ -686,6 +754,55 @@ class DatabaseConnection:
             except SQLAlchemyError as e:
                 LOGGER.error(f"Error updating sync status: {str(e)}")
                 connection.rollback()
+
+    def snapshot_current_sprint_work_items(self):
+        """Copy active-sprint Bug/Story work items into work_item_snapshot once per day."""
+        snapshot_date = datetime.now().date()
+        column_list = ', '.join(['snapshot_date', *WORK_ITEM_SNAPSHOT_COLUMNS])
+        select_list = ', '.join([f':snapshot_date AS snapshot_date', *[f'wi.{col}' for col in WORK_ITEM_SNAPSHOT_COLUMNS]])
+
+        with self.engine.connect() as connection:
+            existing = connection.execute(
+                text("""
+                    SELECT 1
+                    FROM work_item_snapshot
+                    WHERE snapshot_date = :snapshot_date
+                    LIMIT 1
+                """),
+                {"snapshot_date": snapshot_date},
+            ).first()
+            if existing:
+                LOGGER.info(f"------>Work item snapshot already exists for {snapshot_date}; skipping")
+                return 0
+
+            active_sprints = connection.execute(
+                text("SELECT name FROM sprints WHERE state = 'active' ORDER BY name"),
+            ).fetchall()
+            if not active_sprints:
+                LOGGER.info("------>No active sprint found; skipping work item snapshot")
+                return 0
+
+            sprint_names = [row[0] for row in active_sprints]
+            LOGGER.info(
+                f"------>Snapshotting work items for active sprint(s): {', '.join(sprint_names)}"
+            )
+
+            result = connection.execute(
+                text(f"""
+                    INSERT INTO work_item_snapshot ({column_list})
+                    SELECT {select_list}
+                    FROM work_items wi
+                    WHERE wi.work_item_type IN ('Bug', 'Story')
+                      AND wi.iteration_path IN (
+                            SELECT name FROM sprints WHERE state = 'active'
+                      )
+                """),
+                {"snapshot_date": snapshot_date},
+            )
+            connection.commit()
+            inserted = result.rowcount
+            LOGGER.info(f"------>Inserted {inserted} work item snapshot rows for {snapshot_date}")
+            return inserted
 
     def update_history_snapshots(self):
         """Update the history snapshots table with current metrics"""
@@ -4340,6 +4457,25 @@ def main():
             elif include_azure_cost and not AZURE_COST_AVAILABLE:
                 LOGGER.info("------>Skipping Azure cost metrics (export_azure_cost not available)")
 
+            # Daily snapshot of active-sprint work items (at most once per 24h)
+            processed_work_item_snapshots = 0
+            work_item_snapshot_attempted = False
+            last_work_item_snapshot_sync = db.get_last_sync_time('work_item_snapshot')
+            min_snapshot_hours = int(os.getenv('WORK_ITEM_SNAPSHOT_MIN_SYNC_HOURS', '24'))
+            if should_snapshot_work_items(last_work_item_snapshot_sync, min_snapshot_hours):
+                work_item_snapshot_attempted = True
+                LOGGER.info("------>Creating daily work item snapshot for active sprint")
+                try:
+                    processed_work_item_snapshots = db.snapshot_current_sprint_work_items()
+                except Exception as e:
+                    LOGGER.error(f"------>Error creating work item snapshot: {str(e)}")
+            else:
+                hours_since = (datetime.now() - last_work_item_snapshot_sync).total_seconds() / 3600
+                LOGGER.info(
+                    f"------>Skipping work item snapshot "
+                    f"(last run {hours_since:.1f}h ago; min interval {min_snapshot_hours}h)"
+                )
+
             # Update history snapshots
             db.update_history_snapshots()
             LOGGER.info("------>Updated history snapshots")
@@ -4383,6 +4519,8 @@ def main():
                 db.update_sync_status('github_tests', processed_tests)
             if processed_azure_cost > 0:
                 db.update_sync_status('azure_cost', processed_azure_cost)
+            if work_item_snapshot_attempted:
+                db.update_sync_status('work_item_snapshot', processed_work_item_snapshots)
 
             # Update full sync status if we ran a full sync
             if should_run_full_sync:
