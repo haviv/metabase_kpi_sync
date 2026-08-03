@@ -7,21 +7,25 @@ The user can:
   * Ask the bot to generate a static HTML report (same style as
     analyze_bug_quality.py), saved under reports/ and served by this app.
 
-Uses OpenAI chat-completions with function/tool calling. The LLM can introspect
-the DB schema, run read-only SQL, invoke the full bug-quality analyzer, and
-build arbitrary data-driven reports composed of scalars / tables / charts.
+Uses an OpenAI-compatible API (Azure Foundry by default, or OpenAI) with
+function/tool calling. The LLM can introspect the DB schema, run read-only SQL,
+invoke the full bug-quality analyzer, and build arbitrary data-driven reports
+composed of scalars / tables / charts.
 
 Run:
     source venv/bin/activate
     pip install -r requirements.txt
-    export OPENAI_API_KEY=sk-...
     python3 chatbot_app.py        # or: uvicorn chatbot_app:app --port 8787
 
-Env:
-    OPENAI_API_KEY     required
-    OPENAI_MODEL       default: gpt-5.3
-    CHATBOT_PORT       default: 8787
-    PG_*               Postgres creds (same as the rest of the repo)
+Env (LLM — Azure Foundry preferred when set):
+    AZURE_FOUNDRY_BASEURL   Azure OpenAI v1 base URL
+    AZURE_FOUNDRY_API_KEY   Azure Foundry API key
+    AZURE_FOUNDRY_MODEL     optional deployment name (default gpt-5.3-chat)
+    CHATBOT_EXTRA_ENV_FILE  optional second .env to load (e.g. Nexus backend)
+    OPENAI_API_KEY          fallback if Azure Foundry is not configured
+    OPENAI_MODEL            model / deployment name
+    CHATBOT_PORT            default: 8787
+    PG_*                    Postgres creds (same as the rest of the repo)
 """
 
 from __future__ import annotations
@@ -47,6 +51,9 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 load_dotenv(Path(__file__).parent / ".env")
+_extra_env_file = os.getenv("CHATBOT_EXTRA_ENV_FILE")
+if _extra_env_file:
+    load_dotenv(_extra_env_file, override=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -55,7 +62,6 @@ load_dotenv(Path(__file__).parent / ".env")
 
 
 PORT = int(os.getenv("CHATBOT_PORT", "8787"))
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-2026-03-05")
 # GPT-5 reasoning effort: 'minimal' | 'low' | 'medium' | 'high'.
 # 'medium' is a good default for data-analysis agents that iterate on SQL.
 REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "medium")
@@ -88,10 +94,48 @@ def _sanitize_key(raw: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+def _sanitize_base_url(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return raw
+    return raw.strip().rstrip("/")
+
+
+AZURE_FOUNDRY_BASEURL = _sanitize_base_url(os.getenv("AZURE_FOUNDRY_BASEURL"))
+AZURE_FOUNDRY_API_KEY = _sanitize_key(os.getenv("AZURE_FOUNDRY_API_KEY"))
 OPENAI_API_KEY = _sanitize_key(os.getenv("OPENAI_API_KEY"))
-if not OPENAI_API_KEY:
-    print("WARNING: OPENAI_API_KEY is not set — chat endpoint will fail until it is.",
-          file=sys.stderr)
+USE_AZURE_FOUNDRY = bool(AZURE_FOUNDRY_BASEURL and AZURE_FOUNDRY_API_KEY)
+
+OPENAI_MODEL = (
+    os.getenv("OPENAI_MODEL")
+    or os.getenv("AZURE_FOUNDRY_MODEL")
+    or ("gpt-5.3-chat" if USE_AZURE_FOUNDRY else "gpt-5.4-2026-03-05")
+)
+
+
+def llm_configured() -> bool:
+    return USE_AZURE_FOUNDRY or bool(OPENAI_API_KEY)
+
+
+def create_llm_client() -> OpenAI:
+    if USE_AZURE_FOUNDRY:
+        return OpenAI(
+            api_key=AZURE_FOUNDRY_API_KEY,
+            base_url=AZURE_FOUNDRY_BASEURL,
+        )
+    if OPENAI_API_KEY:
+        return OpenAI(api_key=OPENAI_API_KEY)
+    raise RuntimeError(
+        "No LLM credentials configured. Set AZURE_FOUNDRY_BASEURL and "
+        "AZURE_FOUNDRY_API_KEY, or OPENAI_API_KEY."
+    )
+
+
+if not llm_configured():
+    print(
+        "WARNING: No LLM API credentials configured — chat endpoint will fail "
+        "until AZURE_FOUNDRY_* or OPENAI_API_KEY is set.",
+        file=sys.stderr,
+    )
 
 PG_CONN = (
     f"postgresql://{os.getenv('PG_USERNAME')}:{os.getenv('PG_PASSWORD')}"
@@ -977,7 +1021,7 @@ def run_chat(
 ) -> tuple[str, Optional[str], list[dict]]:
     """Drive the Responses-API tool loop for one user turn. Returns
     (final_text, report_url_if_any, tool_trace)."""
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    client = create_llm_client()
 
     mode_hint = (
         "[MODE=REPORT — the user wants a static HTML report. Favor "
@@ -1190,8 +1234,11 @@ def index() -> HTMLResponse:
 
 @app.post("/chat", response_model=ChatReply)
 def chat(req: ChatRequest) -> ChatReply:
-    if not OPENAI_API_KEY:
-        raise HTTPException(500, "OPENAI_API_KEY is not configured on the server.")
+    if not llm_configured():
+        raise HTTPException(
+            500,
+            "LLM API is not configured (set AZURE_FOUNDRY_* or OPENAI_API_KEY).",
+        )
     sid = req.session_id or uuid4().hex
     session = SESSIONS.setdefault(sid, [])
     try:
@@ -1223,6 +1270,7 @@ def health() -> JSONResponse:
     endpoint without sending messages through the UI."""
     info: dict[str, Any] = {
         "model": OPENAI_MODEL,
+        "llm_provider": "azure-foundry" if USE_AZURE_FOUNDRY else "openai",
         "reasoning_effort": REASONING_EFFORT,
         "max_iterations": MAX_TOOL_ITERATIONS,
         "tools": [t["name"] for t in TOOLS_SCHEMA],
@@ -1233,10 +1281,10 @@ def health() -> JSONResponse:
     except Exception as e:  # noqa: BLE001
         info["db_ok"] = False
         info["db_error"] = f"{type(e).__name__}: {e}"
-    info["openai_key_set"] = bool(OPENAI_API_KEY)
-    if OPENAI_API_KEY:
+    info["llm_configured"] = llm_configured()
+    if llm_configured():
         try:
-            client = OpenAI(api_key=OPENAI_API_KEY)
+            client = create_llm_client()
             probe_kwargs: dict[str, Any] = {
                 "model": OPENAI_MODEL,
                 "input": [{"role": "user", "content": "Reply with exactly: OK"}],
@@ -1252,11 +1300,11 @@ def health() -> JSONResponse:
                     probe = client.responses.create(**probe_kwargs)
                 else:
                     raise
-            info["openai_ok"] = True
-            info["openai_reply"] = (probe.output_text or "").strip()[:40]
+            info["llm_ok"] = True
+            info["llm_reply"] = (probe.output_text or "").strip()[:40]
         except Exception as e:  # noqa: BLE001
-            info["openai_ok"] = False
-            info["openai_error"] = f"{type(e).__name__}: {e}"
+            info["llm_ok"] = False
+            info["llm_error"] = f"{type(e).__name__}: {e}"
     return JSONResponse(info)
 
 
