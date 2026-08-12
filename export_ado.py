@@ -915,16 +915,37 @@ class DatabaseConnection:
                                 raise ValueError(f"Unsupported date format for {date_field}: {item[date_field]}")
                             item[date_field] = normalize_utc_naive(parsed_date)
 
-                    # Check if item exists
-                    existing_columns = "jira_id, source"
-                    result = connection.execute(
-                        text(f"SELECT {existing_columns} FROM {table.name} WHERE id = :id"),
-                        {"id": item['ID']}
-                    ).first()
+                    # Resolve existing row: Jira items match by jira_id first to avoid ADO-id collisions.
+                    is_jira_item = item.get('Source', 'ADO') == 'JIRA'
+                    jira_key = item.get('JiraID')
+                    row_id = item['ID']
+                    existing_row = None
 
-                    if result:
-                        if item.get('Source', 'ADO') != 'JIRA' and result[0]:
-                            LOGGER.info(f"Skipping ADO update for {table.name} {item['ID']} because it is owned by Jira ({result[0]})")
+                    if is_jira_item and jira_key:
+                        existing_row = connection.execute(
+                            text(f"SELECT id, jira_id, source FROM {table.name} WHERE jira_id = :jira_id"),
+                            {"jira_id": jira_key},
+                        ).first()
+                        if existing_row:
+                            row_id = existing_row[0]
+
+                    if not existing_row:
+                        candidate = connection.execute(
+                            text(f"SELECT id, jira_id, source FROM {table.name} WHERE id = :id"),
+                            {"id": item['ID']},
+                        ).first()
+                        if candidate:
+                            if is_jira_item and jira_key and candidate[1] and candidate[1] != jira_key:
+                                existing_row = None
+                            else:
+                                existing_row = candidate
+                                row_id = candidate[0]
+
+                    if existing_row:
+                        if not is_jira_item and existing_row[1]:
+                            LOGGER.info(
+                                f"Skipping ADO update for {table.name} {item['ID']} because it is owned by Jira ({existing_row[1]})"
+                            )
                             processed_count += 1
                             continue
 
@@ -957,7 +978,7 @@ class DatabaseConnection:
                         update_stmt += " WHERE id = :id"
 
                         params = {
-                            "id": item['ID'],
+                            "id": row_id,
                             "jira_id": item.get('JiraID'),
                             "source": item.get('Source', 'ADO'),
                             "title": item['Title'],
@@ -1036,7 +1057,7 @@ class DatabaseConnection:
                         insert_stmt += ")"
 
                         params = {
-                            "id": item['ID'],
+                            "id": row_id,
                             "jira_id": item.get('JiraID'),
                             "source": item.get('Source', 'ADO'),
                             "title": item['Title'],
@@ -3036,13 +3057,7 @@ class JIRAExtractor:
             LOGGER.warning(f"Warning: could not parse ADO work item id from {self.ado_work_item_id_field}: {raw_value}")
             return None
 
-    def _compatibility_id(self, issue, table_name):
-        jira_key = issue.get('key')
-        fields = issue.get('fields', {})
-        migrated_ado_id = self._extract_migrated_ado_id(fields)
-        if migrated_ado_id:
-            return migrated_ado_id
-
+    def _jira_internal_compatibility_id(self, issue, table_name, jira_key):
         jira_internal_id = int(issue['id']) if str(issue.get('id', '')).isdigit() else None
         if jira_internal_id is None:
             raise ValueError(f"Jira issue {jira_key} does not have a numeric issue id")
@@ -3052,7 +3067,7 @@ class JIRAExtractor:
             with self.db_connection.engine.connect() as connection:
                 existing = connection.execute(
                     text(f"SELECT jira_id, source FROM {table_name} WHERE id = :id"),
-                    {"id": jira_internal_id}
+                    {"id": jira_internal_id},
                 ).first()
                 if existing and not (existing[0] == jira_key or existing[1] == 'JIRA'):
                     fallback_id = 1_000_000_000 + jira_internal_id
@@ -3062,6 +3077,29 @@ class JIRAExtractor:
                     )
                     return fallback_id
         return jira_internal_id
+
+    def _compatibility_id(self, issue, table_name):
+        jira_key = issue.get('key')
+        fields = issue.get('fields', {})
+        migrated_ado_id = self._extract_migrated_ado_id(fields)
+        if migrated_ado_id:
+            if hasattr(self, 'db_connection') and self.db_connection:
+                with self.db_connection.engine.connect() as connection:
+                    existing = connection.execute(
+                        text(f"SELECT jira_id FROM {table_name} WHERE id = :id"),
+                        {"id": migrated_ado_id},
+                    ).first()
+                    if existing and existing[0] and existing[0] != jira_key:
+                        LOGGER.info(
+                            f"Warning: Jira issue {jira_key} ADO id {migrated_ado_id} already owned by "
+                            f"{existing[0]}. Using Jira internal id instead."
+                        )
+                    else:
+                        return migrated_ado_id
+            else:
+                return migrated_ado_id
+
+        return self._jira_internal_compatibility_id(issue, table_name, jira_key)
 
     def _board_name_map(self):
         return {board['id']: board['name'] for board in self._resolve_boards()}
