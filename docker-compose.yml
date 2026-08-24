@@ -42,10 +42,14 @@ services:
 
   chatbot:
     build: .
-    command: ["uvicorn", "chatbot_app:app", "--host", "0.0.0.0", "--port", "8787"]
+    command:
+      - sh
+      - -c
+      - mkdir -p logs && exec uvicorn chatbot_app:app --host 0.0.0.0 --port 8787 2>&1 | tee -a logs/chatbot.log
     env_file:
       - .env
     environment:
+      - PYTHONUNBUFFERED=1
       - PG_HOST=postgres
       - PG_PORT=5432
       - PG_DATABASE=${PG_DATABASE}
@@ -66,11 +70,17 @@ services:
     volumes:
       - ./.env:/app/.env
       - ./reports:/app/reports
+      - ./logs:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
       metabase:
         condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8787/ready"]
       interval: 30s
@@ -81,6 +91,8 @@ services:
   ado-exporter:
     build: .
     environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - ADO_ORGANIZATION=${ADO_ORGANIZATION}
       - ADO_PROJECT=${ADO_PROJECT}
       - ADO_PERSONAL_ACCESS_TOKEN=${ADO_PERSONAL_ACCESS_TOKEN}
@@ -99,9 +111,15 @@ services:
       - PG_PASSWORD=${PG_PASSWORD}
     volumes:
       - ./.env:/app/.env
+      - ./logs:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
     restart: unless-stopped
 
 volumes:

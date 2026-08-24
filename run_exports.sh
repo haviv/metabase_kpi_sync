@@ -12,16 +12,19 @@ cleanup() {
 # Set up signal handlers
 trap cleanup SIGINT SIGTERM
 
-# Create logs directory
+# Create logs directory (bind-mounted to host when using docker-compose)
 mkdir -p logs
 
-# Use fixed log file names (will be recreated each time)
 ADO_LOG="logs/ado_export.log"
 JIRA_LOG="logs/jira_export.log"
+WRAPPER_LOG="logs/run_exports.log"
 
-# Clear existing log files
-echo "" > "$ADO_LOG"
-echo "" > "$JIRA_LOG"
+# Mirror wrapper/monitor output to a host-visible file as well as stdout
+exec > >(tee -a "$WRAPPER_LOG") 2>&1
+
+# Append a session marker instead of truncating — keeps history on the host volume
+SESSION_START="=== Session started $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
+printf '\n%s\n' "$SESSION_START" | tee -a "$ADO_LOG" "$JIRA_LOG"
 
 # Function to rotate logs if they get too large (over 10MB)
 rotate_logs() {
@@ -37,17 +40,18 @@ rotate_logs() {
 
 echo "Starting ADO and JIRA sync services..."
 echo "Press Ctrl+C to stop all services"
+echo "Wrapper log: $WRAPPER_LOG"
 echo "ADO logs: $ADO_LOG"
 echo "JIRA logs: $JIRA_LOG"
 
 # Start ADO export in background with logging (unbuffered)
 echo "Starting ADO export..."
-python3 -u export_ado.py > "$ADO_LOG" 2>&1 &
+python3 -u export_ado.py >> "$ADO_LOG" 2>&1 &
 ADO_PID=$!
 
 # Start JIRA export in background with logging (unbuffered)
 echo "Starting JIRA export..."
-python3 -u export_jira.py > "$JIRA_LOG" 2>&1 &
+python3 -u export_jira.py >> "$JIRA_LOG" 2>&1 &
 JIRA_PID=$!
 
 echo "Both services started successfully"

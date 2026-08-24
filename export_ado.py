@@ -29,11 +29,18 @@ WORK_ITEM_SNAPSHOT_COLUMNS = (
 )
 
 
-def should_snapshot_work_items(last_sync_time, min_hours=24):
-    """Return True when the daily work-item snapshot has not run within min_hours."""
-    if not last_sync_time or last_sync_time == datetime(2025, 3, 1):
-        return True
-    return datetime.now() - last_sync_time >= timedelta(hours=min_hours)
+def should_snapshot_work_items(last_sync_time, now=None):
+    """Once per calendar day, first sync cycle at or after 06:00 local."""
+    now = now or datetime.now()
+    snapshot_hour = int(os.getenv('WORK_ITEM_SNAPSHOT_HOUR', '6'))
+
+    if last_sync_time and last_sync_time != datetime(2025, 3, 1):
+        if getattr(last_sync_time, 'tzinfo', None):
+            last_sync_time = last_sync_time.replace(tzinfo=None)
+        if last_sync_time.date() == now.date():
+            return False
+
+    return now.hour >= snapshot_hour
 
 
 def configure_logging():
@@ -290,8 +297,7 @@ class DatabaseConnection:
                 if col_name not in existing_columns:
                     new_columns[col_name] = col_type
         
-        # Add effort-related columns for work_items table
-        if table_name == 'work_items':
+        if table_name in ('work_items', 'work_item_snapshot'):
             work_item_columns = {
                 'effort': 'FLOAT',
                 'effort_dev_estimate': 'FLOAT',
@@ -595,6 +601,10 @@ class DatabaseConnection:
                     self._add_new_columns(connection, 'work_items')
                     self._ensure_jira_metadata_columns(connection, 'work_items')
 
+                if 'work_item_snapshot' in existing_tables:
+                    self._add_new_columns(connection, 'work_item_snapshot')
+                    self._ensure_jira_metadata_columns(connection, 'work_item_snapshot')
+
                 if 'change_history' in existing_tables:
                     self._ensure_jira_metadata_columns(connection, 'change_history')
                 
@@ -763,10 +773,20 @@ class DatabaseConnection:
                 connection.rollback()
 
     def snapshot_current_sprint_work_items(self):
-        """Copy active-sprint Bug/Story work items into work_item_snapshot once per day."""
+        """Copy active-sprint Bug/Story work items into work_item_snapshot once per day.
+
+        Jira stores every sprint an issue joined in iteration_path as a comma-separated
+        list, so we match the active sprint name as a token rather than an exact string.
+        """
         snapshot_date = datetime.now().date()
-        column_list = ', '.join(['snapshot_date', *WORK_ITEM_SNAPSHOT_COLUMNS])
-        select_list = ', '.join([f':snapshot_date AS snapshot_date', *[f'wi.{col}' for col in WORK_ITEM_SNAPSHOT_COLUMNS]])
+        inspector = inspect(self.engine)
+        snapshot_columns = {col['name'] for col in inspector.get_columns('work_item_snapshot')}
+        copy_columns = [col for col in WORK_ITEM_SNAPSHOT_COLUMNS if col in snapshot_columns]
+        if not copy_columns:
+            LOGGER.error("------>work_item_snapshot has no copyable columns; skipping")
+            return 0
+        column_list = ', '.join(['snapshot_date', *copy_columns])
+        select_list = ', '.join([f':snapshot_date AS snapshot_date', *[f'wi.{col}' for col in copy_columns]])
 
         with self.engine.connect() as connection:
             existing = connection.execute(
@@ -783,7 +803,12 @@ class DatabaseConnection:
                 return 0
 
             active_sprints = connection.execute(
-                text("SELECT name FROM sprints WHERE state = 'active' ORDER BY name"),
+                text("""
+                    SELECT DISTINCT name
+                    FROM sprints
+                    WHERE lower(state) IN ('active', 'current')
+                    ORDER BY name
+                """),
             ).fetchall()
             if not active_sprints:
                 LOGGER.info("------>No active sprint found; skipping work item snapshot")
@@ -800,8 +825,11 @@ class DatabaseConnection:
                     SELECT {select_list}
                     FROM work_items wi
                     WHERE wi.work_item_type IN ('Bug', 'Story')
-                      AND wi.iteration_path IN (
-                            SELECT name FROM sprints WHERE state = 'active'
+                      AND EXISTS (
+                            SELECT 1
+                            FROM sprints s
+                            WHERE lower(s.state) IN ('active', 'current')
+                              AND wi.iteration_path ILIKE '%' || s.name || '%'
                       )
                 """),
                 {"snapshot_date": snapshot_date},
@@ -4532,12 +4560,11 @@ def main():
             elif include_azure_cost and not AZURE_COST_AVAILABLE:
                 LOGGER.info("------>Skipping Azure cost metrics (export_azure_cost not available)")
 
-            # Daily snapshot of active-sprint work items (at most once per 24h)
+            # Daily snapshot of active-sprint work items (once per day after 06:00)
             processed_work_item_snapshots = 0
             work_item_snapshot_attempted = False
             last_work_item_snapshot_sync = db.get_last_sync_time('work_item_snapshot')
-            min_snapshot_hours = int(os.getenv('WORK_ITEM_SNAPSHOT_MIN_SYNC_HOURS', '24'))
-            if should_snapshot_work_items(last_work_item_snapshot_sync, min_snapshot_hours):
+            if should_snapshot_work_items(last_work_item_snapshot_sync):
                 work_item_snapshot_attempted = True
                 LOGGER.info("------>Creating daily work item snapshot for active sprint")
                 try:
@@ -4545,11 +4572,7 @@ def main():
                 except Exception as e:
                     LOGGER.error(f"------>Error creating work item snapshot: {str(e)}")
             else:
-                hours_since = (datetime.now() - last_work_item_snapshot_sync).total_seconds() / 3600
-                LOGGER.info(
-                    f"------>Skipping work item snapshot "
-                    f"(last run {hours_since:.1f}h ago; min interval {min_snapshot_hours}h)"
-                )
+                LOGGER.info("------>Skipping work item snapshot (already ran today or before 06:00)")
 
             # Update history snapshots
             db.update_history_snapshots()
@@ -4608,7 +4631,7 @@ def main():
                 LOGGER.info("Single sync cycle completed; exiting")
                 break
             LOGGER.info(f"Sleeping for {SLEEP_INTERVAL/60} minutes...\n")
-            
+
             time.sleep(SLEEP_INTERVAL)
             
         except KeyboardInterrupt:
