@@ -25,7 +25,7 @@ WORK_ITEM_SNAPSHOT_COLUMNS = (
     'qa_effort_estimation', 'qa_effort_actual', 'tshirt_estimation', 'parent_work_item',
     'ticket_type', 'freshdesk_ticket', 'target_version', 'tags', 'connector', 'created_by',
     'blocker', 'business_value', 'business_outcome', 'jira_component', 'team',
-    'triage', 'bug_type',
+    'triage', 'bug_type', 'investment_category', 'customer_account',
 )
 
 
@@ -319,6 +319,8 @@ class DatabaseConnection:
                 'team': 'VARCHAR(200)',
                 'triage': 'TIMESTAMP',
                 'bug_type': 'VARCHAR(200)',
+                'investment_category': 'VARCHAR(200)',
+                'customer_account': 'VARCHAR(200)',
             }
             for col_name, col_type in work_item_columns.items():
                 if col_name not in existing_columns:
@@ -479,6 +481,8 @@ class DatabaseConnection:
                 Column('team', String(200), nullable=True),
                 Column('triage', DateTime, nullable=True),
                 Column('bug_type', String(200), nullable=True),
+                Column('investment_category', String(200), nullable=True),
+                Column('customer_account', String(200), nullable=True),
             )
 
             # History snapshots table
@@ -531,6 +535,8 @@ class DatabaseConnection:
                 Column('team', String(200), nullable=True),
                 Column('triage', DateTime, nullable=True),
                 Column('bug_type', String(200), nullable=True),
+                Column('investment_category', String(200), nullable=True),
+                Column('customer_account', String(200), nullable=True),
             )
 
             # Change history table
@@ -1008,7 +1014,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             update_stmt += ", parent_issue = :parent_issue, ticket_type = :ticket_type, jira_component = :jira_component, team = :team"
                         elif item_type == 'work_item':
-                            update_stmt += ", work_item_type = :work_item_type, effort = :effort, effort_dev_estimate = :effort_dev_estimate, effort_dev_actual = :effort_dev_actual, qa_effort_estimation = :qa_effort_estimation, qa_effort_actual = :qa_effort_actual, tshirt_estimation = :tshirt_estimation, parent_work_item = :parent_work_item, ticket_type = :ticket_type, jira_component = :jira_component, team = :team, freshdesk_ticket = :freshdesk_ticket, target_version = :target_version, tags = :tags, connector = :connector, created_by = :created_by, blocker = :blocker, business_value = :business_value, business_outcome = :business_outcome, triage = :triage, bug_type = :bug_type"
+                            update_stmt += ", work_item_type = :work_item_type, effort = :effort, effort_dev_estimate = :effort_dev_estimate, effort_dev_actual = :effort_dev_actual, qa_effort_estimation = :qa_effort_estimation, qa_effort_actual = :qa_effort_actual, tshirt_estimation = :tshirt_estimation, parent_work_item = :parent_work_item, ticket_type = :ticket_type, jira_component = :jira_component, team = :team, freshdesk_ticket = :freshdesk_ticket, target_version = :target_version, tags = :tags, connector = :connector, created_by = :created_by, blocker = :blocker, business_value = :business_value, business_outcome = :business_outcome, triage = :triage, bug_type = :bug_type, investment_category = :investment_category, customer_account = :customer_account"
                         
                         update_stmt += " WHERE id = :id"
 
@@ -1059,6 +1065,8 @@ class DatabaseConnection:
                             params["business_outcome"] = item.get('BusinessOutcome', '')
                             params["triage"] = item.get('Triage')
                             params["bug_type"] = item.get('BugType', '')
+                            params["investment_category"] = item.get('InvestmentCategory', '')
+                            params["customer_account"] = item.get('CustomerAccount', '')
 
                         connection.execute(text(update_stmt), params)
                     else:
@@ -1076,7 +1084,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             insert_stmt += ", parent_issue, ticket_type, jira_component, team"
                         elif item_type == 'work_item':
-                            insert_stmt += ", work_item_type, effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type, jira_component, team, freshdesk_ticket, target_version, tags, connector, created_by, blocker, business_value, business_outcome, triage, bug_type"
+                            insert_stmt += ", work_item_type, effort, effort_dev_estimate, effort_dev_actual, qa_effort_estimation, qa_effort_actual, tshirt_estimation, parent_work_item, ticket_type, jira_component, team, freshdesk_ticket, target_version, tags, connector, created_by, blocker, business_value, business_outcome, triage, bug_type, investment_category, customer_account"
                         
                         insert_stmt += """
                         )
@@ -1089,7 +1097,7 @@ class DatabaseConnection:
                         if item_type == 'bug':
                             insert_stmt += ", :parent_issue, :ticket_type, :jira_component, :team"
                         elif item_type == 'work_item':
-                            insert_stmt += ", :work_item_type, :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type, :jira_component, :team, :freshdesk_ticket, :target_version, :tags, :connector, :created_by, :blocker, :business_value, :business_outcome, :triage, :bug_type"
+                            insert_stmt += ", :work_item_type, :effort, :effort_dev_estimate, :effort_dev_actual, :qa_effort_estimation, :qa_effort_actual, :tshirt_estimation, :parent_work_item, :ticket_type, :jira_component, :team, :freshdesk_ticket, :target_version, :tags, :connector, :created_by, :blocker, :business_value, :business_outcome, :triage, :bug_type, :investment_category, :customer_account"
                         
                         insert_stmt += ")"
 
@@ -1140,6 +1148,8 @@ class DatabaseConnection:
                             params["business_outcome"] = item.get('BusinessOutcome', '')
                             params["triage"] = item.get('Triage')
                             params["bug_type"] = item.get('BugType', '')
+                            params["investment_category"] = item.get('InvestmentCategory', '')
+                            params["customer_account"] = item.get('CustomerAccount', '')
 
                         connection.execute(text(insert_stmt), params)
                         
@@ -2956,6 +2966,8 @@ class JIRAExtractor:
         self.business_outcome_field = os.getenv('JIRA_BUSINESS_OUTCOME_FIELD_ID', 'customfield_12468')
         self.triage_field = os.getenv('JIRA_TRIAGE_FIELD_ID', 'customfield_12639')
         self.bug_type_field = os.getenv('JIRA_BUG_TYPE_FIELD_ID', 'customfield_12467')
+        self.investment_category_field = os.getenv('JIRA_INVESTMENT_CATEGORY_FIELD_ID', 'customfield_12535')
+        self.customer_account_field = os.getenv('JIRA_CUSTOMER_ACCOUNT_FIELD_ID', 'customfield_12689')
 
     def _request_json(self, path, params=None):
         response = requests.get(f"{self.jira_url}{path}", headers=self.headers, params=params, timeout=60)
@@ -3322,6 +3334,8 @@ class JIRAExtractor:
             'BusinessOutcome': self._extract_value(fields, self.business_outcome_field) or '',
             'Triage': self._parse_jira_datetime(self._extract_value(fields, self.triage_field)),
             'BugType': self._extract_value(fields, self.bug_type_field) or '',
+            'InvestmentCategory': self._extract_value(fields, self.investment_category_field) or '',
+            'CustomerAccount': self._extract_value(fields, self.customer_account_field) or '',
         }
 
     def _search_issues(self, jql_query, fields_param):
@@ -3575,7 +3589,8 @@ class JIRAExtractor:
             self.ado_work_item_id_field, self.ado_created_date_field,
             *self.target_version_fields, *self.connector_fields, self.blocker_field,
             self.business_value_field, self.business_outcome_field,
-            self.triage_field, self.bug_type_field
+            self.triage_field, self.bug_type_field,
+            self.investment_category_field, self.customer_account_field,
         }
         return ",".join(sorted([field for field in fields if field]))
 
