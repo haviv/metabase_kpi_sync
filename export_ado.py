@@ -778,6 +778,165 @@ class DatabaseConnection:
                 LOGGER.error(f"Error updating sync status: {str(e)}")
                 connection.rollback()
 
+    def _has_jira_deletion_history(self, connection, record_id, table_name, jira_key):
+        existing = connection.execute(
+            text("""
+                SELECT 1
+                FROM change_history
+                WHERE record_id = :record_id
+                  AND table_name = :table_name
+                  AND jira_id = :jira_id
+                  AND field_changed = 'System.State'
+                  AND new_value = 'Deleted'
+                LIMIT 1
+            """),
+            {
+                "record_id": record_id,
+                "table_name": table_name,
+                "jira_id": jira_key,
+            },
+        ).first()
+        return existing is not None
+
+    def _insert_jira_deletion_history(
+        self,
+        connection,
+        record_id,
+        table_name,
+        jira_key,
+        old_state,
+        deleted_at,
+        deleted_by,
+    ):
+        if self._has_jira_deletion_history(connection, record_id, table_name, jira_key):
+            return False
+        connection.execute(
+            text("""
+                INSERT INTO change_history
+                (record_id, jira_id, source, table_name, field_changed, old_value, new_value, changed_by, changed_date)
+                VALUES
+                (:record_id, :jira_id, 'JIRA', :table_name, 'System.State', :old_value, 'Deleted', :changed_by, :changed_date)
+            """),
+            {
+                "record_id": record_id,
+                "jira_id": jira_key,
+                "table_name": table_name,
+                "old_value": old_state or '',
+                "changed_by": deleted_by or '',
+                "changed_date": deleted_at,
+            },
+        )
+        return True
+
+    def apply_jira_issue_deletion(self, jira_key, deleted_at, deleted_by):
+        """Mark a synced Jira issue as deleted and append a state change row."""
+        if not jira_key or not deleted_at:
+            return 0
+
+        updated = 0
+        with self.engine.connect() as connection:
+            try:
+                bug_history_written = False
+
+                bug_row = connection.execute(
+                    text("SELECT id, state FROM bugs WHERE jira_id = :jira_id"),
+                    {"jira_id": jira_key},
+                ).first()
+                if bug_row and bug_row[1] != 'Deleted':
+                    connection.execute(
+                        text("""
+                            UPDATE bugs
+                            SET state = 'Deleted',
+                                changed_date = GREATEST(changed_date, :deleted_at)
+                            WHERE id = :id
+                        """),
+                        {"id": bug_row[0], "deleted_at": deleted_at},
+                    )
+                    bug_history_written = self._insert_jira_deletion_history(
+                        connection,
+                        bug_row[0],
+                        'bugs',
+                        jira_key,
+                        bug_row[1],
+                        deleted_at,
+                        deleted_by,
+                    )
+                    updated += 1
+
+                work_item_row = connection.execute(
+                    text("""
+                        SELECT id, state, work_item_type
+                        FROM work_items
+                        WHERE jira_id = :jira_id
+                    """),
+                    {"jira_id": jira_key},
+                ).first()
+                if work_item_row and work_item_row[1] != 'Deleted':
+                    connection.execute(
+                        text("""
+                            UPDATE work_items
+                            SET state = 'Deleted',
+                                changed_date = GREATEST(changed_date, :deleted_at)
+                            WHERE id = :id
+                        """),
+                        {"id": work_item_row[0], "deleted_at": deleted_at},
+                    )
+                    if work_item_row[2] == 'Bug':
+                        if not bug_history_written:
+                            self._insert_jira_deletion_history(
+                                connection,
+                                bug_row[0] if bug_row else work_item_row[0],
+                                'bugs',
+                                jira_key,
+                                work_item_row[1],
+                                deleted_at,
+                                deleted_by,
+                            )
+                    else:
+                        history_table = work_item_row[2] or 'work_items'
+                        self._insert_jira_deletion_history(
+                            connection,
+                            work_item_row[0],
+                            history_table,
+                            jira_key,
+                            work_item_row[1],
+                            deleted_at,
+                            deleted_by,
+                        )
+                    updated += 1
+
+                issue_row = connection.execute(
+                    text("SELECT id, state FROM issues WHERE jira_id = :jira_id"),
+                    {"jira_id": jira_key},
+                ).first()
+                if issue_row and issue_row[1] != 'Deleted':
+                    connection.execute(
+                        text("""
+                            UPDATE issues
+                            SET state = 'Deleted',
+                                changed_date = GREATEST(changed_date, :deleted_at)
+                            WHERE id = :id
+                        """),
+                        {"id": issue_row[0], "deleted_at": deleted_at},
+                    )
+                    self._insert_jira_deletion_history(
+                        connection,
+                        issue_row[0],
+                        'issues',
+                        jira_key,
+                        issue_row[1],
+                        deleted_at,
+                        deleted_by,
+                    )
+                    updated += 1
+
+                connection.commit()
+            except SQLAlchemyError as e:
+                LOGGER.error(f"Error applying Jira deletion for {jira_key}: {str(e)}")
+                connection.rollback()
+                raise
+        return updated
+
     def snapshot_current_sprint_work_items(self):
         """Copy active-sprint Bug/Story work items into work_item_snapshot once per day.
 
@@ -3059,6 +3218,8 @@ class JIRAExtractor:
             return normalize_utc_naive(parsed)
         raw_text = str(value).strip()
         for date_format in (
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%dT%H:%M:%S%z",
             "%Y-%m-%dT%H:%M:%S.%fZ",
             "%Y-%m-%dT%H:%M:%SZ",
             "%a, %d %b %Y %H:%M:%S %z",
@@ -3337,6 +3498,121 @@ class JIRAExtractor:
             'InvestmentCategory': self._extract_value(fields, self.investment_category_field) or '',
             'CustomerAccount': self._extract_value(fields, self.customer_account_field) or '',
         }
+
+    def _parse_jira_audit_timestamp(self, value):
+        return self._parse_jira_datetime(value)
+
+    def _audit_time_param(self, value):
+        if value is None:
+            return None
+        if getattr(value, 'tzinfo', None) is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+    def _resolve_audit_author(self, account_id, cache):
+        if not account_id:
+            return ''
+        if account_id in cache:
+            return cache[account_id]
+        user_data = self._request_json('/rest/api/3/user', {'accountId': account_id})
+        display_name = ''
+        if isinstance(user_data, dict):
+            display_name = user_data.get('displayName') or account_id
+        else:
+            display_name = account_id
+        cache[account_id] = display_name
+        return display_name
+
+    def _fetch_audit_deletions(self, from_dt, to_dt, project_prefix):
+        """Return unique deleted issue keys from the Jira audit log."""
+        deletions = {}
+        offset = 0
+        limit = 1000
+        from_param = self._audit_time_param(from_dt)
+        to_param = self._audit_time_param(to_dt)
+
+        while True:
+            data = self._request_json(
+                '/rest/api/3/auditing/record',
+                {
+                    'from': from_param,
+                    'to': to_param,
+                    'filter': 'Deleted Jira issue',
+                    'limit': limit,
+                    'offset': offset,
+                },
+            )
+            if not data:
+                break
+
+            records = data.get('records', [])
+            for record in records:
+                object_item = record.get('objectItem') or {}
+                if object_item.get('typeName') != 'ISSUE_DELETE':
+                    continue
+                jira_key = object_item.get('name', '')
+                if not jira_key.startswith(project_prefix):
+                    continue
+
+                deleted_at = self._parse_jira_audit_timestamp(record.get('created'))
+                if not deleted_at:
+                    continue
+
+                author_id = record.get('authorAccountId') or record.get('authorKey') or ''
+                existing = deletions.get(jira_key)
+                if not existing or deleted_at > existing['deleted_at']:
+                    deletions[jira_key] = {
+                        'jira_key': jira_key,
+                        'deleted_at': deleted_at,
+                        'author_id': author_id,
+                    }
+
+            if len(records) < limit:
+                break
+            offset += limit
+            if offset >= data.get('total', offset):
+                break
+
+        return list(deletions.values())
+
+    def sync_deleted_jira_issues(self, db_connection):
+        """Fetch deleted NEXUS issues from the audit log and mark them in Postgres."""
+        entity_type = 'jira_deleted_issues'
+        last_sync = db_connection.get_last_sync_time(entity_type)
+        initial_days = int(os.getenv('JIRA_DELETION_INITIAL_SYNC_DAYS', '30'))
+        overlap_hours = int(os.getenv('JIRA_DELETION_SYNC_OVERLAP_HOURS', '1'))
+        now = datetime.now()
+
+        if last_sync == datetime(2025, 3, 1):
+            from_dt = now - timedelta(days=initial_days)
+            LOGGER.info(
+                f"------>First Jira deletion sync; fetching last {initial_days} days"
+            )
+        else:
+            from_dt = last_sync - timedelta(hours=overlap_hours)
+            LOGGER.info(
+                f"------>Incremental Jira deletion sync from {from_dt.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+        project_prefix = f"{self.project_key}-"
+        deletions = self._fetch_audit_deletions(from_dt, now, project_prefix)
+        LOGGER.info(
+            f"------>Found {len(deletions)} deleted {self.project_key} issue(s) in audit log"
+        )
+
+        author_cache = {}
+        processed = 0
+        for deletion in deletions:
+            deleted_by = self._resolve_audit_author(deletion.get('author_id'), author_cache)
+            processed += db_connection.apply_jira_issue_deletion(
+                deletion['jira_key'],
+                deletion['deleted_at'],
+                deleted_by,
+            )
+
+        db_connection.update_sync_status(entity_type, processed)
+        LOGGER.info(f"------>Applied {processed} Jira deletion update(s)")
+        return processed
 
     def _search_issues(self, jql_query, fields_param):
         issues = []
@@ -4437,6 +4713,12 @@ def main():
                     )
                 db.update_jira_parent_links(jira_work_items)
                 db.update_jira_parent_links(jira_bugs)
+
+                try:
+                    processed_jira_deletions = jira_extractor.sync_deleted_jira_issues(db)
+                    LOGGER.info(f"------>Processed {processed_jira_deletions} Jira deletion update(s)")
+                except Exception as e:
+                    LOGGER.error(f"------>Error syncing Jira deletions: {str(e)}")
 
                 jira_extractor.normalize_existing_jira_states(db)
                 LOGGER.info("------>Normalized existing Jira states to ADO values")
