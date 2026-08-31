@@ -3269,6 +3269,7 @@ class JIRAExtractor:
             'code review': 'Waiting for PR',
             'ready for qa': 'Ready for QA',
             'in qa': 'In QA',
+            'qa completed': 'QA Completed',
             'done': 'Done',
             'closed': 'Done',
         }
@@ -3953,6 +3954,7 @@ class JIRAExtractor:
             'CODE REVIEW': 'Waiting for PR',
             'READY FOR QA': 'Ready for QA',
             'IN QA': 'In QA',
+            'QA COMPLETED': 'QA Completed',
             'DONE': 'Done',
             'CLOSED': 'Done',
         }
