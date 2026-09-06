@@ -79,6 +79,13 @@ try:
 except ImportError:
     PR_METRICS_AVAILABLE = False
 
+# Import GitHub team roster sync
+try:
+    from sync_github_teams import sync_org_teams
+    GITHUB_TEAMS_SYNC_AVAILABLE = True
+except ImportError:
+    GITHUB_TEAMS_SYNC_AVAILABLE = False
+
 # Import Azure cost metrics extractor
 try:
     from export_azure_cost import AzureCostExtractor, should_sync_azure_cost
@@ -4734,6 +4741,42 @@ def main():
                 else:
                     processed_jira_capacities = jira_extractor.update_sprint_capacities(current_sprint_only=True)
 
+            # Sync GitHub org teams + members (all teams, once per calendar day).
+            # Roster tables: github_teams, github_team_members, github_users.
+            processed_github_teams = 0
+            github_teams_attempted = False
+            if GITHUB_TEAMS_SYNC_AVAILABLE:
+                github_org = os.getenv('GITHUB_ORG')
+                if github_org and os.getenv('GITHUB_TOKEN'):
+                    last_teams_sync = db.get_last_sync_time('github_teams')
+                    today = datetime.now().date()
+                    last_sync_date = (
+                        last_teams_sync.date()
+                        if last_teams_sync and last_teams_sync != datetime(2025, 3, 1)
+                        else None
+                    )
+                    if last_sync_date == today:
+                        LOGGER.info("------>Skipping GitHub teams roster (already synced today)")
+                    else:
+                        LOGGER.info("------>Syncing GitHub teams roster (all org teams, daily)")
+                        github_teams_attempted = True
+                        try:
+                            result = sync_org_teams(db.engine, github_org)
+                            processed_github_teams = (
+                                result['teams'] + result['memberships'] + result['users']
+                            )
+                            LOGGER.info(
+                                "------>GitHub teams roster: %s teams, %s memberships, %s user profiles",
+                                result['teams'],
+                                result['memberships'],
+                                result['users'],
+                            )
+                        except Exception as e:
+                            LOGGER.error(f"------>Error syncing GitHub teams roster: {str(e)}")
+                            github_teams_attempted = False
+                else:
+                    LOGGER.info("------>Skipping GitHub teams roster (GITHUB_ORG or GITHUB_TOKEN not configured)")
+
             # Update GitHub Copilot metrics (if configured)
             # Uses org users-1-day usage reports + team membership (export_github_copilot).
             # Runs at most once per calendar day; daily window is a few days ending yesterday.
@@ -4908,6 +4951,8 @@ def main():
                 if not include_ado:
                     db.update_sync_status('sprint_capacity', processed_jira_capacities)
 
+            if github_teams_attempted:
+                db.update_sync_status('github_teams', processed_github_teams)
             if processed_copilot > 0:
                 db.update_sync_status('copilot_metrics', processed_copilot)
             if processed_prs > 0:

@@ -384,6 +384,71 @@ def get_qa_user_profiles(
 
 
 # --------------------------------------------------------------------------- #
+# Sync entry point (callable from export_ado and CLI)
+# --------------------------------------------------------------------------- #
+
+
+def sync_org_teams(
+    engine,
+    org: str,
+    token: str | None = None,
+    verbose: bool = False,
+) -> dict:
+    """Sync all org teams and members into Postgres.
+
+    Creates tables if missing, full-refreshes roster for ``org``, and upserts
+    ``github_users`` profiles for every member seen.
+
+    Returns:
+        {"teams": int, "memberships": int, "users": int}
+    """
+    token = token or os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise ValueError("GITHUB_TOKEN is required")
+
+    headers = _gh_headers(token)
+    ensure_schema(engine)
+
+    teams = fetch_teams(org, headers, verbose)
+    if verbose:
+        print(f"  {len(teams)} teams returned by GitHub")
+
+    members_by_team: dict[str, list[dict]] = {}
+    for i, t in enumerate(teams, 1):
+        slug = t["slug"]
+        if verbose:
+            print(f"  [{i}/{len(teams)}] members for {slug} …", end=" ", flush=True)
+        members = fetch_team_members(org, slug, headers, verbose)
+        members_by_team[slug] = members
+        if verbose:
+            print(f"{len(members)} members")
+
+    n_teams, n_members = replace_org_data(engine, org, teams, members_by_team)
+
+    unique_logins: set[str] = set()
+    for members in members_by_team.values():
+        for m in members:
+            login = (m.get("login") or "").lower()
+            if login:
+                unique_logins.add(login)
+
+    profiles: list[dict] = []
+    for i, login in enumerate(sorted(unique_logins), 1):
+        if verbose and (i % 25 == 0 or i == len(unique_logins)):
+            print(f"  profile {i}/{len(unique_logins)} …")
+        try:
+            profile = fetch_user_profile(login, headers, verbose)
+            if profile:
+                profiles.append(profile)
+        except requests.HTTPError as e:
+            if verbose:
+                print(f"  skip {login}: {e}")
+
+    n_users = upsert_users(engine, profiles)
+    return {"teams": n_teams, "memberships": n_members, "users": n_users}
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
@@ -407,47 +472,14 @@ def main() -> int:
         return 2
 
     org = args.org
-    headers = _gh_headers(token)
     engine = create_engine(PG_CONN)
-    ensure_schema(engine)
 
     print(f"Fetching teams for org={org} …")
-    teams = fetch_teams(org, headers, args.verbose)
-    print(f"  {len(teams)} teams returned by GitHub")
-
-    members_by_team: dict[str, list[dict]] = {}
-    for i, t in enumerate(teams, 1):
-        slug = t["slug"]
-        print(f"  [{i}/{len(teams)}] members for {slug} …", end=" ", flush=True)
-        members = fetch_team_members(org, slug, headers, args.verbose)
-        members_by_team[slug] = members
-        print(f"{len(members)} members")
-
-    n_teams, n_members = replace_org_data(engine, org, teams, members_by_team)
-    print(f"\nWrote {n_teams} teams and {n_members} memberships "
-          f"for org '{org}' into Postgres.")
-
-    # Fetch user profiles (name + email) for every unique member we just saw.
-    # Used to map ADO System.CreatedBy (displayName / email) -> GitHub user.
-    unique_logins: set[str] = set()
-    for members in members_by_team.values():
-        for m in members:
-            login = (m.get("login") or "").lower()
-            if login:
-                unique_logins.add(login)
-    print(f"\nFetching profile (name+email) for {len(unique_logins)} unique users …")
-    profiles: list[dict] = []
-    for i, login in enumerate(sorted(unique_logins), 1):
-        if i % 25 == 0 or i == len(unique_logins):
-            print(f"  {i}/{len(unique_logins)} …")
-        try:
-            profile = fetch_user_profile(login, headers, args.verbose)
-            if profile:
-                profiles.append(profile)
-        except requests.HTTPError as e:
-            print(f"  skip {login}: {e}")
-    n_users = upsert_users(engine, profiles)
-    print(f"Wrote {n_users} user profiles.")
+    result = sync_org_teams(engine, org, token=token, verbose=args.verbose)
+    print(
+        f"\nWrote {result['teams']} teams, {result['memberships']} memberships, "
+        f"{result['users']} user profiles for org '{org}'."
+    )
 
     if args.show_qa is not None:
         qa = get_qa_logins(engine, args.show_qa, org=org)
